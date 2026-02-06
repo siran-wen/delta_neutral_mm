@@ -1,0 +1,11 @@
+# Hyperliquid连通性测试工具依赖 (使用CCXT)
+# 安装命令: pip install -r utils/requirements_test.txt
+
+# CCXT统一交易所API库 (必需)
+ccxt>=4.0.0
+
+# 以太坊账户库 (可选，用于认证测试)
+eth-account>=0.9.0
+
+# YAML配置文件解析 (通常已包含在Python标准库或项目中)
+PyYAML>=6.0
