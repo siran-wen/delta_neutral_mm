@@ -7,6 +7,7 @@ Hyperliquid交易所连通性测试工具 (使用CCXT)
 - REST API连通性测试
 - 认证信息验证
 - 市场数据获取测试
+- 下单/撤单连通性测试
 """
 
 import yaml
@@ -116,7 +117,8 @@ class HyperliquidConnectivityTester:
         self.results = {
             'rest_api': {'status': 'pending', 'details': []},
             'authentication': {'status': 'pending', 'details': []},
-            'market_data': {'status': 'pending', 'details': []}
+            'market_data': {'status': 'pending', 'details': []},
+            'order_lifecycle': {'status': 'pending', 'details': []}
         }
     
     def _load_config(self) -> Dict[str, Any]:
@@ -560,6 +562,285 @@ class HyperliquidConnectivityTester:
         print(f"\n{Colors.BOLD}结果: {success_count}/{total_tests} 测试通过{Colors.RESET}")
         return all_success
     
+    def test_order_lifecycle(self) -> bool:
+        """测试下单和撤单连通性
+        
+        流程：
+        1. 获取当前BTC市场价格
+        2. 以远低于市场价的限价单下买单（确保不会成交）
+        3. 确认下单成功
+        4. 立即撤销该订单
+        5. 确认撤单成功
+        """
+        self._print_header("下单/撤单连通性测试 (CCXT)")
+        
+        success_count = 0
+        total_tests = 0
+        order_id = None
+        symbol = None
+        
+        # 前置检查：认证信息是否有效
+        private_key = self.auth_config.get('private_key', '').strip()
+        wallet_address = self.auth_config.get('wallet_address', '').strip()
+        
+        if not private_key or not wallet_address \
+                or 'YOUR' in private_key.upper() \
+                or 'YOUR' in wallet_address.upper():
+            self._print_result(
+                "前置检查",
+                False,
+                "配置文件中未填入真实的私钥和钱包地址，请先更新 config/hyperliquid_config.yaml"
+            )
+            self.results['order_lifecycle']['status'] = 'skipped'
+            self.results['order_lifecycle']['details'].append({
+                'test': '前置检查',
+                'status': 'skipped',
+                'error': '缺少真实认证信息'
+            })
+            print(f"\n{Colors.BOLD}{Colors.YELLOW}{Symbols.WARNING()} 下单/撤单测试跳过 (需要真实认证信息){Colors.RESET}")
+            return False
+        
+        # ---- 步骤1: 获取当前市场价格 ----
+        total_tests += 1
+        current_price = None
+        try:
+            # 确保市场信息已加载
+            if not self.exchange.markets:
+                self.exchange.load_markets()
+            
+            # 尝试使用 BTC/USDC:USDC (Hyperliquid永续合约)
+            test_symbols = ['BTC/USDC:USDC', 'BTC/USDT:USDT']
+            for sym in test_symbols:
+                if sym in self.exchange.markets:
+                    symbol = sym
+                    break
+            
+            if not symbol:
+                # 取第一个swap类型的交易对
+                for sym, market in self.exchange.markets.items():
+                    if market.get('swap'):
+                        symbol = sym
+                        break
+            
+            if not symbol:
+                raise Exception("未找到可用的永续合约交易对")
+            
+            ticker = self.exchange.fetch_ticker(symbol)
+            current_price = ticker.get('last') or ticker.get('close')
+            
+            if not current_price:
+                raise Exception(f"无法获取 {symbol} 的当前价格")
+            
+            self._print_result(
+                "获取市场价格",
+                True,
+                f"{symbol} 当前价格: {current_price}"
+            )
+            success_count += 1
+            self.results['order_lifecycle']['details'].append({
+                'test': '获取市场价格',
+                'status': 'success',
+                'symbol': symbol,
+                'price': current_price
+            })
+        except Exception as e:
+            self._print_result("获取市场价格", False, f"错误: {str(e)}")
+            self.results['order_lifecycle']['details'].append({
+                'test': '获取市场价格',
+                'status': 'failed',
+                'error': str(e)
+            })
+            self.results['order_lifecycle']['status'] = 'failed'
+            print(f"\n{Colors.BOLD}{Colors.RED}{Symbols.CROSS()} 无法获取价格，跳过下单测试{Colors.RESET}")
+            return False
+        
+        # ---- 步骤2: 下限价买单 (价格远低于市场价，不会成交) ----
+        total_tests += 1
+        try:
+            # 计算安全的测试价格：当前价格的50%，确保不会成交
+            test_price = round(current_price * 0.5, 1)
+            
+            # 使用最小下单量
+            market_info = self.exchange.markets.get(symbol, {})
+            min_amount = market_info.get('limits', {}).get('amount', {}).get('min', 0.001)
+            # 对于BTC，使用最小数量
+            test_amount = min_amount if min_amount and min_amount > 0 else 0.001
+            
+            print(f"  >> 下单参数: {symbol} 买入 {test_amount} @ 限价 {test_price}")
+            print(f"     (市场价: {current_price}, 测试价格为市场价的50%, 不会成交)")
+            
+            # 创建限价买单
+            order = self.exchange.create_order(
+                symbol=symbol,
+                type='limit',
+                side='buy',
+                amount=test_amount,
+                price=test_price
+            )
+            
+            order_id = order.get('id')
+            order_status = order.get('status', 'unknown')
+            
+            self._print_result(
+                "创建限价买单",
+                True,
+                f"订单ID: {order_id}, 状态: {order_status}"
+            )
+            success_count += 1
+            self.results['order_lifecycle']['details'].append({
+                'test': '创建限价买单',
+                'status': 'success',
+                'order_id': order_id,
+                'order_status': order_status,
+                'price': test_price,
+                'amount': test_amount
+            })
+        except ccxt.InsufficientFunds:
+            self._print_result("创建限价买单", False, "余额不足，无法下单")
+            self.results['order_lifecycle']['details'].append({
+                'test': '创建限价买单',
+                'status': 'failed',
+                'error': '余额不足'
+            })
+            self.results['order_lifecycle']['status'] = 'failed'
+            print(f"\n{Colors.BOLD}结果: {success_count}/{total_tests} 测试通过{Colors.RESET}")
+            return False
+        except ccxt.AuthenticationError as e:
+            self._print_result("创建限价买单", False, f"认证失败: {str(e)}")
+            self.results['order_lifecycle']['details'].append({
+                'test': '创建限价买单',
+                'status': 'failed',
+                'error': f'认证失败: {str(e)}'
+            })
+            self.results['order_lifecycle']['status'] = 'failed'
+            print(f"\n{Colors.BOLD}结果: {success_count}/{total_tests} 测试通过{Colors.RESET}")
+            return False
+        except Exception as e:
+            self._print_result("创建限价买单", False, f"错误: {str(e)}")
+            self.results['order_lifecycle']['details'].append({
+                'test': '创建限价买单',
+                'status': 'failed',
+                'error': str(e)
+            })
+            self.results['order_lifecycle']['status'] = 'failed'
+            print(f"\n{Colors.BOLD}结果: {success_count}/{total_tests} 测试通过{Colors.RESET}")
+            return False
+        
+        # ---- 步骤3: 查询订单状态 ----
+        total_tests += 1
+        try:
+            time.sleep(1)  # 等待订单进入系统
+            
+            fetched_order = self.exchange.fetch_order(order_id, symbol)
+            fetched_status = fetched_order.get('status', 'unknown')
+            
+            self._print_result(
+                "查询订单状态",
+                True,
+                f"订单ID: {order_id}, 状态: {fetched_status}"
+            )
+            success_count += 1
+            self.results['order_lifecycle']['details'].append({
+                'test': '查询订单状态',
+                'status': 'success',
+                'order_status': fetched_status
+            })
+        except Exception as e:
+            self._print_result("查询订单状态", None, f"查询跳过: {str(e)}")
+            self.results['order_lifecycle']['details'].append({
+                'test': '查询订单状态',
+                'status': 'skipped',
+                'note': str(e)
+            })
+        
+        # ---- 步骤4: 撤销订单 ----
+        total_tests += 1
+        try:
+            cancel_result = self.exchange.cancel_order(order_id, symbol)
+            
+            cancel_status = None
+            if isinstance(cancel_result, dict):
+                cancel_status = cancel_result.get('status', 'canceled')
+            else:
+                cancel_status = 'canceled'
+            
+            self._print_result(
+                "撤销订单",
+                True,
+                f"订单ID: {order_id} 已撤销, 状态: {cancel_status}"
+            )
+            success_count += 1
+            self.results['order_lifecycle']['details'].append({
+                'test': '撤销订单',
+                'status': 'success',
+                'cancel_status': cancel_status
+            })
+        except Exception as e:
+            self._print_result("撤销订单", False, f"错误: {str(e)}")
+            self.results['order_lifecycle']['details'].append({
+                'test': '撤销订单',
+                'status': 'failed',
+                'error': str(e)
+            })
+            # 如果撤单失败，尝试用cancel_all_orders兜底
+            try:
+                print(f"  >> 尝试撤销所有挂单...")
+                self.exchange.cancel_all_orders(symbol)
+                self._print_result("撤销所有挂单 (兜底)", True, "已撤销所有挂单")
+            except Exception as e2:
+                self._print_result("撤销所有挂单 (兜底)", False, f"错误: {str(e2)}")
+        
+        # ---- 步骤5: 确认订单已撤销 ----
+        total_tests += 1
+        try:
+            time.sleep(1)
+            
+            # 获取当前挂单列表，确认测试订单已不在列表中
+            open_orders = self.exchange.fetch_open_orders(symbol)
+            test_order_still_open = any(o.get('id') == order_id for o in open_orders)
+            
+            if not test_order_still_open:
+                self._print_result(
+                    "确认订单已撤销",
+                    True,
+                    f"订单 {order_id} 已不在挂单列表中, 当前挂单数: {len(open_orders)}"
+                )
+                success_count += 1
+                self.results['order_lifecycle']['details'].append({
+                    'test': '确认订单已撤销',
+                    'status': 'success'
+                })
+            else:
+                self._print_result("确认订单已撤销", False, "订单仍在挂单列表中")
+                self.results['order_lifecycle']['details'].append({
+                    'test': '确认订单已撤销',
+                    'status': 'failed',
+                    'error': '订单仍在挂单列表中'
+                })
+                # 再次尝试撤单
+                try:
+                    self.exchange.cancel_order(order_id, symbol)
+                except Exception:
+                    pass
+        except Exception as e:
+            self._print_result("确认订单已撤销", None, f"查询跳过: {str(e)}")
+            self.results['order_lifecycle']['details'].append({
+                'test': '确认订单已撤销',
+                'status': 'skipped',
+                'note': str(e)
+            })
+        
+        # 汇总结果
+        all_success = success_count == total_tests
+        self.results['order_lifecycle']['status'] = 'success' if all_success else 'partial' if success_count > 0 else 'failed'
+        
+        if all_success:
+            print(f"\n{Colors.BOLD}{Colors.GREEN}{Symbols.CHECK()} 下单/撤单测试全部通过!{Colors.RESET}")
+        else:
+            print(f"\n{Colors.BOLD}结果: {success_count}/{total_tests} 测试通过{Colors.RESET}")
+        
+        return all_success
+    
     def print_summary(self):
         """打印测试总结"""
         self._print_header("测试总结")
@@ -622,6 +903,9 @@ class HyperliquidConnectivityTester:
         time.sleep(1)
         
         self.test_market_data()
+        time.sleep(1)
+        
+        self.test_order_lifecycle()
         
         # 打印总结
         return self.print_summary()
