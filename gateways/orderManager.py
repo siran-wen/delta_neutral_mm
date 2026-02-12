@@ -454,8 +454,8 @@ class OrderManager:
             logger=self._logger,
         )
 
-        # ---- 防重入锁 (按 client_order_id) ----
-        self._op_locks: Dict[str, threading.Lock] = {}
+        # ---- 防重入锁 (按 client_order_id，使用 RLock 支持同线程重入) ----
+        self._op_locks: Dict[str, threading.RLock] = {}
         self._op_locks_lock = threading.Lock()
 
         # ---- 回调 ----
@@ -1098,11 +1098,11 @@ class OrderManager:
         with self._orders_lock:
             return self._orders.get(client_order_id)
 
-    def _get_op_lock(self, client_order_id: str) -> threading.Lock:
-        """获取单个订单的操作防重入锁"""
+    def _get_op_lock(self, client_order_id: str) -> threading.RLock:
+        """获取单个订单的操作防重入锁（RLock 允许同线程重入，支持 amend -> cancel 调用链）"""
         with self._op_locks_lock:
             if client_order_id not in self._op_locks:
-                self._op_locks[client_order_id] = threading.Lock()
+                self._op_locks[client_order_id] = threading.RLock()
             return self._op_locks[client_order_id]
 
     @staticmethod

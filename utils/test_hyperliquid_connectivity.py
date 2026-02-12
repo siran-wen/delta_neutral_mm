@@ -144,9 +144,10 @@ class HyperliquidConnectivityTester:
             wallet_address = self.auth_config.get('wallet_address', '').strip()
             
             # 创建CCXT交易所配置
+            # Hyperliquid在CCXT中使用 walletAddress + privateKey 认证
             exchange_config = {
-                'apiKey': wallet_address,  # Hyperliquid使用钱包地址作为apiKey
-                'secret': private_key,     # 私钥作为secret
+                'walletAddress': wallet_address,
+                'privateKey': private_key,
                 'enableRateLimit': True,
                 'timeout': self.timeout * 1000,  # CCXT使用毫秒
                 'options': {
@@ -402,7 +403,7 @@ class HyperliquidConnectivityTester:
         
         # 测试认证API调用 (使用CCXT)
         try:
-            if self.exchange and hasattr(self.exchange, 'apiKey') and self.exchange.apiKey:
+            if self.exchange and hasattr(self.exchange, 'walletAddress') and self.exchange.walletAddress:
                 # 尝试获取账户余额（需要认证）
                 balance = self.exchange.fetch_balance()
                 if balance:
@@ -654,20 +655,74 @@ class HyperliquidConnectivityTester:
             print(f"\n{Colors.BOLD}{Colors.RED}{Symbols.CROSS()} 无法获取价格，跳过下单测试{Colors.RESET}")
             return False
         
+        # ---- 步骤1.5: 检查账户余额 ----
+        total_tests += 1
+        available_balance = 0
+        try:
+            balance = self.exchange.fetch_balance()
+            # Hyperliquid使用USDC作为保证金
+            available_balance = balance.get('free', {}).get('USDC', 0) or 0
+            total_balance = balance.get('total', {}).get('USDC', 0) or 0
+            
+            self._print_result(
+                "查询账户余额",
+                True,
+                f"可用余额: {available_balance} USDC, 总余额: {total_balance} USDC"
+            )
+            success_count += 1
+            self.results['order_lifecycle']['details'].append({
+                'test': '查询账户余额',
+                'status': 'success',
+                'available': available_balance,
+                'total': total_balance
+            })
+            
+            # 检查余额是否足够 (Hyperliquid最小订单价值约10 USDC)
+            if available_balance < 11:
+                self._print_result(
+                    "余额检查",
+                    None,
+                    f"可用余额 {available_balance} USDC 不足以下单 (最低约需 11 USDC)"
+                )
+                print(f"\n{Colors.BOLD}{Colors.YELLOW}{Symbols.WARNING()} 下单/撤单API连通性正常，但余额不足无法实际下单{Colors.RESET}")
+                print(f"  {Colors.YELLOW}提示: 请向钱包转入至少 11 USDC 后重新测试{Colors.RESET}")
+                self.results['order_lifecycle']['status'] = 'partial'
+                self.results['order_lifecycle']['details'].append({
+                    'test': '余额检查',
+                    'status': 'partial',
+                    'note': '余额不足，跳过实际下单测试'
+                })
+                print(f"\n{Colors.BOLD}结果: {success_count}/{total_tests} 测试通过 (余额不足，跳过下单){Colors.RESET}")
+                return False
+        except Exception as e:
+            self._print_result("查询账户余额", False, f"错误: {str(e)}")
+            self.results['order_lifecycle']['details'].append({
+                'test': '查询账户余额',
+                'status': 'failed',
+                'error': str(e)
+            })
+        
         # ---- 步骤2: 下限价买单 (价格远低于市场价，不会成交) ----
         total_tests += 1
         try:
-            # 计算安全的测试价格：当前价格的50%，确保不会成交
-            test_price = round(current_price * 0.5, 1)
-            
-            # 使用最小下单量
+            # 获取市场精度信息
             market_info = self.exchange.markets.get(symbol, {})
-            min_amount = market_info.get('limits', {}).get('amount', {}).get('min', 0.001)
-            # 对于BTC，使用最小数量
-            test_amount = min_amount if min_amount and min_amount > 0 else 0.001
+            
+            # 计算安全的测试价格：当前价格的50%，确保不会成交
+            raw_test_price = current_price * 0.5
+            test_price = float(self.exchange.price_to_precision(symbol, raw_test_price))
+            
+            # 计算最小下单量：确保订单价值约11 USDC (最低要求10 USDC)
+            min_notional = 11.0  # USDC
+            raw_amount = min_notional / test_price
+            test_amount = float(self.exchange.amount_to_precision(symbol, raw_amount))
+            # 确保数量不为0
+            if test_amount <= 0:
+                test_amount = float(self.exchange.amount_to_precision(symbol, 0.001))
             
             print(f"  >> 下单参数: {symbol} 买入 {test_amount} @ 限价 {test_price}")
             print(f"     (市场价: {current_price}, 测试价格为市场价的50%, 不会成交)")
+            print(f"     (订单名义价值: ~{round(test_amount * test_price, 2)} USDC)")
             
             # 创建限价买单
             order = self.exchange.create_order(
@@ -702,7 +757,8 @@ class HyperliquidConnectivityTester:
                 'status': 'failed',
                 'error': '余额不足'
             })
-            self.results['order_lifecycle']['status'] = 'failed'
+            self.results['order_lifecycle']['status'] = 'partial'
+            print(f"\n{Colors.BOLD}{Colors.YELLOW}{Symbols.WARNING()} 下单API连通正常，但余额不足{Colors.RESET}")
             print(f"\n{Colors.BOLD}结果: {success_count}/{total_tests} 测试通过{Colors.RESET}")
             return False
         except ccxt.AuthenticationError as e:
@@ -726,31 +782,48 @@ class HyperliquidConnectivityTester:
             print(f"\n{Colors.BOLD}结果: {success_count}/{total_tests} 测试通过{Colors.RESET}")
             return False
         
-        # ---- 步骤3: 查询订单状态 ----
+        # ---- 步骤3: 查询订单状态 (使用 fetch_open_orders 批量查询) ----
         total_tests += 1
         try:
             time.sleep(1)  # 等待订单进入系统
             
-            fetched_order = self.exchange.fetch_order(order_id, symbol)
-            fetched_status = fetched_order.get('status', 'unknown')
+            open_orders = self.exchange.fetch_open_orders(symbol)
+            matched_order = None
+            for o in open_orders:
+                if o.get('id') == order_id:
+                    matched_order = o
+                    break
             
-            self._print_result(
-                "查询订单状态",
-                True,
-                f"订单ID: {order_id}, 状态: {fetched_status}"
-            )
-            success_count += 1
-            self.results['order_lifecycle']['details'].append({
-                'test': '查询订单状态',
-                'status': 'success',
-                'order_status': fetched_status
-            })
+            if matched_order:
+                fetched_status = matched_order.get('status', 'unknown')
+                self._print_result(
+                    "查询订单状态",
+                    True,
+                    f"订单ID: {order_id}, 状态: {fetched_status}, 挂单总数: {len(open_orders)}"
+                )
+                success_count += 1
+                self.results['order_lifecycle']['details'].append({
+                    'test': '查询订单状态',
+                    'status': 'success',
+                    'order_status': fetched_status
+                })
+            else:
+                self._print_result(
+                    "查询订单状态",
+                    False,
+                    f"订单ID: {order_id} 未在挂单列表中找到 (挂单数: {len(open_orders)})"
+                )
+                self.results['order_lifecycle']['details'].append({
+                    'test': '查询订单状态',
+                    'status': 'failed',
+                    'note': '订单未在挂单列表中'
+                })
         except Exception as e:
-            self._print_result("查询订单状态", None, f"查询跳过: {str(e)}")
+            self._print_result("查询订单状态", False, f"错误: {str(e)}")
             self.results['order_lifecycle']['details'].append({
                 'test': '查询订单状态',
-                'status': 'skipped',
-                'note': str(e)
+                'status': 'failed',
+                'error': str(e)
             })
         
         # ---- 步骤4: 撤销订单 ----

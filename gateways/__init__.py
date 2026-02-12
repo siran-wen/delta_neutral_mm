@@ -59,6 +59,14 @@ from gateways.orderManager import (
     RateLimiter,
 )
 
+from gateways.exception_handler import (
+    ConnectionMonitor,
+    ReconnectPolicy,
+    ExceptionClassifier,
+    ExceptionSeverity,
+    MonitorState,
+)
+
 __all__ = [
     # gateway
     "BaseGateway",
@@ -83,4 +91,10 @@ __all__ = [
     "LatencyRecord",
     "LatencyTracker",
     "RateLimiter",
+    # exception_handler
+    "ConnectionMonitor",
+    "ReconnectPolicy",
+    "ExceptionClassifier",
+    "ExceptionSeverity",
+    "MonitorState",
 ]

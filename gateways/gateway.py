@@ -39,6 +39,7 @@ class GatewayStatus(Enum):
     CONNECTING = "connecting"
     CONNECTED = "connected"
     AUTHENTICATED = "authenticated"
+    RECONNECTING = "reconnecting"
     ERROR = "error"
 
 
