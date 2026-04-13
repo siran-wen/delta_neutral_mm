@@ -420,15 +420,17 @@ class ConnectionMonitor:
         if gw.status == GatewayStatus.DISCONNECTED:
             raise ConnectionError("网关已处于断开状态")
 
-        # 尝试轻量调用
+        # 尝试轻量调用，优先 fetch_time，不支持则回退 fetch_ticker
         try:
-            # 优先: ccxt 的 fetch_status (极轻量)
             if hasattr(gw, 'exchange') and gw.exchange is not None:
                 exchange = gw.exchange
                 if hasattr(exchange, 'fetch_time'):
-                    exchange.fetch_time()
-                    return
-                # 回退: fetch_ticker 取一个活跃的交易对
+                    try:
+                        exchange.fetch_time()
+                        return
+                    except Exception:
+                        # fetch_time 不支持或失败，回退到 fetch_ticker
+                        pass
                 exchange.fetch_ticker("BTC/USDC:USDC")
                 return
         except AttributeError:
