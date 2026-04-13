@@ -664,7 +664,14 @@ class HyperliquidGateway(BaseGateway):
             exchange_config["walletAddress"] = wallet_address
             exchange_config["privateKey"] = private_key
 
-        return ccxt.hyperliquid(exchange_config)
+        instance = ccxt.hyperliquid(exchange_config)
+
+        # CCXT 4.5.x 变更: Hyperliquid 新增 HIP-3 DEX 市场，fetchHip3Markets()
+        # 默认会拉取所有 DEX 且超过 5 个上限时报错。做市只需 spot/swap，
+        # 把 hip3 从 fetchMarkets.types 中移除即可跳过该调用。
+        instance.options.setdefault("fetchMarkets", {})["types"] = ["spot", "swap"]
+
+        return instance
 
     def _has_credentials(self) -> bool:
         """检查是否配置了有效的认证信息"""

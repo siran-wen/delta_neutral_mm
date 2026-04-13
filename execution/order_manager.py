@@ -10,6 +10,22 @@
 3. 延迟与性能监测   — 链路埋点、RTT 统计、滑点预警
 4. 频率限制保护     — 自适应令牌桶、优先级队列
 5. 原子化改单操作   — Cancel-Replace 模拟、防重入锁
+
+用法:
+    from gateways import GatewayFactory
+    from execution import OrderManager
+    from gateways.gateway import OrderSide, OrderType
+
+    gw = GatewayFactory.create("config/hyperliquid_config.yaml")
+    gw.connect()
+
+    om = OrderManager(gw)
+    om.start()
+
+    order = om.submit_order("BTC/USDC:USDC", OrderSide.BUY, OrderType.LIMIT, 0.001, 35000.0)
+    om.amend_order(order.client_order_id, new_price=36000.0)
+    om.cancel_order(order.client_order_id)
+    om.stop()
 """
 
 import uuid

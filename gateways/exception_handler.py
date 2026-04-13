@@ -14,7 +14,8 @@
     - 可观测性: 所有状态变更均通过事件回调通知上层
 
 用法:
-    from gateways import GatewayFactory, OrderManager, ConnectionMonitor
+    from gateways import GatewayFactory, ConnectionMonitor
+    from execution import OrderManager
 
     gw = GatewayFactory.create("config/hyperliquid_config.yaml")
     gw.connect()

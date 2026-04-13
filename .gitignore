@@ -1,66 +1,14 @@
+# 私钥/认证配置 — 永远不提交
+config/hyperliquid_config.yaml
+
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
-venv/
-ENV/
-env/
+*.pyo
 .venv/
+venv/
+*.egg-info/
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# Logs
+# 运行时
 *.log
-logs/
-
-# Environment variables
-.env
-.env.local
-.env.*.local
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Jupyter Notebook
-.ipynb_checkpoints/
-
-# Test coverage
-htmlcov/
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-
-# Secrets - 重要：不要上传私钥！
-# 如果配置文件包含真实私钥，请在上传前替换为占位符
-# config/*_secret.yaml
-# *.pem
-# *.key
+data/logs/

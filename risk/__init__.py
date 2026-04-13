@@ -21,7 +21,7 @@
     rm.disarm()
 """
 
-from risk.limits import (
+from risk.pre_trade import (
     RiskManager,
     RiskConfig,
     PositionLimiter,

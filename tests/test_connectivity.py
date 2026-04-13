@@ -154,10 +154,10 @@ class HyperliquidConnectivityTester:
                     'defaultType': 'swap',  # 默认使用永续合约
                 }
             }
-            
+
             # 创建交易所实例
             self.exchange = ccxt.hyperliquid(exchange_config)
-            
+
         except Exception as e:
             print(f"{Colors.RED}[ERROR] 初始化交易所失败: {e}{Colors.RESET}")
             # 即使认证失败，也创建只读实例用于公共API测试
@@ -165,6 +165,10 @@ class HyperliquidConnectivityTester:
                 'enableRateLimit': True,
                 'timeout': self.timeout * 1000,
             })
+
+        # CCXT 4.5.x: 把 hip3 从 fetchMarkets.types 移除，跳过 fetchHip3Markets()
+        # 避免 "Too many DEXes" 报错（做市只需 spot/swap 市场）
+        self.exchange.options.setdefault('fetchMarkets', {})['types'] = ['spot', 'swap']
     
     def _print_header(self, title: str):
         """打印测试标题"""
