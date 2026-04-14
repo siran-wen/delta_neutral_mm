@@ -164,6 +164,87 @@ class AccountBalance:
         return cls(balances=balances, raw=data)
 
 
+@dataclass
+class Position:
+    """持仓信息"""
+    symbol: str
+    side: str                                    # "long" / "short" / "flat"
+    size: float                                  # 持仓数量（绝对值）
+    entry_price: float                           # 开仓均价
+    unrealized_pnl: float                        # 未实现盈亏
+    notional_value: float                        # 名义价值
+    leverage: Optional[float] = None             # 杠杆倍数（交易所不一定返回）
+    liquidation_price: Optional[float] = None    # 强平价格（交易所不一定返回）
+    margin_type: Optional[str] = None            # 保证金模式（交易所不一定返回）
+    raw: Optional[dict] = None                   # 保留原始响应
+
+    @classmethod
+    def from_ccxt(cls, data: dict) -> "Position":
+        """
+        从 CCXT fetch_positions 返回的标准结构构造 Position
+
+        CCXT 返回格式参考:
+            https://docs.ccxt.com/#/?id=position-structure
+        """
+        symbol = data.get("symbol", "")
+
+        # ---- size: 取绝对值，防御 None ----
+        contracts = data.get("contracts")
+        contract_size = data.get("contractSize")
+        if contracts is not None and contract_size is not None:
+            size = abs(float(contracts) * float(contract_size))
+        elif contracts is not None:
+            size = abs(float(contracts))
+        else:
+            size = 0.0
+
+        # ---- side: 优先取 CCXT 标准字段，缺失时根据 contracts 正负推断 ----
+        raw_side = data.get("side")
+        if size == 0.0:
+            side = "flat"
+        elif raw_side in ("long", "short"):
+            side = raw_side
+        elif contracts is not None:
+            side = "long" if float(contracts) >= 0 else "short"
+        else:
+            side = "flat"
+
+        entry_price = float(data.get("entryPrice") or 0.0)
+        unrealized_pnl = float(data.get("unrealizedPnl") or 0.0)
+
+        # ---- notional_value: 优先取 CCXT 的 notional，缺失时计算 ----
+        notional = data.get("notional")
+        if notional is not None:
+            notional_value = abs(float(notional))
+        else:
+            notional_value = size * entry_price
+
+        leverage = None
+        raw_leverage = data.get("leverage")
+        if raw_leverage is not None:
+            leverage = float(raw_leverage)
+
+        liquidation_price = None
+        raw_liq = data.get("liquidationPrice")
+        if raw_liq is not None:
+            liquidation_price = float(raw_liq)
+
+        margin_type = data.get("marginMode") or data.get("marginType")
+
+        return cls(
+            symbol=symbol,
+            side=side,
+            size=size,
+            entry_price=entry_price,
+            unrealized_pnl=unrealized_pnl,
+            notional_value=notional_value,
+            leverage=leverage,
+            liquidation_price=liquidation_price,
+            margin_type=margin_type,
+            raw=data,
+        )
+
+
 # =============================================================================
 # 回调事件类型
 # =============================================================================
@@ -295,6 +376,19 @@ class BaseGateway(ABC):
     @abstractmethod
     def fetch_balance(self) -> AccountBalance:
         """获取账户余额"""
+        ...
+
+    @abstractmethod
+    def fetch_positions(self, symbols: Optional[List[str]] = None) -> List[Position]:
+        """
+        获取当前持仓列表
+
+        Args:
+            symbols: 交易对列表 (None 则获取全部持仓)
+
+        Returns:
+            持仓列表，无持仓时返回空列表
+        """
         ...
 
     # ---- 订单管理 ----
@@ -559,6 +653,45 @@ class HyperliquidGateway(BaseGateway):
         self._ensure_authenticated()
         data = self._exchange.fetch_balance()
         return AccountBalance.from_ccxt(data)
+
+    def fetch_positions(
+        self,
+        symbols: Optional[List[str]] = None,
+        include_empty: bool = False,
+    ) -> List[Position]:
+        """
+        获取当前持仓列表
+
+        Args:
+            symbols:       交易对列表 (None 则获取全部持仓)
+            include_empty: 是否包含空仓位 (对账场景需要)
+
+        Returns:
+            持仓列表，无持仓时返回空列表
+        """
+        self._ensure_authenticated()
+        self._logger.info(f"查询持仓: symbols={symbols or 'ALL'}")
+
+        try:
+            data = self._exchange.fetch_positions(symbols)
+
+            positions = []
+            for item in data:
+                pos = Position.from_ccxt(item)
+                if include_empty or pos.size > 0:
+                    positions.append(pos)
+
+            self._logger.info(f"获取到 {len(positions)} 个持仓")
+            return positions
+        except ccxt.AuthenticationError as e:
+            self._on_error(e, "查询持仓")
+            raise
+        except ccxt.NetworkError as e:
+            self._on_error(e, "查询持仓")
+            raise
+        except Exception as e:
+            self._on_error(e, "查询持仓")
+            raise
 
     # ---- 订单管理 ----
 
