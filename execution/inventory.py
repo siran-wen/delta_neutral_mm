@@ -30,7 +30,10 @@ TODO: 后续迭代实现：
 
 import threading
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List
+
+if TYPE_CHECKING:
+    from gateways.gateway import Position
 
 
 @dataclass
@@ -74,6 +77,31 @@ class InventoryTracker:
                 self.avg_entry.pop(symbol, None)
 
             self.positions[symbol] = new_pos
+
+    def sync_from_positions(self, positions: List["Position"]) -> int:
+        """
+        从交易所持仓快照批量初始化/同步本地状态。
+
+        用于启动时拉取 gateway.fetch_positions() 的结果，一次性写入
+        positions 和 avg_entry，避免逐笔 on_fill 的开销和语义不匹配。
+
+        Args:
+            positions: gateway.fetch_positions() 返回的 Position 列表
+
+        Returns:
+            同步的品种数量
+        """
+        with self._lock:
+            self.positions.clear()
+            self.avg_entry.clear()
+            for pos in positions:
+                if pos.size == 0 or pos.side == "flat":
+                    continue
+                delta = pos.size if pos.side == "long" else -pos.size
+                self.positions[pos.symbol] = delta
+                if pos.entry_price > 0:
+                    self.avg_entry[pos.symbol] = pos.entry_price
+        return len(self.positions)
 
     def get_position(self, symbol: str) -> float:
         """返回单品种净 Delta，不存在时返回 0.0"""

@@ -24,9 +24,6 @@ from gateways.gateway import (
     Balance,
     AccountBalance,
     Position,
-    GatewayEvent,
-    StatusEvent,
-    ErrorEvent,
 )
 
 from gateways.exception_handler import (
@@ -34,7 +31,6 @@ from gateways.exception_handler import (
     ReconnectPolicy,
     ExceptionClassifier,
     ExceptionSeverity,
-    MonitorState,
 )
 
 __all__ = [
@@ -51,13 +47,9 @@ __all__ = [
     "Balance",
     "AccountBalance",
     "Position",
-    "GatewayEvent",
-    "StatusEvent",
-    "ErrorEvent",
     # exception_handler
     "ConnectionMonitor",
     "ReconnectPolicy",
     "ExceptionClassifier",
     "ExceptionSeverity",
-    "MonitorState",
 ]

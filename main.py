@@ -202,6 +202,16 @@ def main() -> None:
     inventory = InventoryTracker()
     quoter = Quoter(strategy_cfg=strategy_cfg, inventory=inventory)
 
+    # ── 启动时同步交易所持仓，消除重启后 delta 盲区 ─────────────────────
+    try:
+        positions = gateway.fetch_positions(symbols)
+        n_synced = inventory.sync_from_positions(positions)
+        # 批量同步到 RiskManager.PositionLimiter
+        rm.sync_positions(inventory.get_all_positions())
+        logger.info(f"初始持仓同步完成: {n_synced} 个品种")
+    except Exception as e:
+        logger.warning(f"初始持仓同步失败（将从零开始跟踪）: {e}")
+
     # symbol → {"bid": cid | None, "ask": cid | None}
     active_quotes: Dict[str, Dict[str, Optional[str]]] = {
         s: {"bid": None, "ask": None} for s in symbols

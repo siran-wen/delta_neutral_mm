@@ -162,7 +162,7 @@ class ManagedOrder:
     state_changed_at: float = field(default_factory=time.time)
 
     # ---- 延迟追踪 ----
-    latency: LatencyRecord = field(default=None)
+    latency: Optional[LatencyRecord] = field(default=None)
 
     # ---- 原子改单锁标记 ----
     locked: bool = False

@@ -37,9 +37,11 @@ Gateway (HyperliquidGateway via CCXT)  →  exchange abstraction
 ### Key modules
 
 - **`gateways/gateway.py`** — `BaseGateway` abstract interface + `HyperliquidGateway` (CCXT-based). `GatewayFactory` creates instances from YAML config. Event-driven via `.on()` callbacks.
-- **`gateways/orderManager.py`** — Tracks every order through a state machine (`PENDING_NEW → OPEN → PARTIALLY_FILLED → FILLED | CANCELLED | REJECTED | LOST | STALE`). Token-bucket rate limiter with priority queue (cancel > hedge > new order > query). Background reconciliation thread syncs local state with exchange. Latency tracker (sliding window, P95).
 - **`gateways/exception_handler.py`** — `ConnectionMonitor` runs a heartbeat thread. On disconnect: cancels all open orders, then reconnects with exponential backoff (1s→60s). Classifies errors as TRANSIENT (retry), RATE_LIMITED (wait), or FATAL (give up). Cold-start recovery re-syncs orders after reconnect.
-- **`risk/limits.py`** — Three components unified by `RiskManager`:
+- **`execution/order_manager.py`** — Tracks every order through a state machine (`PENDING_NEW → OPEN → PARTIALLY_FILLED → FILLED | CANCELLED | REJECTED | LOST | STALE`). Token-bucket rate limiter with priority queue (cancel > hedge > new order > query). Background reconciliation thread syncs local state with exchange. Latency tracker (sliding window, P95).
+- **`execution/inventory.py`** — `InventoryTracker`: thread-safe local position tracking (net delta, weighted-average entry price, unrealized PnL). Supports `sync_from_positions()` for startup recovery.
+- **`execution/quoter.py`** — `Quoter`: bid/ask price and size calculation from mid-price and strategy parameters. Requote threshold check.
+- **`risk/pre_trade.py`** — Three components unified by `RiskManager`:
   - `PositionLimiter`: per-symbol and global delta limits; triggers hedger callback on breach.
   - `FatFingerGuard`: rejects orders deviating too far from mid-price (% and absolute thresholds).
   - `KillSwitch`: intercepts SIGINT/SIGTERM/uncaught exceptions → cancels all orders → flattens positions → shuts down.
@@ -55,14 +57,22 @@ All core components are thread-safe. `OrderManager` uses per-order RLocks plus a
 ### Initialization flow
 
 ```python
+from gateways import GatewayFactory, ConnectionMonitor, ReconnectPolicy
+from execution import OrderManager, InventoryTracker, Quoter
+from risk import RiskManager, RiskConfig
+
 gateway = GatewayFactory.create("config/hyperliquid_config.yaml")
 gateway.connect()
 om = OrderManager(gateway, reconcile_interval=3.0)
 om.start()
 monitor = ConnectionMonitor(gateway, om, policy=ReconnectPolicy())
 monitor.start()
-rm = RiskManager(gateway=gateway, order_manager=om, connection_monitor=monitor)
+rm = RiskManager(gateway=gateway, order_manager=om, connection_monitor=monitor, config=RiskConfig())
 rm.arm()
+
+inventory = InventoryTracker()
+inventory.sync_from_positions(gateway.fetch_positions())
+rm.sync_positions(inventory.get_all_positions())
 ```
 
 Shutdown: `rm.disarm() → monitor.stop() → om.stop() → gateway.disconnect()`.
