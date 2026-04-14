@@ -24,8 +24,7 @@ import logging
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import yaml
 
@@ -37,10 +36,9 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from gateways.gateway import GatewayFactory, OrderSide, OrderType
-from gateways.exception_handler import ConnectionMonitor, ReconnectPolicy
-from execution.order_manager import OrderManager, ManagedOrder, OrderState
-from risk.pre_trade import RiskManager, RiskConfig
+from gateways import GatewayFactory, OrderSide, OrderType, ConnectionMonitor, ReconnectPolicy
+from execution import OrderManager, ManagedOrder, OrderState, InventoryTracker, Quoter
+from risk import RiskManager, RiskConfig
 
 
 # =============================================================================
@@ -84,134 +82,6 @@ def _get_strategy_cfg(cfg: dict) -> dict:
 
 
 # =============================================================================
-# Placeholder: 持仓跟踪
-# （TODO: 替换为 execution.inventory.InventoryTracker）
-# =============================================================================
-
-@dataclass
-class InventoryState:
-    """
-    本地持仓与损益跟踪。
-
-    TODO: 替换为 execution.inventory.InventoryTracker，届时实现：
-        - FIFO 成本基础（realized PnL 精确核算）
-        - 资金费率累计
-        - 多账户/多品种 USD 等值汇总
-    """
-    # symbol → 净 Delta（正=多头, 负=空头）
-    positions: Dict[str, float] = field(default_factory=dict)
-    # symbol → 加权平均入场价
-    avg_entry: Dict[str, float] = field(default_factory=dict)
-    # 已实现 PnL（USDC），暂不计算，留 placeholder
-    realized_pnl: float = 0.0
-
-    def on_fill(self, symbol: str, side: str, amount: float, price: float) -> None:
-        """
-        根据成交更新持仓和加权均价。
-
-        TODO: 替换为 execution.inventory 的精确计算，包含：
-              - 平仓时的 realized PnL 结算
-              - FIFO / 加权均价两种模式切换
-        """
-        prev = self.positions.get(symbol, 0.0)
-        change = amount if side == "buy" else -amount
-        new_pos = prev + change
-
-        # 更新加权均价（仅在加仓时更新；减仓不改变成本价）
-        if change > 0:
-            prev_cost = abs(prev) * self.avg_entry.get(symbol, price)
-            self.avg_entry[symbol] = (prev_cost + change * price) / (abs(prev) + change)
-        elif new_pos == 0:
-            self.avg_entry.pop(symbol, None)
-
-        self.positions[symbol] = new_pos
-
-    def unrealized_pnl(self, mid_prices: Dict[str, float]) -> float:
-        """
-        按当前 mid 估算未实现 PnL。
-
-        TODO: 替换为标记价格（mark price），考虑资金费率。
-        """
-        total = 0.0
-        for sym, delta in self.positions.items():
-            mid = mid_prices.get(sym)
-            entry = self.avg_entry.get(sym)
-            if mid and entry:
-                total += delta * (mid - entry)
-        return total
-
-    def summary_lines(self, mid_prices: Dict[str, float]) -> List[str]:
-        """生成持仓摘要行，供 shutdown 时打印"""
-        lines = []
-        for sym, delta in self.positions.items():
-            mid = mid_prices.get(sym, 0.0)
-            entry = self.avg_entry.get(sym, 0.0)
-            upnl = delta * (mid - entry) if mid and entry else 0.0
-            lines.append(
-                f"  {sym:<22} delta={delta:+.6f}  "
-                f"entry={entry:.4f}  mid={mid:.4f}  uPnL={upnl:+.2f} USDC"
-            )
-        return lines
-
-
-# =============================================================================
-# Placeholder: 报价计算
-# （TODO: 替换为 execution.quoter.Quoter）
-# =============================================================================
-
-def compute_quotes(
-    symbol: str,
-    mid: float,
-    inventory: InventoryState,
-    strategy_cfg: dict,
-) -> Tuple[float, float, float]:
-    """
-    根据 mid 价格和策略参数计算 bid/ask/size。
-
-    Args:
-        symbol:       交易对（当前未用，供 skew 扩展预留）
-        mid:          当前中间价
-        inventory:    持仓状态（供 skew 调整预留）
-        strategy_cfg: 策略参数字典
-
-    Returns:
-        (bid_price, ask_price, size)  — 精度由 gateway 规范化
-
-    TODO: 接入 execution.quoter.Quoter，实现：
-        - 基于 inventory.positions[symbol] 的 skew 调整
-          （持多→抬高卖价/降低买价，引导库存回归中性）
-        - 基于 realized_vol / ATR 的动态价差
-        - 多档报价（L1~L3，当前仅挂最优档）
-        - ML 预测信号偏斜（接入 ml_service 后）
-    """
-    half_spread = mid * strategy_cfg["spread_pct"]
-    bid_price = mid - half_spread
-    ask_price = mid + half_spread
-    # 数量 = 名义金额 / 中价；gateway 会做最小单位裁剪
-    size = strategy_cfg["order_size_usd"] / mid if mid > 0 else 0.0
-    return bid_price, ask_price, size
-
-
-def should_requote(
-    symbol: str,
-    old_mid: float,
-    new_mid: float,
-    strategy_cfg: dict,
-) -> bool:
-    """
-    判断 mid 是否偏离足够大，需要撤旧单重新报价。
-
-    TODO: 接入 execution.quoter，加入更细粒度触发条件：
-        - 当前挂单距 mid 的实际偏离（而非 mid 本身变化）
-        - 库存 Delta 超过软阈值时强制刷新
-        - 成交概率模型触发
-    """
-    if old_mid <= 0:
-        return True
-    return abs(new_mid - old_mid) / old_mid >= strategy_cfg["requote_threshold"]
-
-
-# =============================================================================
 # 工具
 # =============================================================================
 
@@ -249,7 +119,7 @@ def parse_args() -> argparse.Namespace:
 # =============================================================================
 
 def print_final_summary(
-    inventory: InventoryState,
+    inventory: InventoryTracker,
     last_mids: Dict[str, float],
     logger: logging.Logger,
 ) -> None:
@@ -329,7 +199,8 @@ def main() -> None:
     # =========================================================================
     # 2. 共享状态（闭包变量，由回调和主循环共同读写）
     # =========================================================================
-    inventory = InventoryState()
+    inventory = InventoryTracker()
+    quoter = Quoter(strategy_cfg=strategy_cfg, inventory=inventory)
 
     # symbol → {"bid": cid | None, "ask": cid | None}
     active_quotes: Dict[str, Dict[str, Optional[str]]] = {
@@ -384,13 +255,13 @@ def main() -> None:
         撤旧挂新：在 bid/ask 两侧各挂一张限价单。
 
         流程:
-            撤旧单 → compute_quotes（placeholder）→ 风控检查 → 下单
+            撤旧单 → quoter.compute() → 风控检查 → 下单
         """
         # 撤旧单，避免双边重叠持仓
         _cancel_symbol_quotes(symbol)
 
-        # 计算报价（placeholder，见 compute_quotes 的 TODO）
-        bid_price, ask_price, size = compute_quotes(symbol, mid, inventory, strategy_cfg)
+        # 计算报价
+        bid_price, ask_price, size = quoter.compute(symbol, mid)
 
         # 交易所精度规范化
         try:
@@ -457,7 +328,7 @@ def main() -> None:
         price  = managed.price or 0.0
         signed = amount if managed.side == "buy" else -amount
 
-        # 更新本地持仓（placeholder，见 InventoryState 的 TODO）
+        # 更新本地持仓
         inventory.on_fill(managed.symbol, managed.side, amount, price)
 
         # 同步通知 RiskManager 更新 Delta（用于仓位限制检查）
@@ -466,7 +337,7 @@ def main() -> None:
         logger.info(
             f"成交: {managed.symbol} {managed.side.upper()}  "
             f"{amount:.6f} @ {price}  "
-            f"持仓={inventory.positions.get(managed.symbol, 0):+.6f}"
+            f"持仓={inventory.get_position(managed.symbol):+.6f}"
         )
 
         # 清除已成交侧的报价 CID
@@ -576,8 +447,8 @@ def main() -> None:
 
                 # ── 判断是否需要重新报价 ─────────────────────────────────────
                 triggered    = needs_requote.pop(symbol, False)  # 成交补单触发
-                mid_drifted  = should_requote(
-                    symbol, last_quoted_mid.get(symbol, 0.0), mid, strategy_cfg
+                mid_drifted  = quoter.should_requote(
+                    symbol, last_quoted_mid.get(symbol, 0.0), mid
                 )
 
                 if triggered or mid_drifted:

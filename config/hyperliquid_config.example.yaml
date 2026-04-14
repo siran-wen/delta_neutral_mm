@@ -33,9 +33,9 @@ hyperliquid:
           user_data: true    # 用户数据
         description: 🔥 永续合约价格数据订阅
         symbols:
-        - BTC/USDC:PERP
-        - ETH/USDC:PERP
-        
+        - BTC/USDC:USDC
+        - ETH/USDC:USDC
+
       # 主流币种组合 (当前活跃)
       major_coins:
         data_types:
@@ -44,10 +44,10 @@ hyperliquid:
           trades: false       # 交易数据
         description: 🔥 主流币种永续合约价格数据订阅
         symbols:
-        - BTC/USDC:PERP
-        - ETH/USDC:PERP
-        - SOL/USDC:PERP
-        
+        - BTC/USDC:USDC
+        - ETH/USDC:USDC
+        - SOL/USDC:USDC
+
       # 仅价格数据组合
       price_only:
         data_types:
@@ -56,11 +56,11 @@ hyperliquid:
           trades: false       # 交易数据
         description: 🔥 永续合约价格数据订阅
         symbols:
-        - BTC/USDC:PERP
-        - ETH/USDC:PERP
-        - SOL/USDC:PERP
-        - AVAX/USDC:PERP
-        - DOGE/USDC:PERP
+        - BTC/USDC:USDC
+        - ETH/USDC:USDC
+        - SOL/USDC:USDC
+        - AVAX/USDC:USDC
+        - DOGE/USDC:USDC
         
     # 自定义订阅配置
     custom:
@@ -108,7 +108,7 @@ hyperliquid:
     perpetual:
       description: 永续合约市场     # 市场描述
       enabled: true              # 是否启用 (true=启用, false=禁用)
-      suffix: :PERP             # 符号后缀 (已弃用，现在统一使用:USDC)
+      suffix: :USDC             # 符号后缀 (统一使用:USDC格式)
       
     # 市场优先级 (优先处理哪种市场)
     priority: perpetual
@@ -117,40 +117,40 @@ hyperliquid:
     spot:
       description: 现货市场        # 市场描述
       enabled: false             # 是否启用 (建议关闭以减少数据量)
-      suffix: :SPOT             # 符号后缀 (已弃用，现在统一使用:USDC)
+      suffix: :USDC             # 符号后缀 (统一使用:USDC格式)
   name: Hyperliquid
   # 精度配置 - 定义价格和数量的小数位数
   precision:
     # 价格精度 (小数位数)
     price:
-      ADA/USDC:PERP: 6          # ADA永续合约价格6位小数
-      AVAX/USDC:PERP: 4         # AVAX永续合约价格4位小数
+      ADA/USDC:USDC: 6          # ADA永续合约价格6位小数
+      AVAX/USDC:USDC: 4         # AVAX永续合约价格4位小数
       AVAX/USDC:SPOT: 4         # AVAX现货价格4位小数
-      BTC/USDC:PERP: 2          # BTC永续合约价格2位小数
+      BTC/USDC:USDC: 2          # BTC永续合约价格2位小数
       BTC/USDC:SPOT: 2          # BTC现货价格2位小数
-      DOGE/USDC:PERP: 6         # DOGE永续合约价格6位小数
-      ETH/USDC:PERP: 2          # ETH永续合约价格2位小数
+      DOGE/USDC:USDC: 6         # DOGE永续合约价格6位小数
+      ETH/USDC:USDC: 2          # ETH永续合约价格2位小数
       ETH/USDC:SPOT: 2          # ETH现货价格2位小数
-      LINK/USDC:PERP: 4         # LINK永续合约价格4位小数
-      SOL/USDC:PERP: 4          # SOL永续合约价格4位小数
+      LINK/USDC:USDC: 4         # LINK永续合约价格4位小数
+      SOL/USDC:USDC: 4          # SOL永续合约价格4位小数
       SOL/USDC:SPOT: 4          # SOL现货价格4位小数
-      UNI/USDC:PERP: 4          # UNI永续合约价格4位小数
+      UNI/USDC:USDC: 4          # UNI永续合约价格4位小数
       default: 6                # 默认价格精度
       
     # 数量精度 (小数位数)
     quantity:
-      ADA/USDC:PERP: 0          # ADA永续合约数量0位小数
-      AVAX/USDC:PERP: 3         # AVAX永续合约数量3位小数
+      ADA/USDC:USDC: 0          # ADA永续合约数量0位小数
+      AVAX/USDC:USDC: 3         # AVAX永续合约数量3位小数
       AVAX/USDC:SPOT: 3         # AVAX现货数量3位小数
-      BTC/USDC:PERP: 5          # BTC永续合约数量5位小数
+      BTC/USDC:USDC: 5          # BTC永续合约数量5位小数
       BTC/USDC:SPOT: 5          # BTC现货数量5位小数
-      DOGE/USDC:PERP: 0         # DOGE永续合约数量0位小数
-      ETH/USDC:PERP: 4          # ETH永续合约数量4位小数
+      DOGE/USDC:USDC: 0         # DOGE永续合约数量0位小数
+      ETH/USDC:USDC: 4          # ETH永续合约数量4位小数
       ETH/USDC:SPOT: 4          # ETH现货数量4位小数
-      LINK/USDC:PERP: 2         # LINK永续合约数量2位小数
-      SOL/USDC:PERP: 3          # SOL永续合约数量3位小数
+      LINK/USDC:USDC: 2         # LINK永续合约数量2位小数
+      SOL/USDC:USDC: 3          # SOL永续合约数量3位小数
       SOL/USDC:SPOT: 3          # SOL现货数量3位小数
-      UNI/USDC:PERP: 2          # UNI永续合约数量2位小数
+      UNI/USDC:USDC: 2          # UNI永续合约数量2位小数
       default: 6                # 默认数量精度
       
   # 速率限制配置 - 防止API调用过于频繁
@@ -222,9 +222,6 @@ hyperliquid:
       - SOL/USDC:USDC
       - AVAX/USDC:USDC
       - DOGE/USDC:USDC
-      - BTC/USDC:USDC
-      - ETH/USDC:USDC
-      - SOL/USDC:USDC
   # 符号映射配置已移除 - 现在由执行器统一处理格式转换
   
   # 支持的交易对配置
@@ -250,10 +247,10 @@ hyperliquid:
     - ETH/USDC:USDC           # ETH现货
     - SOL/USDC:USDC           # SOL现货
     - AVAX/USDC:USDC          # AVAX现货
-    - DOGE/USDC:SPOT
-    - ADA/USDC:SPOT
-    - LINK/USDC:SPOT
-    - UNI/USDC:SPOT
+    - DOGE/USDC:USDC
+    - ADA/USDC:USDC
+    - LINK/USDC:USDC
+    - UNI/USDC:USDC
   trading:
     perpetual:
       default_leverage: 10

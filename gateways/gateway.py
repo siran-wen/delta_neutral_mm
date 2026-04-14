@@ -751,21 +751,45 @@ class HyperliquidGateway(BaseGateway):
         self._ensure_authenticated()
         self._logger.info(f"撤销所有挂单: symbol={symbol or 'ALL'}")
 
-        # 先获取挂单列表
-        open_orders = self.fetch_open_orders(symbol)
-        if not open_orders:
-            return 0
+        # ── 优先：批量撤单接口（单次 API 调用，延迟最低） ──────────────────
+        try:
+            if symbol:
+                # 指定 symbol：单次调用即可
+                result = self._exchange.cancel_all_orders(symbol)
+                cancelled = len(result) if isinstance(result, list) else 0
+            else:
+                # 未指定 symbol：按 symbol 分组批量撤（Hyperliquid 要求指定 symbol）
+                open_orders = self.fetch_open_orders()
+                if not open_orders:
+                    return 0
+                # 收集有挂单的 symbol 去重
+                active_symbols = list({o.symbol for o in open_orders})
+                cancelled = 0
+                for sym in active_symbols:
+                    result = self._exchange.cancel_all_orders(sym)
+                    cancelled += len(result) if isinstance(result, list) else 0
 
-        cancelled = 0
-        for order in open_orders:
-            try:
-                self._exchange.cancel_order(order.id, order.symbol)
-                cancelled += 1
-            except Exception as e:
-                self._logger.warning(f"撤销订单 {order.id} 失败: {e}")
+            self._logger.info(f"已撤销 {cancelled} 个订单（批量接口）")
+            return cancelled
 
-        self._logger.info(f"已撤销 {cancelled}/{len(open_orders)} 个订单")
-        return cancelled
+        except Exception as e:
+            # ── Fallback：串行逐个撤单 ─────────────────────────────────────
+            self._logger.warning(f"批量撤单接口不可用，回退串行模式: {e}")
+
+            open_orders = self.fetch_open_orders(symbol)
+            if not open_orders:
+                return 0
+
+            cancelled = 0
+            for order in open_orders:
+                try:
+                    self._exchange.cancel_order(order.id, order.symbol)
+                    cancelled += 1
+                except Exception as cancel_err:
+                    self._logger.warning(f"撤销订单 {order.id} 失败: {cancel_err}")
+
+            self._logger.info(f"已撤销 {cancelled}/{len(open_orders)} 个订单（串行模式）")
+            return cancelled
 
     def fetch_open_orders(self, symbol: Optional[str] = None) -> List[Order]:
         self._ensure_authenticated()
