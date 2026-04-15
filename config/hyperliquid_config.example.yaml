@@ -311,3 +311,42 @@ hyperliquid:
         allMids: true          # 现货中间价数据
         l2Book: true          # 现货L2订单簿
         trades: false         # 现货交易数据
+
+# ====================================
+# 风控配置
+# ====================================
+risk:
+  position_limit:
+    max_delta_per_symbol: 1.0    # 单品种最大 |Delta|
+    max_delta_global: 10.0       # 全局最大 |Delta|（所有品种之和）
+    warn_threshold_pct: 0.8      # 预警阈值（占上限的百分比）
+    auto_hedge: true             # 超限时是否自动触发 Hedger
+  fat_finger:
+    max_deviation_pct: 0.05      # 挂单价偏离中价的最大百分比（5%）
+    max_deviation_abs: null      # 偏离绝对值上限（null = 不启用）
+    check_market_orders: false   # 是否检查市价单
+  kill_switch:
+    flatten_positions: true      # 关停时是否平掉全部持仓
+    cancel_timeout: 10.0         # 撤单超时（秒）
+    flatten_timeout: 30.0        # 平仓超时（秒）
+
+# ====================================
+# 连接监控配置
+# ====================================
+reconnect:
+  max_retries: 0                 # 最大重连次数（0 = 无限重试）
+  initial_delay: 1.0             # 首次重试延迟（秒）
+  max_delay: 60.0                # 最大退避延迟（秒）
+  backoff_factor: 2.0            # 指数退避倍率
+  heartbeat_interval: 5.0        # 心跳检测间隔（秒）
+  heartbeat_timeout: 10.0        # 单次心跳超时（秒）
+  cancel_on_disconnect: true     # 断连时是否立即撤单
+
+# ====================================
+# 订单管理配置
+# ====================================
+order_manager:
+  reconcile_interval: 3.0        # 对账巡检间隔（秒）
+  stale_timeout: 5.0             # 订单变为 STALE 的超时（秒）
+  rate_limit_per_sec: 20         # 每秒最大 API 请求数
+  rtt_warn_threshold: 2.0        # RTT 预警阈值（秒）

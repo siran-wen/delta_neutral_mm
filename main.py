@@ -21,9 +21,11 @@ MVP 职责:
 import argparse
 import io
 import logging
+import os
 import sys
 import threading
 import time
+from datetime import datetime
 from typing import Dict, List, Optional
 
 import yaml
@@ -38,7 +40,9 @@ if sys.platform == "win32":
 
 from gateways import GatewayFactory, OrderSide, OrderType, ConnectionMonitor, ReconnectPolicy
 from execution import OrderManager, ManagedOrder, OrderState, InventoryTracker, Quoter
-from risk import RiskManager, RiskConfig
+from risk import (
+    RiskManager, RiskConfig, PositionLimitConfig, FatFingerConfig, KillSwitchConfig,
+)
 
 
 # =============================================================================
@@ -74,11 +78,75 @@ def _get_strategy_cfg(cfg: dict) -> dict:
           requote_threshold: 0.0005  # mid 变动超过此比例时重新报价（0.05%）
     """
     defaults = {
-        "spread_pct": 0.001,       # 单侧价差 0.1%
-        "order_size_usd": 50.0,    # 每侧 50 USDC
-        "requote_threshold": 5e-4, # 0.05% 触发重报
+        "spread_pct": 0.001,              # 单侧价差 0.1%
+        "order_size_usd": 50.0,           # 每侧 50 USDC
+        "requote_threshold": 5e-4,        # 0.05% 触发重报
+        "skew_intensity": 0.0,            # 库存 skew 强度（0 = 关闭）
+        "spread_penalty_factor": 0.0,     # 库存价差加宽因子（0 = 不加宽）
     }
     return {**defaults, **cfg.get("strategy", {})}
+
+
+def _get_risk_config(cfg: dict) -> RiskConfig:
+    """
+    从 yaml 的 risk: 节构造 RiskConfig，缺失时使用 dataclass 默认值。
+
+    嵌套结构: risk.position_limit / risk.fat_finger / risk.kill_switch
+    每一层都容忍完全缺失。
+    """
+    risk_raw = cfg.get("risk", {})
+
+    pl_defaults = {
+        "max_delta_per_symbol": 1.0,
+        "max_delta_global": 10.0,
+        "warn_threshold_pct": 0.8,
+        "auto_hedge": True,
+    }
+    ff_defaults = {
+        "max_deviation_pct": 0.05,
+        "max_deviation_abs": None,
+        "check_market_orders": False,
+    }
+    ks_defaults = {
+        "flatten_positions": True,
+        "cancel_timeout": 10.0,
+        "flatten_timeout": 30.0,
+    }
+
+    return RiskConfig(
+        position_limit=PositionLimitConfig(**{**pl_defaults, **risk_raw.get("position_limit", {})}),
+        fat_finger=FatFingerConfig(**{**ff_defaults, **risk_raw.get("fat_finger", {})}),
+        kill_switch=KillSwitchConfig(**{**ks_defaults, **risk_raw.get("kill_switch", {})}),
+    )
+
+
+def _get_reconnect_policy(cfg: dict) -> "ReconnectPolicy":
+    """
+    从 yaml 的 reconnect: 节构造 ReconnectPolicy，缺失时使用 dataclass 默认值。
+    """
+    defaults = {
+        "max_retries": 0,
+        "initial_delay": 1.0,
+        "max_delay": 60.0,
+        "backoff_factor": 2.0,
+        "heartbeat_interval": 5.0,
+        "heartbeat_timeout": 10.0,
+        "cancel_on_disconnect": True,
+    }
+    return ReconnectPolicy(**{**defaults, **cfg.get("reconnect", {})})
+
+
+def _get_om_config(cfg: dict) -> dict:
+    """
+    从 yaml 的 order_manager: 节读取参数，缺失时使用默认值。
+    """
+    defaults = {
+        "reconcile_interval": 3.0,
+        "stale_timeout": 5.0,
+        "rate_limit_per_sec": 20,
+        "rtt_warn_threshold": 2.0,
+    }
+    return {**defaults, **cfg.get("order_manager", {})}
 
 
 # =============================================================================
@@ -92,12 +160,23 @@ def _compute_mid(ticker) -> Optional[float]:
     return ticker.last  # 无盘口时回退到最新成交价
 
 
-def setup_logging(level: str = "INFO") -> None:
+def setup_logging(level: str = "INFO", dry_run: bool = False) -> None:
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    fmt = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+
+    handlers: list = [logging.StreamHandler(sys.stdout)]
+
+    if dry_run:
+        os.makedirs("logs", exist_ok=True)
+        filename = f"logs/dry_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        handlers.append(logging.FileHandler(filename, encoding="utf-8"))
+
     logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        stream=sys.stdout,
+        level=log_level,
+        format=fmt,
+        datefmt=datefmt,
+        handlers=handlers,
     )
 
 
@@ -111,6 +190,8 @@ def parse_args() -> argparse.Namespace:
                         help="行情轮询间隔（秒）")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--dry-run", action="store_true", default=False,
+                        help="观察模式：连接交易所并打印报价，但不实际下单")
     return parser.parse_args()
 
 
@@ -145,19 +226,26 @@ def print_final_summary(
 
 def main() -> None:
     args = parse_args()
-    setup_logging(args.log_level)
+    setup_logging(args.log_level, dry_run=args.dry_run)
     logger = logging.getLogger("main")
+    dry_run: bool = args.dry_run
 
     sep = "=" * 55
     logger.info(sep)
-    logger.info("  Delta Neutral Market Maker  启动")
+    if dry_run:
+        logger.info("  [DRY-RUN] Delta Neutral Market Maker 启动（仅观察，不下单）")
+    else:
+        logger.info("  Delta Neutral Market Maker  启动")
     logger.info(sep)
 
     # ── 配置 ──────────────────────────────────────────────────────────────────
     cfg = _load_yaml(args.config)
-    symbols: List[str]   = _get_symbols(cfg, args.symbols)
-    poll_interval: float = _get_poll_interval(cfg, args.poll_interval)
-    strategy_cfg: dict   = _get_strategy_cfg(cfg)
+    symbols: List[str]        = _get_symbols(cfg, args.symbols)
+    poll_interval: float      = _get_poll_interval(cfg, args.poll_interval)
+    strategy_cfg: dict        = _get_strategy_cfg(cfg)
+    risk_cfg: RiskConfig      = _get_risk_config(cfg)
+    reconnect_policy          = _get_reconnect_policy(cfg)
+    om_cfg: dict              = _get_om_config(cfg)
 
     if not symbols:
         logger.error("未配置交易品种，请在 yaml 中添加 symbols.perpetual 或使用 --symbols")
@@ -169,6 +257,21 @@ def main() -> None:
         f"策略参数 : 价差={strategy_cfg['spread_pct']:.3%}  "
         f"每侧={strategy_cfg['order_size_usd']} USDC  "
         f"重报阈值={strategy_cfg['requote_threshold']:.3%}"
+    )
+    logger.info(
+        f"风控参数 : 单品种Delta上限={risk_cfg.position_limit.max_delta_per_symbol}  "
+        f"全局Delta上限={risk_cfg.position_limit.max_delta_global}  "
+        f"价格保护={risk_cfg.fat_finger.max_deviation_pct:.1%}"
+    )
+    logger.info(
+        f"连接监控 : 心跳={reconnect_policy.heartbeat_interval}s  "
+        f"退避={reconnect_policy.initial_delay}s→{reconnect_policy.max_delay}s  "
+        f"断连撤单={reconnect_policy.cancel_on_disconnect}"
+    )
+    logger.info(
+        f"订单管理 : 对账={om_cfg['reconcile_interval']}s  "
+        f"限速={om_cfg['rate_limit_per_sec']}/s  "
+        f"STALE超时={om_cfg['stale_timeout']}s"
     )
 
     # =========================================================================
@@ -182,25 +285,38 @@ def main() -> None:
     logger.info(f"Gateway 已连接: {gateway.exchange_name} ({gateway.status.value})")
 
     logger.info("── 初始化 OrderManager ──")
-    om = OrderManager(gateway, reconcile_interval=3.0)
-    om.start()
+    om = OrderManager(
+        gateway,
+        reconcile_interval=om_cfg["reconcile_interval"],
+        stale_timeout=om_cfg["stale_timeout"],
+        rate_limit_per_sec=om_cfg["rate_limit_per_sec"],
+        rtt_warn_threshold=om_cfg["rtt_warn_threshold"],
+    )
+    if not dry_run:
+        om.start()
+    else:
+        logger.info("  [DRY-RUN] 跳过 OM reconcile 线程（无订单需对账）")
 
     logger.info("── 初始化 ConnectionMonitor ──")
-    monitor = ConnectionMonitor(gateway, om, policy=ReconnectPolicy())
+    monitor = ConnectionMonitor(gateway, om, policy=reconnect_policy)
 
     logger.info("── 初始化 RiskManager ──")
     rm = RiskManager(
         gateway=gateway,
         order_manager=om,
         connection_monitor=monitor,
-        config=RiskConfig(),
+        config=risk_cfg,
     )
 
     # =========================================================================
     # 2. 共享状态（闭包变量，由回调和主循环共同读写）
     # =========================================================================
     inventory = InventoryTracker()
-    quoter = Quoter(strategy_cfg=strategy_cfg, inventory=inventory)
+    quoter = Quoter(
+        strategy_cfg=strategy_cfg,
+        inventory=inventory,
+        max_delta_per_symbol=risk_cfg.position_limit.max_delta_per_symbol,
+    )
 
     # ── 启动时同步交易所持仓，消除重启后 delta 盲区 ─────────────────────
     try:
@@ -260,15 +376,22 @@ def main() -> None:
         for s in symbols:
             _cancel_symbol_quotes(s)
 
-    def _place_symbol_quotes(symbol: str, mid: float) -> None:
+    def _place_symbol_quotes(symbol, mid):
         """
         撤旧挂新：在 bid/ask 两侧各挂一张限价单。
 
         流程:
             撤旧单 → quoter.compute() → 风控检查 → 下单
+        dry_run 时:
+            quoter.compute() → 精度规范化 → 风控检查 → 打印日志（不下单）
+
+        Returns:
+            (bid_price, ask_price, size) 精度规范化后的值，
+            或 None（规范化失败 / size<=0 时）。
         """
-        # 撤旧单，避免双边重叠持仓
-        _cancel_symbol_quotes(symbol)
+        if not dry_run:
+            # 撤旧单，避免双边重叠持仓
+            _cancel_symbol_quotes(symbol)
 
         # 计算报价
         bid_price, ask_price, size = quoter.compute(symbol, mid)
@@ -280,14 +403,17 @@ def main() -> None:
             size      = float(gateway.amount_to_precision(symbol, size))
         except Exception as e:
             logger.warning(f"精度规范化失败 [{symbol}]: {e}")
-            return
+            return None
 
         if size <= 0:
-            return
+            return None
 
         # ── 买单：仓位超多头限制时被 RiskManager 拒绝，只报卖单 ──────────────
         bid_ok = rm.pre_trade_check(symbol, "buy", size, price=bid_price, mid_price=mid)
-        if bid_ok.passed:
+        if dry_run:
+            status = "passed" if bid_ok.passed else f"rejected: {bid_ok.reason}"
+            logger.info(f"[DRY-RUN] [{symbol}] 买单 {size} @ {bid_price} (风控: {status})")
+        elif bid_ok.passed:
             try:
                 order = om.submit_order(
                     symbol, OrderSide.BUY, OrderType.LIMIT, size, bid_price,
@@ -303,7 +429,10 @@ def main() -> None:
 
         # ── 卖单：仓位超空头限制时被 RiskManager 拒绝，只报买单 ──────────────
         ask_ok = rm.pre_trade_check(symbol, "sell", size, price=ask_price, mid_price=mid)
-        if ask_ok.passed:
+        if dry_run:
+            status = "passed" if ask_ok.passed else f"rejected: {ask_ok.reason}"
+            logger.info(f"[DRY-RUN] [{symbol}] 卖单 {size} @ {ask_price} (风控: {status})")
+        elif ask_ok.passed:
             try:
                 order = om.submit_order(
                     symbol, OrderSide.SELL, OrderType.LIMIT, size, ask_price,
@@ -318,6 +447,7 @@ def main() -> None:
             logger.info(f"[{symbol}] 卖单被风控拒绝: {ask_ok.reason}")
 
         last_quoted_mid[symbol] = mid
+        return bid_price, ask_price, size
 
     # =========================================================================
     # 4. 事件回调
@@ -461,14 +591,29 @@ def main() -> None:
                     symbol, last_quoted_mid.get(symbol, 0.0), mid
                 )
 
+                quote_result = None
                 if triggered or mid_drifted:
-                    _place_symbol_quotes(symbol, mid)
+                    quote_result = _place_symbol_quotes(symbol, mid)
 
                     # TODO: strategy.on_tick(symbol, mid, inventory) 调用点
                     #       未来在此接入 strategy.delta_neutral_mm 的决策逻辑
 
+                # ── dry-run 每轮每品种汇总 ──────────────────────────────────
+                if dry_run and mid:
+                    if quote_result is not None:
+                        bid, ask, sz = quote_result
+                    else:
+                        bid, ask, sz = quoter.compute(symbol, mid)
+                    info = quoter.skew_info(symbol, mid)
+                    short_sym = symbol.split("/")[0]
+                    logger.info(
+                        f"[DRY-RUN] {short_sym} mid={mid:.2f} "
+                        f"bid={bid:.2f} ask={ask:.2f} size={sz:.5f} "
+                        f"delta={info['delta']:+.4f} skew_offset={info['skew_offset']:.2f}"
+                    )
+
             # ── 打印行情摘要 ─────────────────────────────────────────────────
-            if last_mids:
+            if last_mids and not dry_run:
                 summary = "  ".join(
                     f"{s.split('/')[0]}={v:.2f}" for s, v in last_mids.items()
                 )
@@ -516,25 +661,30 @@ def main() -> None:
 
             # Step 1: 停止主循环（已通过 shutdown_event 完成）
 
-            # Step 2: 撤销所有挂单（等待交易所 ACK，om.cancel_order 为同步调用）
-            logger.info("步骤1/3: 撤销所有挂单...")
-            try:
-                n_om = om.cancel_all()
-                logger.info(f"  OrderManager 撤掉 {n_om} 个挂单")
-            except Exception as e:
-                logger.error(f"  OM 撤单失败: {e}")
-            # Gateway 层兜底（防止 OM 漏掉非本进程创建的挂单）
-            try:
-                n_gw = gateway.cancel_all_orders()
-                if n_gw:
-                    logger.info(f"  Gateway 兜底撤掉 {n_gw} 个挂单")
-            except Exception as e:
-                logger.error(f"  Gateway 兜底撤单失败（网络可能已中断）: {e}")
+            if dry_run:
+                # dry-run 无实际挂单，跳过撤单步骤
+                logger.info("步骤1/3: [DRY-RUN] 跳过撤单（无实际挂单）")
+            else:
+                # Step 2: 撤销所有挂单（等待交易所 ACK，om.cancel_order 为同步调用）
+                logger.info("步骤1/3: 撤销所有挂单...")
+                try:
+                    n_om = om.cancel_all()
+                    logger.info(f"  OrderManager 撤掉 {n_om} 个挂单")
+                except Exception as e:
+                    logger.error(f"  OM 撤单失败: {e}")
+                # Gateway 层兜底（防止 OM 漏掉非本进程创建的挂单）
+                try:
+                    n_gw = gateway.cancel_all_orders()
+                    if n_gw:
+                        logger.info(f"  Gateway 兜底撤掉 {n_gw} 个挂单")
+                except Exception as e:
+                    logger.error(f"  Gateway 兜底撤单失败（网络可能已中断）: {e}")
 
             # Step 3: 停止各组件
             logger.info("步骤2/3: 停止各组件")
             monitor.stop()
-            om.stop()
+            if not dry_run:
+                om.stop()
 
         else:
             # KillSwitch 已执行撤单和组件停止，跳过重复操作

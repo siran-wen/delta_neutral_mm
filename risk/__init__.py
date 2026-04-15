@@ -25,10 +25,16 @@ from risk.pre_trade import (
     RiskManager,
     RiskConfig,
     RiskCheckResult,
+    PositionLimitConfig,
+    FatFingerConfig,
+    KillSwitchConfig,
 )
 
 __all__ = [
     "RiskManager",
     "RiskConfig",
     "RiskCheckResult",
+    "PositionLimitConfig",
+    "FatFingerConfig",
+    "KillSwitchConfig",
 ]
