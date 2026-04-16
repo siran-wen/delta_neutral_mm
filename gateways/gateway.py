@@ -592,13 +592,9 @@ class HyperliquidGateway(BaseGateway):
                     self._set_status(GatewayStatus.CONNECTED, "公共API已连接，认证失败")
                     return True
                 except Exception as e:
-                    # CCXT 4.5.x 的 fetch_balance 存在 422 序列化 bug，
-                    # 不代表认证失败（下单测试已验证凭证有效），直接标记为 AUTHENTICATED
-                    self._logger.warning(
-                        f"余额查询失败（可能是 CCXT 版本兼容问题，不影响下单）: {e}"
-                    )
-                    self._set_status(GatewayStatus.AUTHENTICATED, "认证成功（余额查询跳过）")
-                    return True
+                    self._on_error(e, "认证-余额查询")
+                    self._set_status(GatewayStatus.ERROR, f"余额查询异常: {e}")
+                    return False
             else:
                 self._set_status(GatewayStatus.CONNECTED, "公共API已连接（未配置认证）")
                 return True

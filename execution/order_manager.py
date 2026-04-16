@@ -905,8 +905,7 @@ class OrderManager:
         try:
             exchange_open_orders = self._gateway.fetch_open_orders()
         except Exception as e:
-            # CCXT 4.5.x 的 fetch_open_orders 存在 422 bug，降级为 debug 避免刷屏
-            self._logger.debug(f"巡检拉取挂单失败（可能是 CCXT 版本兼容问题）: {e}")
+            self._logger.warning(f"对账巡检拉取挂单失败: {e}")
             return
 
         # 建立交易所侧 eid 集合
@@ -985,8 +984,10 @@ class OrderManager:
         try:
             exchange_open_orders = self._gateway.fetch_open_orders()
         except Exception as e:
-            self._logger.warning(f"冷启动恢复失败（可能是 CCXT 版本兼容问题，不影响正常运行）: {e}")
-            return
+            # 冷启动拉不到挂单意味着本地对账基线缺失，继续运行会让本地订单簿
+            # 与交易所状态发散——直接抛出阻止启动，避免双挂/漏撤。
+            self._logger.error(f"冷启动恢复失败: {e}", exc_info=True)
+            raise
 
         recovered = 0
         for gw_order in exchange_open_orders:
