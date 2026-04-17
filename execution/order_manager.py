@@ -527,6 +527,7 @@ class OrderManager:
         price: Optional[float] = None,
         strategy_trigger_ts: Optional[float] = None,
         params: Optional[Dict] = None,
+        priority: RequestPriority = RequestPriority.NEW_ORDER,
     ) -> ManagedOrder:
         """
         提交新订单
@@ -568,7 +569,7 @@ class OrderManager:
             self._orders[cid] = managed
 
         # 限流
-        if not self._rate_limiter.wait_and_acquire(RequestPriority.NEW_ORDER, timeout=3.0):
+        if not self._rate_limiter.wait_and_acquire(priority, timeout=3.0):
             managed.transition_to(OrderState.REJECTED)
             managed.reject_reason = "rate_limited"
             self._logger.warning(f"[{cid}] 下单被限流拒绝")

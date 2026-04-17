@@ -20,6 +20,7 @@ from execution.order_manager import (
 )
 from execution.inventory import InventoryTracker
 from execution.quoter import Quoter
+from execution.hedger import Hedger, TradingPairConfig
 
 __all__ = [
     "OrderManager",
@@ -31,4 +32,6 @@ __all__ = [
     "RateLimiter",
     "InventoryTracker",
     "Quoter",
+    "Hedger",
+    "TradingPairConfig",
 ]

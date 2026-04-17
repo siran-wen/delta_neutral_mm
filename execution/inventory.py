@@ -50,31 +50,54 @@ class InventoryTracker:
     positions: Dict[str, float] = field(default_factory=dict)
     # symbol → 加权平均入场价
     avg_entry: Dict[str, float] = field(default_factory=dict)
-    # 已实现 PnL（USDC），暂不计算，留 placeholder
+    # 已实现 PnL（USDC）
     realized_pnl: float = 0.0
+    # (account, currency) → 余额，account 为 "spot" 或 "perp"
+    balances: Dict[str, Dict[str, float]] = field(default_factory=dict)
     # 线程安全锁：on_fill 可能在 OM-Reconcile 线程中被调用，
     # 而主循环线程同时读取 positions/avg_entry，需要互斥保护
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def on_fill(self, symbol: str, side: str, amount: float, price: float) -> None:
         """
-        根据成交更新持仓和加权均价。
+        根据成交更新持仓、加权均价、已实现 PnL。
 
-        TODO: 替换为精确计算，包含：
-              - 平仓时的 realized PnL 结算
-              - FIFO / 加权均价两种模式切换
+        已实现 PnL 按加权均价法结算：平仓部分按 (成交价 - 均价) 计入。
         """
         with self._lock:
             prev = self.positions.get(symbol, 0.0)
             change = amount if side == "buy" else -amount
             new_pos = prev + change
 
-            # 更新加权均价（仅在加仓时更新；减仓不改变成本价）
-            if change > 0:
-                prev_cost = abs(prev) * self.avg_entry.get(symbol, price)
-                self.avg_entry[symbol] = (prev_cost + change * price) / (abs(prev) + change)
-            elif new_pos == 0:
+            # ── 已实现 PnL（仓位缩减时按均价结算）────────────────────
+            entry = self.avg_entry.get(symbol, 0.0)
+            if entry > 0:
+                if prev > 0 and change < 0:
+                    # 平多仓
+                    closed = min(prev, amount)
+                    self.realized_pnl += closed * (price - entry)
+                elif prev < 0 and change > 0:
+                    # 平空仓
+                    closed = min(abs(prev), amount)
+                    self.realized_pnl += closed * (entry - price)
+
+            # ── 更新加权均价 ─────────────────────────────────────────
+            if new_pos == 0:
                 self.avg_entry.pop(symbol, None)
+            elif prev >= 0 and change > 0:
+                # 加多仓（含从零新建）
+                prev_cost = prev * self.avg_entry.get(symbol, price)
+                self.avg_entry[symbol] = (prev_cost + change * price) / (prev + change)
+            elif prev <= 0 and change < 0:
+                # 加空仓（含从零新建）
+                prev_cost = abs(prev) * self.avg_entry.get(symbol, price)
+                self.avg_entry[symbol] = (
+                    (prev_cost + abs(change) * price) / (abs(prev) + abs(change))
+                )
+            elif (prev > 0 and new_pos < 0) or (prev < 0 and new_pos > 0):
+                # 翻仓（穿越零点）— 新方向以当前价为均价
+                self.avg_entry[symbol] = price
+            # else: 减仓但未穿越零点 → 保持原均价
 
             self.positions[symbol] = new_pos
 
@@ -112,6 +135,55 @@ class InventoryTracker:
         """返回所有品种持仓的快照拷贝"""
         with self._lock:
             return dict(self.positions)
+
+    def get_net_delta(self, base_asset: str, asset_map: Dict[str, str]) -> float:
+        """
+        聚合某个 base asset 在所有市场（现货 + 永续）的净 Delta。
+
+        Args:
+            base_asset: 标的资产名称（如 "SOL"）
+            asset_map:  symbol → base_asset 的映射表
+
+        Returns:
+            净 Delta（现货多头 + 永续空头 应接近 0）
+        """
+        # 持锁拷贝快照，锁外计算
+        with self._lock:
+            pos_snapshot = dict(self.positions)
+        total = 0.0
+        for sym, delta in pos_snapshot.items():
+            if asset_map.get(sym) == base_asset:
+                total += delta
+        return total
+
+    # =========================================================================
+    # 余额管理
+    # =========================================================================
+
+    def set_balance(self, account: str, currency: str, amount: float) -> None:
+        """设置指定账户和币种的余额"""
+        with self._lock:
+            if account not in self.balances:
+                self.balances[account] = {}
+            self.balances[account][currency] = amount
+
+    def get_balance(self, account: str, currency: str) -> float:
+        """获取指定账户和币种的余额，不存在返回 0.0"""
+        with self._lock:
+            return self.balances.get(account, {}).get(currency, 0.0)
+
+    def get_all_balances(self) -> Dict[str, Dict[str, float]]:
+        """返回所有余额的快照拷贝"""
+        with self._lock:
+            return {acct: dict(curs) for acct, curs in self.balances.items()}
+
+    def deduct_balance(self, account: str, currency: str, amount: float) -> None:
+        """扣减余额（成交后调用）"""
+        with self._lock:
+            cur = self.balances.get(account, {}).get(currency, 0.0)
+            if account not in self.balances:
+                self.balances[account] = {}
+            self.balances[account][currency] = cur - amount
 
     def unrealized_pnl(self, mid_prices: Dict[str, float]) -> float:
         """

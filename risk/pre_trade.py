@@ -44,6 +44,7 @@ class RiskBreach(Enum):
     FAT_FINGER_PCT = "fat_finger_pct"                  # 价格偏离（百分比）
     FAT_FINGER_ABS = "fat_finger_abs"                  # 价格偏离（绝对值）
     KILL_SWITCH = "kill_switch"                        # 一键关停
+    INSUFFICIENT_BALANCE = "insufficient_balance"      # 余额不足
 
 
 @dataclass
@@ -525,6 +526,148 @@ class FatFingerGuard:
 
 
 # =============================================================================
+# 3b. 余额保护 (Balance Guard)
+# =============================================================================
+
+@dataclass
+class BalanceGuardConfig:
+    """
+    余额保护配置
+
+    Attributes:
+        enabled:           是否启用余额检查（默认关闭）
+        check_spot:        是否检查现货余额
+        check_perp:        是否检查永续保证金（留给后续迭代）
+        fee_buffer_pct:    余额预留比例作为 fee 缓冲（0.005 = 0.5%）
+    """
+    enabled: bool = False
+    check_spot: bool = True
+    check_perp: bool = False
+    fee_buffer_pct: float = 0.005
+
+
+class BalanceGuard:
+    """
+    余额保护
+
+    检查本次下单所需余额是否充足，考虑活跃挂单已占用的余额。
+
+    用法:
+        guard = BalanceGuard(inventory, order_manager, config=BalanceGuardConfig(enabled=True))
+        result = guard.check("USOL/USDC", "buy", 0.5, price=130.0)
+    """
+
+    def __init__(
+        self,
+        inventory=None,
+        order_manager=None,
+        config: Optional[BalanceGuardConfig] = None,
+        logger: Optional[logging.Logger] = None,
+    ):
+        self._inventory = inventory
+        self._om = order_manager
+        self._config = config or BalanceGuardConfig()
+        self._logger = logger or logging.getLogger("BalanceGuard")
+
+    @property
+    def config(self) -> BalanceGuardConfig:
+        return self._config
+
+    def check(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        price: Optional[float] = None,
+    ) -> RiskCheckResult:
+        """
+        检查余额是否足够支撑本次下单。
+
+        Args:
+            symbol:  交易对
+            side:    "buy" / "sell"
+            amount:  数量
+            price:   挂单价
+
+        Returns:
+            RiskCheckResult
+        """
+        if not self._config.enabled:
+            return RiskCheckResult.ok()
+
+        # 判断市场类型：symbol 不含 ":" 视为现货
+        is_spot = ":" not in symbol
+
+        if is_spot and self._config.check_spot:
+            return self._check_spot(symbol, side, amount, price)
+
+        if not is_spot and self._config.check_perp:
+            # 永续保证金检查留给后续迭代
+            pass
+
+        return RiskCheckResult.ok()
+
+    def _check_spot(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        price: Optional[float],
+    ) -> RiskCheckResult:
+        """现货余额检查"""
+        if price is None or price <= 0:
+            return RiskCheckResult.ok()
+
+        fee_mult = 1 + self._config.fee_buffer_pct
+
+        # 计算活跃挂单已占用
+        active_orders = self._om.get_active_orders(symbol) if self._om else []
+        occupied = 0.0
+
+        if side == "buy":
+            # Buy 需要 USDC
+            needed = price * amount * fee_mult
+            for o in active_orders:
+                if o.side == "buy" and o.price and o.amount:
+                    occupied += o.price * o.amount * fee_mult
+            available = self._inventory.get_balance("spot", "USDC") - occupied
+            if available < needed:
+                reason = (
+                    f"[{symbol}] BUY 余额不足: 需要 {needed:.2f} USDC, "
+                    f"可用 {available:.2f} USDC "
+                    f"(总余额 {self._inventory.get_balance('spot', 'USDC'):.2f}, "
+                    f"已占用 {occupied:.2f})"
+                )
+                self._logger.warning(reason)
+                return RiskCheckResult.reject(
+                    RiskBreach.INSUFFICIENT_BALANCE, reason,
+                    symbol=symbol, side=side, needed=needed, available=available,
+                )
+        else:
+            # Sell 需要 base asset
+            base_asset = symbol.split("/")[0]
+            needed = amount
+            for o in active_orders:
+                if o.side == "sell" and o.amount:
+                    occupied += o.amount
+            available = self._inventory.get_balance("spot", base_asset) - occupied
+            if available < needed:
+                reason = (
+                    f"[{symbol}] SELL 余额不足: 需要 {needed:.6f} {base_asset}, "
+                    f"可用 {available:.6f} {base_asset} "
+                    f"(总余额 {self._inventory.get_balance('spot', base_asset):.6f}, "
+                    f"已占用 {occupied:.6f})"
+                )
+                self._logger.warning(reason)
+                return RiskCheckResult.reject(
+                    RiskBreach.INSUFFICIENT_BALANCE, reason,
+                    symbol=symbol, side=side, needed=needed, available=available,
+                )
+
+        return RiskCheckResult.ok()
+
+
+# =============================================================================
 # 4. 一键关停 (Kill Switch)
 # =============================================================================
 
@@ -870,10 +1013,11 @@ class RiskConfig:
     """
     统一风控配置
 
-    组合持仓限制、价格保护、一键关停的配置。
+    组合持仓限制、价格保护、余额保护、一键关停的配置。
     """
     position_limit: PositionLimitConfig = field(default_factory=PositionLimitConfig)
     fat_finger: FatFingerConfig = field(default_factory=FatFingerConfig)
+    balance_guard: BalanceGuardConfig = field(default_factory=BalanceGuardConfig)
     kill_switch: KillSwitchConfig = field(default_factory=KillSwitchConfig)
 
 
@@ -915,6 +1059,7 @@ class RiskManager:
         order_manager=None,
         connection_monitor=None,
         config: Optional[RiskConfig] = None,
+        inventory=None,
         logger: Optional[logging.Logger] = None,
     ):
         self._config = config or RiskConfig()
@@ -929,6 +1074,12 @@ class RiskManager:
             config=self._config.fat_finger,
             logger=self._logger.getChild("FatFinger"),
         )
+        self._balance_guard = BalanceGuard(
+            inventory=inventory,
+            order_manager=order_manager,
+            config=self._config.balance_guard,
+            logger=self._logger.getChild("Balance"),
+        ) if inventory else None
         self._kill_switch = KillSwitch(
             gateway=gateway,
             order_manager=order_manager,
@@ -1045,6 +1196,18 @@ class RiskManager:
         if not ff_result.passed:
             self._emit("risk_breach", ff_result)
             return ff_result
+
+        # 检查4: 余额保护
+        if self._balance_guard is not None:
+            bg_result = self._balance_guard.check(
+                symbol=symbol,
+                side=side,
+                amount=amount,
+                price=price,
+            )
+            if not bg_result.passed:
+                self._emit("risk_breach", bg_result)
+                return bg_result
 
         return RiskCheckResult.ok()
 

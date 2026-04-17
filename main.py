@@ -39,9 +39,13 @@ if sys.platform == "win32":
         pass
 
 from gateways import GatewayFactory, OrderSide, OrderType, ConnectionMonitor, ReconnectPolicy
-from execution import OrderManager, ManagedOrder, OrderState, InventoryTracker, Quoter
+from execution import (
+    OrderManager, ManagedOrder, OrderState, InventoryTracker, Quoter,
+    Hedger, TradingPairConfig,
+)
 from risk import (
-    RiskManager, RiskConfig, PositionLimitConfig, FatFingerConfig, KillSwitchConfig,
+    RiskManager, RiskConfig, PositionLimitConfig, FatFingerConfig,
+    BalanceGuardConfig, KillSwitchConfig,
 )
 
 
@@ -112,10 +116,17 @@ def _get_risk_config(cfg: dict) -> RiskConfig:
         "cancel_timeout": 10.0,
         "flatten_timeout": 30.0,
     }
+    bg_defaults = {
+        "enabled": False,
+        "check_spot": True,
+        "check_perp": False,
+        "fee_buffer_pct": 0.005,
+    }
 
     return RiskConfig(
         position_limit=PositionLimitConfig(**{**pl_defaults, **risk_raw.get("position_limit", {})}),
         fat_finger=FatFingerConfig(**{**ff_defaults, **risk_raw.get("fat_finger", {})}),
+        balance_guard=BalanceGuardConfig(**{**bg_defaults, **risk_raw.get("balance_guard", {})}),
         kill_switch=KillSwitchConfig(**{**ks_defaults, **risk_raw.get("kill_switch", {})}),
     )
 
@@ -149,6 +160,32 @@ def _get_om_config(cfg: dict) -> dict:
     return {**defaults, **cfg.get("order_manager", {})}
 
 
+def _get_hedger_config(cfg: dict) -> dict:
+    """
+    从 yaml 的 hedger: 和 trading_pairs: 节读取对冲配置，缺失时默认关闭。
+
+    嵌套结构: hedger.enabled / hedger.hedge_slippage
+    trading_pairs 为顶层列表。
+    """
+    hedger_raw = cfg.get("hedger", {})
+    defaults = {
+        "enabled": False,
+        "hedge_slippage": 0.002,
+    }
+    hedger_cfg = {**defaults, **hedger_raw}
+
+    pairs_raw = cfg.get("trading_pairs", [])
+    hedger_cfg["trading_pairs"] = [
+        TradingPairConfig(
+            base=p["base"],
+            market_symbol=p["market_symbol"],
+            hedge_symbol=p["hedge_symbol"],
+        )
+        for p in pairs_raw
+    ]
+    return hedger_cfg
+
+
 # =============================================================================
 # 工具
 # =============================================================================
@@ -165,12 +202,14 @@ def setup_logging(level: str = "INFO", dry_run: bool = False) -> None:
     fmt = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
 
-    handlers: list = [logging.StreamHandler(sys.stdout)]
+    os.makedirs("logs", exist_ok=True)
+    prefix = "dry_run" if dry_run else "live"
+    filename = f"logs/{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-    if dry_run:
-        os.makedirs("logs", exist_ok=True)
-        filename = f"logs/dry_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        handlers.append(logging.FileHandler(filename, encoding="utf-8"))
+    handlers: list = [
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(filename, encoding="utf-8"),
+    ]
 
     logging.basicConfig(
         level=log_level,
@@ -192,6 +231,14 @@ def parse_args() -> argparse.Namespace:
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--dry-run", action="store_true", default=False,
                         help="观察模式：连接交易所并打印报价，但不实际下单")
+    parser.add_argument("--capital", type=float, default=10000.0,
+                        help="初始资金（USDC），用于计算年化收益率")
+    parser.add_argument("--preset-position", nargs="+", default=None,
+                        help="预设持仓（仅 dry-run 有效），格式 SYMBOL:USD_AMOUNT，"
+                             "正数=多头，负数=空头。例: USOL/USDC:5000 SOL/USDC:USDC:-5000")
+    parser.add_argument("--preset-balance", nargs="+", default=None,
+                        help="预设余额（仅 dry-run 有效），格式 ACCOUNT:CURRENCY:AMOUNT。"
+                             "例: spot:USDC:10000 perp:USDC:500")
     return parser.parse_args()
 
 
@@ -203,8 +250,12 @@ def print_final_summary(
     inventory: InventoryTracker,
     last_mids: Dict[str, float],
     logger: logging.Logger,
+    session_start: float = 0.0,
+    initial_capital: float = 0.0,
 ) -> None:
+    rpnl = inventory.realized_pnl
     upnl = inventory.unrealized_pnl(last_mids)
+    total = rpnl + upnl
     lines = inventory.summary_lines(last_mids)
     sep = "=" * 55
     logger.info(sep)
@@ -215,8 +266,18 @@ def print_final_summary(
             logger.info(line)
     else:
         logger.info("  无持仓记录")
-    logger.info(f"  已实现 PnL : {inventory.realized_pnl:+.4f} USDC  (TODO: 精确核算)")
-    logger.info(f"  未实现 PnL : {upnl:+.4f} USDC  (按最新 mid 估算)")
+    logger.info(f"  已实现 PnL : {rpnl:+.4f} USDC")
+    logger.info(f"  未实现 PnL : {upnl:+.4f} USDC")
+    logger.info(f"  合计 PnL   : {total:+.4f} USDC")
+    if session_start > 0 and initial_capital > 0:
+        elapsed_h = (time.time() - session_start) / 3600
+        annual_pct = (
+            (total / initial_capital) * (8760 / elapsed_h) * 100
+            if elapsed_h > 0 else 0.0
+        )
+        logger.info(f"  初始资金   : {initial_capital:.0f} USDC")
+        logger.info(f"  运行时间   : {elapsed_h:.2f} 小时")
+        logger.info(f"  预期年化   : {annual_pct:+.1f}%")
     logger.info(sep)
 
 
@@ -238,9 +299,28 @@ def main() -> None:
         logger.info("  Delta Neutral Market Maker  启动")
     logger.info(sep)
 
+    # ── 安全检查：preset 参数仅限 dry-run ─────────────────────────────────────
+    if not dry_run and args.preset_position:
+        logger.error("--preset-position 仅在 --dry-run 模式下可用，拒绝启动")
+        sys.exit(1)
+    if not dry_run and args.preset_balance:
+        logger.error("--preset-balance 仅在 --dry-run 模式下可用，拒绝启动")
+        sys.exit(1)
+
     # ── 配置 ──────────────────────────────────────────────────────────────────
     cfg = _load_yaml(args.config)
-    symbols: List[str]        = _get_symbols(cfg, args.symbols)
+    hedger_cfg: dict          = _get_hedger_config(cfg)
+
+    # 根据 hedger 模式选择做市品种
+    if hedger_cfg["enabled"]:
+        trading_pairs = hedger_cfg["trading_pairs"]
+        if not trading_pairs:
+            logger.error("[HEDGE] hedger.enabled=true 但未配置 trading_pairs")
+            sys.exit(1)
+        symbols: List[str] = [pair.market_symbol for pair in trading_pairs]
+    else:
+        symbols: List[str] = _get_symbols(cfg, args.symbols)
+
     poll_interval: float      = _get_poll_interval(cfg, args.poll_interval)
     strategy_cfg: dict        = _get_strategy_cfg(cfg)
     risk_cfg: RiskConfig      = _get_risk_config(cfg)
@@ -252,6 +332,7 @@ def main() -> None:
         sys.exit(1)
 
     logger.info(f"交易品种 : {symbols}")
+    logger.info(f"初始资金 : {args.capital:.0f} USDC")
     logger.info(f"轮询间隔 : {poll_interval}s")
     logger.info(
         f"策略参数 : 价差={strategy_cfg['spread_pct']:.3%}  "
@@ -273,6 +354,10 @@ def main() -> None:
         f"限速={om_cfg['rate_limit_per_sec']}/s  "
         f"STALE超时={om_cfg['stale_timeout']}s"
     )
+    if hedger_cfg["enabled"]:
+        logger.info(
+            f"对冲模式 : 已启用  滑点={hedger_cfg['hedge_slippage']:.3%}"
+        )
 
     # =========================================================================
     # 1. 模块初始化
@@ -283,6 +368,18 @@ def main() -> None:
         logger.error("网关连接失败，退出")
         sys.exit(1)
     logger.info(f"Gateway 已连接: {gateway.exchange_name} ({gateway.status.value})")
+
+    # ── Hedger: 验证 trading_pairs 中的 symbol 存在于交易所 ──
+    if hedger_cfg["enabled"]:
+        markets = gateway.get_markets()
+        for pair in hedger_cfg["trading_pairs"]:
+            for sym in (pair.market_symbol, pair.hedge_symbol):
+                if sym not in markets:
+                    logger.error(
+                        f"[HEDGE] symbol {sym} 不存在于交易所市场列表中，退出"
+                    )
+                    gateway.disconnect()
+                    sys.exit(1)
 
     logger.info("── 初始化 OrderManager ──")
     om = OrderManager(
@@ -300,14 +397,6 @@ def main() -> None:
     logger.info("── 初始化 ConnectionMonitor ──")
     monitor = ConnectionMonitor(gateway, om, policy=reconnect_policy)
 
-    logger.info("── 初始化 RiskManager ──")
-    rm = RiskManager(
-        gateway=gateway,
-        order_manager=om,
-        connection_monitor=monitor,
-        config=risk_cfg,
-    )
-
     # =========================================================================
     # 2. 共享状态（闭包变量，由回调和主循环共同读写）
     # =========================================================================
@@ -318,15 +407,114 @@ def main() -> None:
         max_delta_per_symbol=risk_cfg.position_limit.max_delta_per_symbol,
     )
 
+    logger.info("── 初始化 RiskManager ──")
+    rm = RiskManager(
+        gateway=gateway,
+        order_manager=om,
+        connection_monitor=monitor,
+        config=risk_cfg,
+        inventory=inventory,
+    )
+
+    # ── Hedger 初始化 ────────────────────────────────────────────────────
+    hedger: Optional[Hedger] = None
+    if hedger_cfg["enabled"]:
+        hedger = Hedger(
+            gateway=gateway,
+            order_manager=om,
+            risk_manager=rm,
+            inventory=inventory,
+            trading_pairs=hedger_cfg["trading_pairs"],
+            hedge_slippage=hedger_cfg["hedge_slippage"],
+            dry_run=dry_run,
+        )
+        for pair in hedger_cfg["trading_pairs"]:
+            logger.info(
+                f"[HEDGE] 双腿模式: {pair.market_symbol} (做市) "
+                f"↔ {pair.hedge_symbol} (对冲)"
+            )
+
     # ── 启动时同步交易所持仓，消除重启后 delta 盲区 ─────────────────────
     try:
-        positions = gateway.fetch_positions(symbols)
+        if hedger is not None:
+            sync_symbols = symbols + [
+                p.hedge_symbol for p in hedger_cfg["trading_pairs"]
+            ]
+            positions = gateway.fetch_positions(sync_symbols)
+        else:
+            positions = gateway.fetch_positions(symbols)
         n_synced = inventory.sync_from_positions(positions)
-        # 批量同步到 RiskManager.PositionLimiter
-        rm.sync_positions(inventory.get_all_positions())
         logger.info(f"初始持仓同步完成: {n_synced} 个品种")
     except Exception as e:
         logger.warning(f"初始持仓同步失败（将从零开始跟踪）: {e}")
+
+    # ── [DRY-RUN] 预设持仓注入 ───────────────────────────────────────────
+    if dry_run and args.preset_position:
+        # 构建合法 symbol 白名单
+        valid_symbols = set(symbols)
+        if hedger_cfg["enabled"]:
+            for pair in hedger_cfg["trading_pairs"]:
+                valid_symbols.add(pair.hedge_symbol)
+
+        for spec in args.preset_position:
+            # 从最后一个冒号分割：左边 symbol，右边 USD 金额
+            idx = spec.rfind(":")
+            if idx <= 0:
+                logger.error(f"[DRY-RUN] 预设持仓格式错误（需要 SYMBOL:USD_AMOUNT）: {spec}")
+                sys.exit(1)
+            sym, usd_str = spec[:idx], spec[idx + 1:]
+            try:
+                usd_amount = float(usd_str)
+            except ValueError:
+                logger.error(f"[DRY-RUN] 预设持仓金额无效: {spec}")
+                sys.exit(1)
+            if sym not in valid_symbols:
+                logger.error(
+                    f"[DRY-RUN] 预设持仓 symbol {sym} 不在做市品种列表中 "
+                    f"(合法: {sorted(valid_symbols)})"
+                )
+                sys.exit(1)
+            if abs(usd_amount) < 0.01:
+                continue
+
+            # 拉取 mid 换算 size
+            ticker = gateway.fetch_ticker(sym)
+            mid = (ticker.bid + ticker.ask) / 2.0 if ticker.bid and ticker.ask else ticker.last
+            if not mid or mid <= 0:
+                logger.error(f"[DRY-RUN] 无法获取 {sym} mid-price，跳过预设")
+                continue
+            size = abs(usd_amount) / mid
+            side = "buy" if usd_amount > 0 else "sell"
+            inventory.on_fill(sym, side, size, mid)
+            logger.info(
+                f"[DRY-RUN] 预设持仓: {sym} {'+' if usd_amount > 0 else ''}"
+                f"{usd_amount:.0f} USDC @ mid={mid:.4f} -> delta={inventory.get_position(sym):+.6f}"
+            )
+
+    # ── [DRY-RUN] 预设余额注入 ───────────────────────────────────────────
+    if dry_run and args.preset_balance:
+        for spec in args.preset_balance:
+            parts = spec.split(":", 2)
+            if len(parts) != 3:
+                logger.error(f"[DRY-RUN] 预设余额格式错误（需要 ACCOUNT:CURRENCY:AMOUNT）: {spec}")
+                sys.exit(1)
+            account, currency, amt_str = parts
+            if account not in ("spot", "perp"):
+                logger.error(f"[DRY-RUN] 预设余额 account 必须是 spot 或 perp，收到: {account}")
+                sys.exit(1)
+            try:
+                amount = float(amt_str)
+            except ValueError:
+                logger.error(f"[DRY-RUN] 预设余额金额无效: {spec}")
+                sys.exit(1)
+            inventory.set_balance(account, currency, amount)
+            logger.info(f"[DRY-RUN] 预设余额: {account}:{currency} = {amount:.2f}")
+
+    # ── 同步持仓到风控 ───────────────────────────────────────────────────
+    rm.sync_positions(inventory.get_all_positions())
+    if dry_run and (args.preset_position or args.preset_balance):
+        logger.info(f"[DRY-RUN] 最终持仓: {inventory.get_all_positions()}")
+        logger.info(f"[DRY-RUN] 最终余额: {inventory.get_all_balances()}")
 
     # symbol → {"bid": cid | None, "ask": cid | None}
     active_quotes: Dict[str, Dict[str, Optional[str]]] = {
@@ -351,6 +539,13 @@ def main() -> None:
 
     # 成交触发补单的即时唤醒事件
     requote_event = threading.Event()
+
+    # ── P&L 追踪 ─────────────────────────────────────────────────────
+    session_start = time.time()
+    initial_capital = args.capital
+    pnl_log_interval = 60.0               # P&L 日志间隔（秒）
+    last_pnl_log = session_start
+    counters = {"fills": 0, "volume_usdc": 0.0}  # 成交计数器
 
     # =========================================================================
     # 3. 内部操作函数
@@ -455,11 +650,11 @@ def main() -> None:
 
     def on_fill(managed: ManagedOrder) -> None:
         """
-        成交回调：更新持仓 → 通知 RiskManager → 标记补单。
+        成交回调：更新持仓 → 通知 RiskManager → 标记补单 → 触发对冲。
 
-        注意: 本函数可能在对账线程（OM-Reconcile）中被调用，
-              仅做轻量状态更新，不执行下单/撤单等阻塞操作。
-              实际补单由主循环在 requote_event 触发后处理。
+        注意: 本函数可能在对账线程（OM-Reconcile）中被调用。
+              做市腿成交时：轻量状态更新 + 触发 Hedger 对冲（阻塞）。
+              对冲腿成交时：仅更新持仓/风控，不触发补单和对冲。
         """
         amount = managed.filled or managed.amount
         if amount <= 0:
@@ -474,19 +669,28 @@ def main() -> None:
         # 同步通知 RiskManager 更新 Delta（用于仓位限制检查）
         rm.update_position(managed.symbol, signed)
 
+        # 成交计数
+        counters["fills"] += 1
+        counters["volume_usdc"] += amount * price
+
         logger.info(
             f"成交: {managed.symbol} {managed.side.upper()}  "
             f"{amount:.6f} @ {price}  "
             f"持仓={inventory.get_position(managed.symbol):+.6f}"
         )
 
-        # 清除已成交侧的报价 CID
-        side_key = "bid" if managed.side == "buy" else "ask"
-        active_quotes[managed.symbol][side_key] = None
+        # 清除已成交侧的报价 CID + 标记补单（仅做市腿品种）
+        if managed.symbol in active_quotes:
+            side_key = "bid" if managed.side == "buy" else "ask"
+            active_quotes[managed.symbol][side_key] = None
 
-        # 标记需补单，唤醒主循环（而非直接在此处下单，避免线程争用）
-        needs_requote[managed.symbol] = True
-        requote_event.set()
+            # 标记需补单，唤醒主循环（而非直接在此处下单，避免线程争用）
+            needs_requote[managed.symbol] = True
+            requote_event.set()
+
+        # 对冲触发（做市腿成交 → 对冲腿下反向单）
+        if hedger is not None:
+            hedger.on_market_fill(managed)
 
     def on_state_change(managed: ManagedOrder) -> None:
         """
@@ -619,6 +823,41 @@ def main() -> None:
                 )
                 logger.info(f"[行情] {summary}")
 
+            # ── 定期 P&L 日志 ────────────────────────────────────────────
+            nonlocal last_pnl_log
+            now = time.time()
+            if last_mids and now - last_pnl_log >= pnl_log_interval:
+                rpnl = inventory.realized_pnl
+                upnl = inventory.unrealized_pnl(last_mids)
+                total_pnl = rpnl + upnl
+                elapsed_h = (now - session_start) / 3600
+                annual_pct = (
+                    (total_pnl / initial_capital) * (8760 / elapsed_h) * 100
+                    if elapsed_h > 0 and initial_capital > 0 else 0.0
+                )
+                pos_str = "  ".join(
+                    f"{s.split('/')[0]}={inventory.get_position(s):+.4f}"
+                    for s in symbols
+                )
+                logger.info(
+                    f"[PnL] 已实现={rpnl:+.4f}  未实现={upnl:+.4f}  "
+                    f"合计={total_pnl:+.4f} USDC  "
+                    f"年化={annual_pct:+.1f}%  "
+                    f"成交={counters['fills']}笔  "
+                    f"量={counters['volume_usdc']:.0f}USDC  "
+                    f"运行={elapsed_h:.2f}h"
+                )
+                if pos_str:
+                    logger.info(f"[PnL] 持仓: {pos_str}")
+                logger.info(
+                    f"[PnL] 策略: spread={strategy_cfg['spread_pct']:.3%}  "
+                    f"size={strategy_cfg['order_size_usd']:.0f}USDC  "
+                    f"requote={strategy_cfg['requote_threshold']:.3%}  "
+                    f"skew={strategy_cfg['skew_intensity']}  "
+                    f"delta_max={risk_cfg.position_limit.max_delta_per_symbol}"
+                )
+                last_pnl_log = now
+
             # ── 精确睡眠（扣除本轮耗时），或被成交事件提前唤醒 ──────────────
             elapsed = time.time() - loop_start
             requote_event.wait(timeout=max(0.0, poll_interval - elapsed))
@@ -697,7 +936,28 @@ def main() -> None:
 
         # Step 最后：打印持仓摘要
         logger.info("步骤3/3: 最终持仓摘要")
-        print_final_summary(inventory, last_mids, logger)
+        logger.info(
+            f"  成交统计: {counters['fills']} 笔, "
+            f"成交量={counters['volume_usdc']:.2f} USDC"
+        )
+        print_final_summary(
+            inventory, last_mids, logger,
+            session_start=session_start,
+            initial_capital=initial_capital,
+        )
+
+        # ── Hedger 统计 ─────────────────────────────────────────────────
+        if hedger is not None:
+            stats = hedger.stats
+            logger.info(
+                f"[HEDGE] 对冲统计: 成功={stats['total_hedged']}  "
+                f"失败={stats['total_failed']}  "
+                f"未对冲残量={stats['pending_hedge_debt']}"
+            )
+            asset_map = hedger.build_asset_map()
+            for pair in hedger_cfg["trading_pairs"]:
+                net_delta = inventory.get_net_delta(pair.base, asset_map)
+                logger.info(f"[HEDGE] {pair.base} 净Delta={net_delta:+.6f}")
 
         gateway.disconnect()
         logger.info("系统已关停")
