@@ -90,10 +90,11 @@ class OrderState(Enum):
 class RequestPriority(Enum):
     """API 请求优先级（数值越小优先级越高）"""
     CANCEL = 0          # 最高：撤单
-    HEDGE = 1           # 对冲
-    NEW_ORDER = 2       # 新挂单
-    QUERY = 3           # 查询
-    LOW = 4             # 低优先级
+    BOOTSTRAP = 1       # 启动期建仓（InventoryBootstrap）
+    HEDGE = 2           # 对冲
+    NEW_ORDER = 3       # 新挂单
+    QUERY = 4           # 查询
+    LOW = 5             # 低优先级
 
 
 @dataclass

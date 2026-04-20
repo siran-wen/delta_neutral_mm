@@ -85,9 +85,27 @@ class Hedger:
         self._total_hedged: int = 0
         self._total_failed: int = 0
 
+        # 暂停开关：InventoryBootstrap 期间置 True，防止建仓单触发重复对冲
+        self._paused: bool = False
+
     # =========================================================================
     # 核心方法
     # =========================================================================
+
+    def pause(self) -> None:
+        """
+        暂停对冲。
+
+        用于启动阶段的 InventoryBootstrap：建仓自己会同时下"现货买 + 永续空"两腿，
+        Hedger 若在此期间收到做市腿成交事件会重复下对冲单。建仓完成后调用 resume()。
+        """
+        self._paused = True
+        self._logger.info("[HEDGE] 已暂停（bootstrap 期间）")
+
+    def resume(self) -> None:
+        """恢复对冲。与 pause() 成对使用。"""
+        self._paused = False
+        self._logger.info("[HEDGE] 已恢复")
 
     def on_market_fill(self, managed: ManagedOrder) -> None:
         """
@@ -96,6 +114,10 @@ class Hedger:
         由 main.py 的 on_fill 回调调用（在 OM-Reconcile 线程中执行）。
         忽略对冲腿自己的成交，避免无限循环。
         """
+        # ── 暂停保护：bootstrap 期间不对冲（避免重复对冲建仓单） ──────────
+        if self._paused:
+            return
+
         # ── 第一步：判断是否是做市腿的成交 ────────────────────────────────
         pair = self._market_to_pair.get(managed.symbol)
         if pair is None:

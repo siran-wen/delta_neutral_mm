@@ -21,6 +21,7 @@ from execution.order_manager import (
 from execution.inventory import InventoryTracker
 from execution.quoter import Quoter
 from execution.hedger import Hedger, TradingPairConfig
+from execution.bootstrap import InventoryBootstrap
 
 __all__ = [
     "OrderManager",
@@ -34,4 +35,5 @@ __all__ = [
     "Quoter",
     "Hedger",
     "TradingPairConfig",
+    "InventoryBootstrap",
 ]

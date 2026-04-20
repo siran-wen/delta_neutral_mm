@@ -41,7 +41,7 @@ if sys.platform == "win32":
 from gateways import GatewayFactory, OrderSide, OrderType, ConnectionMonitor, ReconnectPolicy
 from execution import (
     OrderManager, ManagedOrder, OrderState, InventoryTracker, Quoter,
-    Hedger, TradingPairConfig,
+    Hedger, TradingPairConfig, InventoryBootstrap,
 )
 from risk import (
     RiskManager, RiskConfig, PositionLimitConfig, FatFingerConfig,
@@ -160,6 +160,27 @@ def _get_om_config(cfg: dict) -> dict:
     return {**defaults, **cfg.get("order_manager", {})}
 
 
+def _get_bootstrap_config(cfg: dict) -> dict:
+    """
+    从 yaml 的 bootstrap: 节读取底仓建仓参数，缺失时整体禁用。
+
+    与 --bootstrap-inventory CLI 标志的交互：
+        - 若 yaml 里 enabled: true 则无条件启用
+        - 否则靠 CLI 标志触发（在 main() 里合并）
+    """
+    defaults = {
+        "enabled": False,
+        "base_inventory_multiplier": 3.0,
+        "min_spot_usdc_buffer": 50.0,
+        "min_perp_usdc_buffer": 30.0,
+        "skip_if_existing_pct": 0.5,
+        "ioc_slippage": 0.005,
+        "max_attempts": 3,
+        "verify_net_delta_tolerance": 0.05,
+    }
+    return {**defaults, **cfg.get("bootstrap", {})}
+
+
 def _get_hedger_config(cfg: dict) -> dict:
     """
     从 yaml 的 hedger: 和 trading_pairs: 节读取对冲配置，缺失时默认关闭。
@@ -239,6 +260,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preset-balance", nargs="+", default=None,
                         help="预设余额（仅 dry-run 有效），格式 ACCOUNT:CURRENCY:AMOUNT。"
                              "例: spot:USDC:10000 perp:USDC:500")
+    parser.add_argument("--bootstrap-inventory", action="store_true", default=False,
+                        help="启动时自动建立底仓 + 对冲空头（仅在 hedger.enabled=true 时有效）")
     return parser.parse_args()
 
 
@@ -324,6 +347,10 @@ def main() -> None:
     poll_interval: float      = _get_poll_interval(cfg, args.poll_interval)
     strategy_cfg: dict        = _get_strategy_cfg(cfg)
     risk_cfg: RiskConfig      = _get_risk_config(cfg)
+    bootstrap_cfg: dict       = _get_bootstrap_config(cfg)
+    # CLI 标志可以覆盖 yaml 的 enabled=false（但不覆盖 yaml 已开启的场景）
+    if args.bootstrap_inventory:
+        bootstrap_cfg = {**bootstrap_cfg, "enabled": True}
     reconnect_policy          = _get_reconnect_policy(cfg)
     om_cfg: dict              = _get_om_config(cfg)
 
@@ -747,6 +774,40 @@ def main() -> None:
     # 5. 启动 Monitor 和 RiskManager
     # =========================================================================
     monitor.start()
+
+    # ── 底仓自动建仓（在 rm.arm 之前：KillSwitch 尚未接管 SIGINT，便于失败时清理） ──
+    if bootstrap_cfg["enabled"]:
+        if not hedger_cfg["enabled"]:
+            logger.error("[BOOTSTRAP] 需要 hedger.enabled=true 才能建仓（缺少 hedge_symbol）")
+            sys.exit(1)
+
+        # 暂停 Hedger，防止建仓单触发重复对冲
+        if hedger is not None:
+            hedger.pause()
+        try:
+            bootstrap = InventoryBootstrap(
+                gateway=gateway,
+                order_manager=om,
+                inventory=inventory,
+                trading_pairs=hedger_cfg["trading_pairs"],
+                strategy_cfg=strategy_cfg,
+                bootstrap_cfg=bootstrap_cfg,
+                dry_run=dry_run,
+            )
+            ok = bootstrap.run()
+        finally:
+            if hedger is not None:
+                hedger.resume()
+
+        if not ok:
+            logger.error("[BOOTSTRAP] 建仓失败，退出")
+            sys.exit(1)
+        logger.info("[BOOTSTRAP] 全部 trading_pair 建仓完成")
+
+        # 同步建仓产生的持仓到 RiskManager 的 PositionLimiter
+        if not dry_run:
+            rm.sync_positions(inventory.get_all_positions())
+
     rm.arm()
 
     # =========================================================================
