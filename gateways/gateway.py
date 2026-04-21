@@ -378,6 +378,11 @@ class BaseGateway(ABC):
         """获取账户余额"""
         ...
 
+    def fetch_spot_balance(self) -> AccountBalance:
+        """获取现货账户余额。部分交易所的 fetch_balance 只返回保证金账户，
+        此方法用于显式拉取现货子账户余额。默认抛 NotImplementedError。"""
+        raise NotImplementedError
+
     @abstractmethod
     def fetch_positions(self, symbols: Optional[List[str]] = None) -> List[Position]:
         """
@@ -649,6 +654,100 @@ class HyperliquidGateway(BaseGateway):
         self._ensure_authenticated()
         data = self._exchange.fetch_balance()
         return AccountBalance.from_ccxt(data)
+
+    def fetch_spot_balance(self) -> AccountBalance:
+        """
+        通过 Hyperliquid 原生 /info POST 的 spotClearinghouseState 拉取现货账户余额。
+
+        CCXT 在 defaultType="swap" 下 fetch_balance 只返回永续账户的 USDC，不包含
+        现货 token（USOL/HYPE/USDH 等）。这里绕开 CCXT 直接走 REST /info。
+
+        原生响应格式：
+            {"balances": [
+                {"coin": "USDC", "token": 0,   "total": "71.30", "hold": "0.0", ...},
+                {"coin": "USOL", "token": 254, "total": "0.30",  "hold": "0.0", ...},
+            ]}
+        语义:
+            total = 总持有量（包括被挂单占用）
+            hold  = 被挂单占用
+            free  = total - hold
+
+        Returns:
+            AccountBalance，balances 字典以 coin 名（USDC / USOL / HYPE …）为 key。
+        """
+        self._ensure_authenticated()
+
+        wallet = self._auth_config.get("wallet_address", "").strip()
+        if not wallet:
+            raise ValueError("wallet_address 未配置，无法拉取 spot 余额")
+
+        base_url = self._api_config.get("base_url", "https://api.hyperliquid.xyz")
+        url = base_url.rstrip("/") + "/info"
+
+        self._logger.debug(f"fetch_spot_balance: wallet={wallet}  url={url}")
+
+        try:
+            import requests
+            resp = requests.post(
+                url,
+                json={"type": "spotClearinghouseState", "user": wallet},
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            self._on_error(e, "spotClearinghouseState")
+            raise
+
+        # 建立 "原生 coin 名 (baseName)" → "CCXT 剥离 U 前缀后的 base" 映射
+        # Hyperliquid 把 canonical 资产包装成 USOL / UBTC / UETH 等，CCXT 在加载
+        # markets 时保留原名到 baseName、剥离版放 base。下单和 BalanceGuard 都用
+        # CCXT 的 base 口径，这里同时把两个 key（USOL 和 SOL）指向同一个 Balance。
+        name_to_base: Dict[str, str] = {}
+        try:
+            for _m in (self._exchange.markets or {}).values():
+                if (
+                    _m.get("spot")
+                    and _m.get("baseName")
+                    and _m.get("base")
+                    and _m["baseName"] != _m["base"]
+                ):
+                    name_to_base[_m["baseName"]] = _m["base"]
+        except Exception:
+            pass
+
+        balances: Dict[str, Balance] = {}
+        for item in data.get("balances", []):
+            coin = item.get("coin", "")
+            if not coin:
+                continue
+            try:
+                total = float(item.get("total", 0) or 0)
+                hold = float(item.get("hold", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if total <= 0 and hold <= 0:
+                continue
+            bal_obj = Balance(
+                currency=coin,
+                free=max(total - hold, 0.0),
+                used=hold,
+                total=total,
+            )
+            balances[coin] = bal_obj
+            # 别名：同一个 Balance 对象既可用 native name (USOL) 也可用 CCXT base (SOL)
+            ccxt_base = name_to_base.get(coin)
+            if ccxt_base and ccxt_base not in balances:
+                balances[ccxt_base] = bal_obj
+
+        self._logger.info(
+            f"获取到现货余额: {len(balances)} 个 key"
+            + (
+                f" ({', '.join(f'{k}={v.total}' for k, v in balances.items())})"
+                if balances else ""
+            )
+        )
+        return AccountBalance(balances=balances, raw=data)
 
     def fetch_positions(
         self,

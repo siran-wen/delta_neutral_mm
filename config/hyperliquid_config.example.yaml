@@ -25,17 +25,17 @@ hyperliquid:
     perpetual:
       - SOL/USDC:USDC
     spot:
-      - USOL/USDC
+      - SOL/USDC                  # CCXT spot 口径（原生 USOL，CCXT 剥 U 前缀）
 
   # ── 精度配置 ──────────────────────────────────────────────────
   precision:
     price:
       SOL/USDC:USDC: 4
-      USOL/USDC: 3
+      SOL/USDC: 3
       default: 6
     quantity:
       SOL/USDC:USDC: 3
-      USOL/USDC: 3
+      SOL/USDC: 3
       default: 6
 
   # ── 手续费（参考信息，当前不参与 PnL 计算） ───────────────────
@@ -156,7 +156,7 @@ hedger:
 # hedger.enabled=true 时，做市品种从此处提取
 trading_pairs:
   - base: SOL
-    market_symbol: USOL/USDC          # 做市腿（现货）
+    market_symbol: SOL/USDC           # 做市腿（现货，CCXT 口径，底层是 USOL）
     hedge_symbol: SOL/USDC:USDC       # 对冲腿（永续）
 
 # ====================================

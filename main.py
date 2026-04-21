@@ -475,6 +475,83 @@ def main() -> None:
     except Exception as e:
         logger.warning(f"初始持仓同步失败（将从零开始跟踪）: {e}")
 
+    # ── 实盘：同步余额 + 现货底仓到 InventoryTracker ─────────────────────
+    # CCXT 在 defaultType="swap" 下 fetch_balance 只返回永续账户 USDC，不含现货
+    # token。解决：现货走原生 spotClearinghouseState，两路各取所需：
+    #   - fetch_balance()      → perp 子账户（USDC 保证金） → balances["perp"]
+    #   - fetch_spot_balance() → spot 子账户（USDC + USOL + ...） → balances["spot"]
+    # BalanceGuard._check_spot 读 spot:USDC / spot:{base}，两者都由 spot 分支填充。
+    if not dry_run:
+        # 永续账户余额
+        _perp_bal = None
+        try:
+            _perp_bal = gateway.fetch_balance()
+        except Exception as e:
+            logger.warning(f"永续余额拉取失败: {e}")
+
+        # 现货账户余额（绕过 CCXT 限制，走原生 /info）
+        _spot_bal = None
+        try:
+            _spot_bal = gateway.fetch_spot_balance()
+        except Exception as e:
+            logger.warning(f"现货余额拉取失败（现货底仓同步跳过）: {e}")
+
+        # Step 1: 永续 → inventory.balances["perp"]
+        if _perp_bal is not None:
+            for currency, bal in _perp_bal.balances.items():
+                free = float(bal.free or 0.0)
+                if free > 0:
+                    inventory.set_balance("perp", currency, free)
+                    logger.info(f"初始余额同步: perp:{currency} = {free:.6f}")
+
+        # Step 2: 现货全部 coin → inventory.balances["spot"]（BalanceGuard 用）
+        if _spot_bal is not None:
+            for currency, bal in _spot_bal.balances.items():
+                free = float(bal.free or 0.0)
+                if free > 0:
+                    inventory.set_balance("spot", currency, free)
+                    logger.info(f"初始余额同步: spot:{currency} = {free:.6f}")
+
+        # Step 3: 现货 base asset → inventory.positions（Quoter/skew/net_delta 用）
+        # 永续 symbol 都是 "X/USDC:USDC" 格式；不含 ":" 的即现货
+        if _spot_bal is not None:
+            if hedger is not None:
+                spot_market_symbols = [
+                    p.market_symbol
+                    for p in hedger_cfg["trading_pairs"]
+                    if ":" not in p.market_symbol
+                ]
+            else:
+                spot_market_symbols = [s for s in symbols if ":" not in s]
+
+            for sym in spot_market_symbols:
+                base_asset = sym.split("/")[0]      # "USOL/USDC" → "USOL"
+                bal = _spot_bal.balances.get(base_asset)
+                if bal is None:
+                    continue
+                qty = float(bal.total or 0.0)
+                if qty <= 0:
+                    continue
+                # 拉 mid 作为 avg_entry 锚点（仅影响 PnL 显示和 skew 的中心点）
+                entry_mid = 0.0
+                try:
+                    ticker = gateway.fetch_ticker(sym)
+                    if ticker.bid and ticker.ask:
+                        entry_mid = (ticker.bid + ticker.ask) / 2.0
+                    elif ticker.last:
+                        entry_mid = float(ticker.last)
+                except Exception:
+                    pass
+                # 直接写入 positions / avg_entry（绕过 on_fill 的加权均价逻辑）
+                with inventory._lock:
+                    inventory.positions[sym] = qty
+                    if entry_mid > 0:
+                        inventory.avg_entry[sym] = entry_mid
+                logger.info(
+                    f"现货底仓同步: {sym} = {qty} {base_asset} "
+                    f"(avg_entry≈{entry_mid:.4f})"
+                )
+
     # ── [DRY-RUN] 预设持仓注入 ───────────────────────────────────────────
     if dry_run and args.preset_position:
         # 构建合法 symbol 白名单
