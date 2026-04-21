@@ -99,6 +99,20 @@ class InventoryTracker:
                 self.avg_entry[symbol] = price
             # else: 减仓但未穿越零点 → 保持原均价
 
+            # ── 更新余额字典（供 BalanceGuard 实时感知账户余额变化）──
+            # 仅对现货 symbol 生效（永续没有现货余额概念，保证金变动由 fetch_balance 刷）
+            # 不扣 fee —— 上游尚未接入成交费率，余额会略高于实际但方向正确
+            if ":" not in symbol:
+                base_asset, quote_asset = symbol.split("/")
+                notional = amount * price
+                spot = self.balances.setdefault("spot", {})
+                if side == "buy":
+                    spot[quote_asset] = spot.get(quote_asset, 0.0) - notional
+                    spot[base_asset] = spot.get(base_asset, 0.0) + amount
+                else:
+                    spot[quote_asset] = spot.get(quote_asset, 0.0) + notional
+                    spot[base_asset] = spot.get(base_asset, 0.0) - amount
+
             self.positions[symbol] = new_pos
 
     def sync_from_positions(self, positions: List["Position"]) -> int:

@@ -218,6 +218,56 @@ def _compute_mid(ticker) -> Optional[float]:
     return ticker.last  # 无盘口时回退到最新成交价
 
 
+def _compute_initial_capital(
+    perp_balance: Optional["AccountBalance"],
+    spot_balance: Optional["AccountBalance"],
+    spot_asset_value_usd: float,
+    manual_capital: float,
+    logger: logging.Logger,
+) -> float:
+    """
+    从余额对象推算 initial_capital（年化计算用的分母）。
+
+    优先级：
+        1. manual_capital > 0：用户显式指定，直接使用
+        2. 自动推算：perp.USDC.total + spot.USDC.total + Σ(现货非USDC × mid)
+        3. 任一余额拉取失败或合计 ≤ 0：回退到 1.0（避免除零，年化会为 0）
+
+    spot_asset_value_usd 由调用方基于 inventory.positions（已按 symbol 去重）聚合，
+    避免 USOL/SOL 等别名在 balances 字典里重复计数。
+    """
+    if manual_capital > 0:
+        logger.info(f"初始资金（手动指定）: {manual_capital:.2f} USDC")
+        return manual_capital
+
+    perp_usdc = 0.0
+    spot_usdc = 0.0
+    if perp_balance is not None:
+        bal = perp_balance.balances.get("USDC")
+        if bal is not None:
+            perp_usdc = float(bal.total or 0.0)
+    if spot_balance is not None:
+        bal = spot_balance.balances.get("USDC")
+        if bal is not None:
+            spot_usdc = float(bal.total or 0.0)
+
+    auto_capital = perp_usdc + spot_usdc + spot_asset_value_usd
+    if auto_capital <= 0:
+        logger.warning(
+            f"自动推算初始资金失败（perp={perp_usdc:.2f}  spot={spot_usdc:.2f}  "
+            f"spot非USDC={spot_asset_value_usd:.2f}），回退到 1.0（年化计算将为 0）"
+        )
+        return 1.0
+
+    logger.info(
+        f"初始资金（自动）: {auto_capital:.2f} USDC "
+        f"(perp:USDC={perp_usdc:.2f} + spot:USDC={spot_usdc:.2f}"
+        + (f" + spot非USDC={spot_asset_value_usd:.2f}" if spot_asset_value_usd > 0 else "")
+        + ")"
+    )
+    return auto_capital
+
+
 def setup_logging(level: str = "INFO", dry_run: bool = False) -> None:
     log_level = getattr(logging, level.upper(), logging.INFO)
     fmt = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
@@ -252,8 +302,9 @@ def parse_args() -> argparse.Namespace:
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--dry-run", action="store_true", default=False,
                         help="观察模式：连接交易所并打印报价，但不实际下单")
-    parser.add_argument("--capital", type=float, default=10000.0,
-                        help="初始资金（USDC），用于计算年化收益率")
+    parser.add_argument("--capital", type=float, default=0.0,
+                        help="手动指定初始资金（USDC），用于年化计算分母。"
+                             "默认 0 表示自动从交易所余额推算（实盘）或使用 preset-balance 合计（dry-run）。")
     parser.add_argument("--preset-position", nargs="+", default=None,
                         help="预设持仓（仅 dry-run 有效），格式 SYMBOL:USD_AMOUNT，"
                              "正数=多头，负数=空头。例: USOL/USDC:5000 SOL/USDC:USDC:-5000")
@@ -359,7 +410,6 @@ def main() -> None:
         sys.exit(1)
 
     logger.info(f"交易品种 : {symbols}")
-    logger.info(f"初始资金 : {args.capital:.0f} USDC")
     logger.info(f"轮询间隔 : {poll_interval}s")
     logger.info(
         f"策略参数 : 价差={strategy_cfg['spread_pct']:.3%}  "
@@ -475,6 +525,9 @@ def main() -> None:
     except Exception as e:
         logger.warning(f"初始持仓同步失败（将从零开始跟踪）: {e}")
 
+    # initial_capital 默认用 CLI 值，实盘路径下会在余额同步后用 _compute_initial_capital 覆盖
+    initial_capital = args.capital if args.capital > 0 else 1.0
+
     # ── 实盘：同步余额 + 现货底仓到 InventoryTracker ─────────────────────
     # CCXT 在 defaultType="swap" 下 fetch_balance 只返回永续账户 USDC，不含现货
     # token。解决：现货走原生 spotClearinghouseState，两路各取所需：
@@ -551,6 +604,23 @@ def main() -> None:
                     f"现货底仓同步: {sym} = {qty} {base_asset} "
                     f"(avg_entry≈{entry_mid:.4f})"
                 )
+
+        # ── 计算 initial_capital（在 perp/spot 余额 + 现货底仓同步之后）──
+        # 从 inventory.positions 聚合现货非 USDC 资产估值（按 symbol 去重，
+        # 避免 _spot_bal.balances 里 USOL/SOL 别名重复计数）。
+        spot_asset_value_usd = 0.0
+        for sym, qty in inventory.get_all_positions().items():
+            if ":" in sym:
+                continue  # 永续已含在 perp:USDC.total 里
+            if qty <= 0:
+                continue
+            entry = inventory.avg_entry.get(sym, 0.0)
+            if entry > 0:
+                spot_asset_value_usd += qty * entry
+
+        initial_capital = _compute_initial_capital(
+            _perp_bal, _spot_bal, spot_asset_value_usd, args.capital, logger
+        )
 
     # ── [DRY-RUN] 预设持仓注入 ───────────────────────────────────────────
     if dry_run and args.preset_position:
@@ -646,7 +716,24 @@ def main() -> None:
 
     # ── P&L 追踪 ─────────────────────────────────────────────────────
     session_start = time.time()
-    initial_capital = args.capital
+
+    # initial_capital 在实盘路径下已由 _compute_initial_capital 提前计算。
+    # dry-run 路径下未进入那个块，这里补一个 fallback：
+    #   - 有 --capital 时用手动值
+    #   - 否则从 inventory.balances 合计（preset-balance 已注入）
+    if dry_run:
+        if args.capital > 0:
+            initial_capital = args.capital
+            logger.info(f"[DRY-RUN] 初始资金（手动）: {initial_capital:.2f} USDC")
+        else:
+            total = 0.0
+            for acct, curr_map in inventory.get_all_balances().items():
+                total += curr_map.get("USDC", 0.0)
+            initial_capital = max(total, 1.0)
+            logger.info(
+                f"[DRY-RUN] 初始资金（自动推算）: {initial_capital:.2f} USDC"
+            )
+
     pnl_log_interval = 60.0               # P&L 日志间隔（秒）
     last_pnl_log = session_start
     counters = {"fills": 0, "volume_usdc": 0.0}  # 成交计数器
@@ -717,6 +804,7 @@ def main() -> None:
                 order = om.submit_order(
                     symbol, OrderSide.BUY, OrderType.LIMIT, size, bid_price,
                     strategy_trigger_ts=time.time(),
+                    source="quoter",
                 )
                 if not order.state.is_terminal:
                     active_quotes[symbol]["bid"] = order.client_order_id
@@ -736,6 +824,7 @@ def main() -> None:
                 order = om.submit_order(
                     symbol, OrderSide.SELL, OrderType.LIMIT, size, ask_price,
                     strategy_trigger_ts=time.time(),
+                    source="quoter",
                 )
                 if not order.state.is_terminal:
                     active_quotes[symbol]["ask"] = order.client_order_id
@@ -973,10 +1062,6 @@ def main() -> None:
                     (total_pnl / initial_capital) * (8760 / elapsed_h) * 100
                     if elapsed_h > 0 and initial_capital > 0 else 0.0
                 )
-                pos_str = "  ".join(
-                    f"{s.split('/')[0]}={inventory.get_position(s):+.4f}"
-                    for s in symbols
-                )
                 logger.info(
                     f"[PnL] 已实现={rpnl:+.4f}  未实现={upnl:+.4f}  "
                     f"合计={total_pnl:+.4f} USDC  "
@@ -985,8 +1070,83 @@ def main() -> None:
                     f"量={counters['volume_usdc']:.0f}USDC  "
                     f"运行={elapsed_h:.2f}h"
                 )
-                if pos_str:
-                    logger.info(f"[PnL] 持仓: {pos_str}")
+
+                # 按 symbol 打印每腿明细，遍历 inventory.positions（含对冲腿）
+                for sym, qty in sorted(inventory.get_all_positions().items()):
+                    if abs(qty) < 1e-10:
+                        continue
+                    base = sym.split("/")[0]
+                    tag = "合约" if ":" in sym else "现货"
+                    entry = inventory.avg_entry.get(sym, 0.0)
+                    mid = last_mids.get(sym, 0.0)
+                    # 对冲腿 mid 可能不在 last_mids（行情轮询只覆盖做市腿），用 entry 兜底
+                    if mid <= 0:
+                        mid = entry
+                    leg_upnl = qty * (mid - entry) if entry > 0 and mid > 0 else 0.0
+                    logger.info(
+                        f"[PnL] {tag} {sym:<20s}: "
+                        f"{qty:+.6f} {base:<5s}  "
+                        f"entry={entry:.4f}  mid={mid:.4f}  "
+                        f"uPnL={leg_upnl:+.4f}"
+                    )
+
+                # hedger 启用时按 base 聚合净 delta 和组合 uPnL
+                if hedger is not None and hedger_cfg["trading_pairs"]:
+                    for pair in hedger_cfg["trading_pairs"]:
+                        # 两腿都无持仓 → 跳过（避免打印 +0.000000 噪声）
+                        if (
+                            abs(inventory.get_position(pair.market_symbol)) < 1e-10
+                            and abs(inventory.get_position(pair.hedge_symbol)) < 1e-10
+                        ):
+                            continue
+                        asset_map = {
+                            pair.market_symbol: pair.base,
+                            pair.hedge_symbol: pair.base,
+                        }
+                        net_delta = inventory.get_net_delta(pair.base, asset_map)
+                        combo_upnl = 0.0
+                        for sym in (pair.market_symbol, pair.hedge_symbol):
+                            q = inventory.get_position(sym)
+                            if abs(q) < 1e-10:
+                                continue
+                            e = inventory.avg_entry.get(sym, 0.0)
+                            m = last_mids.get(sym, 0.0) or e
+                            if e > 0 and m > 0:
+                                combo_upnl += q * (m - e)
+                        logger.info(
+                            f"[PnL] 聚合 {pair.base:<20s}: "
+                            f"净Delta={net_delta:+.6f}  "
+                            f"组合uPnL={combo_upnl:+.4f} USDC"
+                        )
+
+                # 余额快照（方便追踪 balances 是否随成交同步更新）
+                all_bal = inventory.get_all_balances()
+                bal_snapshots = []
+                for acct in ("spot", "perp"):
+                    curs = all_bal.get(acct, {})
+                    # 去重：USOL/SOL 别名只保留一个（优先 USOL，即原生名）
+                    unique_coins = {}
+                    for coin, amt in curs.items():
+                        if abs(amt) < 1e-10:
+                            continue
+                        if coin == "SOL" and "USOL" in curs:
+                            continue  # SOL 是 USOL 的 CCXT 别名，跳过避免重复
+                        unique_coins[coin] = amt
+                    if unique_coins:
+                        inner = ", ".join(
+                            f"{coin}={amt:.4f}"
+                            for coin, amt in sorted(unique_coins.items())
+                        )
+                        bal_snapshots.append(f"{acct}{{{inner}}}")
+                if bal_snapshots:
+                    total_usdc = sum(
+                        curs.get("USDC", 0.0) for curs in all_bal.values()
+                    )
+                    logger.info(
+                        f"[PnL] 余额: {'  '.join(bal_snapshots)}  "
+                        f"totalUSDC={total_usdc:.2f}"
+                    )
+
                 logger.info(
                     f"[PnL] 策略: spread={strategy_cfg['spread_pct']:.3%}  "
                     f"size={strategy_cfg['order_size_usd']:.0f}USDC  "
@@ -1092,10 +1252,35 @@ def main() -> None:
                 f"失败={stats['total_failed']}  "
                 f"未对冲残量={stats['pending_hedge_debt']}"
             )
-            asset_map = hedger.build_asset_map()
-            for pair in hedger_cfg["trading_pairs"]:
-                net_delta = inventory.get_net_delta(pair.base, asset_map)
-                logger.info(f"[HEDGE] {pair.base} 净Delta={net_delta:+.6f}")
+
+            # 每个 trading_pair 的 delta 分解（现货 / 永续 / 净值 / 裸敞口告警）
+            if hedger_cfg.get("trading_pairs"):
+                logger.info("[HEDGE] 最终 delta 分解:")
+                for pair in hedger_cfg["trading_pairs"]:
+                    spot_q = inventory.get_position(pair.market_symbol)
+                    perp_q = inventory.get_position(pair.hedge_symbol)
+                    spot_entry = inventory.avg_entry.get(pair.market_symbol, 0.0)
+                    perp_entry = inventory.avg_entry.get(pair.hedge_symbol, 0.0)
+                    asset_map = {
+                        pair.market_symbol: pair.base,
+                        pair.hedge_symbol: pair.base,
+                    }
+                    net_d = inventory.get_net_delta(pair.base, asset_map)
+                    warn = "  !! 裸敞口超 0.05" if abs(net_d) > 0.05 else ""
+                    logger.info(
+                        f"  {pair.base}: 现货={spot_q:+.6f} @ {spot_entry:.4f}  "
+                        f"永续={perp_q:+.6f} @ {perp_entry:.4f}  "
+                        f"净delta={net_d:+.6f}{warn}"
+                    )
+
+            # 失败原因分类分布
+            reasons = getattr(hedger, "_failure_reasons", {}) or {}
+            total_fail = sum(reasons.values())
+            if total_fail > 0:
+                logger.info("[HEDGE] 失败原因分布:")
+                for reason, count in reasons.items():
+                    if count > 0:
+                        logger.info(f"  {reason:<15s}: {count} 次")
 
         gateway.disconnect()
         logger.info("系统已关停")

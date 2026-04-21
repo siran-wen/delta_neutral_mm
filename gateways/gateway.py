@@ -407,17 +407,19 @@ class BaseGateway(ABC):
         amount: float,
         price: Optional[float] = None,
         params: Optional[Dict] = None,
+        client_order_id: Optional[str] = None,
     ) -> Order:
         """
         创建订单
 
         Args:
-            symbol:     交易对
-            side:       买/卖
-            order_type: 限价/市价
-            amount:     数量
-            price:      价格 (限价单必填)
-            params:     交易所特定的额外参数
+            symbol:           交易对
+            side:             买/卖
+            order_type:       限价/市价
+            amount:           数量
+            price:            价格 (限价单必填)
+            params:           交易所特定的额外参数
+            client_order_id:  本地订单 ID（仅用于日志追溯，不传给交易所）
         """
         ...
 
@@ -788,6 +790,18 @@ class HyperliquidGateway(BaseGateway):
             self._on_error(e, "查询持仓")
             raise
 
+    def fetch_my_trades(
+        self, symbol: Optional[str] = None, limit: int = 50
+    ) -> List[Dict]:
+        """拉取最近成交记录，CCXT 标准格式 list[dict]，含 'order' (eid) / 'amount' / 'price' 等"""
+        self._ensure_authenticated()
+        try:
+            trades = self._exchange.fetch_my_trades(symbol, limit=limit)
+            return trades or []
+        except Exception as e:
+            self._on_error(e, f"fetch_my_trades({symbol})")
+            raise
+
     # ---- 订单管理 ----
 
     def create_order(
@@ -798,6 +812,7 @@ class HyperliquidGateway(BaseGateway):
         amount: float,
         price: Optional[float] = None,
         params: Optional[Dict] = None,
+        client_order_id: Optional[str] = None,
     ) -> Order:
         self._ensure_authenticated()
 
@@ -809,8 +824,9 @@ class HyperliquidGateway(BaseGateway):
             else None
         )
 
+        cid_tag = f" cid={client_order_id}" if client_order_id else ""
         self._logger.info(
-            f"创建订单: {symbol} {side.value} {order_type.value} "
+            f"创建订单{cid_tag}: {symbol} {side.value} {order_type.value} "
             f"数量={formatted_amount} 价格={formatted_price}"
         )
 
@@ -823,7 +839,7 @@ class HyperliquidGateway(BaseGateway):
             params=params or {},
         )
         order = Order.from_ccxt(data)
-        self._logger.info(f"订单已创建: id={order.id}, status={order.status}")
+        self._logger.info(f"订单已创建{cid_tag}: eid={order.id}, status={order.status}")
         self._emit("order", order)
         return order
 

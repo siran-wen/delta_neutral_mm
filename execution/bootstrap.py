@@ -423,6 +423,7 @@ class InventoryBootstrap:
                     amount=amount, price=price,
                     strategy_trigger_ts=time.time(),
                     priority=RequestPriority.BOOTSTRAP,
+                    source="bootstrap",
                 )
             except Exception as e:
                 last_reason = f"exception: {e}"

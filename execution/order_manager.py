@@ -165,8 +165,16 @@ class ManagedOrder:
     # ---- 延迟追踪 ----
     latency: Optional[LatencyRecord] = field(default=None)
 
+    # ---- 追溯：触发订单的模块来源（quoter / hedger / bootstrap / killswitch / amend） ----
+    source: str = "unknown"
+
     # ---- 原子改单锁标记 ----
     locked: bool = False
+
+    @property
+    def age(self) -> float:
+        """订单创建至今的秒数"""
+        return time.time() - self.created_at
 
     def __post_init__(self):
         if self.remaining is None:
@@ -529,6 +537,7 @@ class OrderManager:
         strategy_trigger_ts: Optional[float] = None,
         params: Optional[Dict] = None,
         priority: RequestPriority = RequestPriority.NEW_ORDER,
+        source: str = "unknown",
     ) -> ManagedOrder:
         """
         提交新订单
@@ -541,6 +550,9 @@ class OrderManager:
             price:               价格 (限价单必填)
             strategy_trigger_ts: 策略触发时间戳（用于延迟追踪）
             params:              交易所特定参数
+            priority:            限速优先级
+            source:              触发模块来源（quoter / hedger / bootstrap / ...），
+                                 用于排查"这一单是谁挂的"
 
         Returns:
             ManagedOrder 实例
@@ -557,6 +569,12 @@ class OrderManager:
             amount=amount,
             price=price,
             state=OrderState.PENDING_NEW,
+            source=source,
+        )
+
+        self._logger.info(
+            f"[{cid}] 提交 {symbol} {side.value} {order_type.value} "
+            f"{amount}@{price}  源={source}"
         )
 
         # 延迟埋点: 策略触发时间
@@ -588,6 +606,7 @@ class OrderManager:
                 amount=amount,
                 price=price,
                 params=params,
+                client_order_id=cid,
             )
 
             # 收到回执
@@ -615,13 +634,13 @@ class OrderManager:
             # 延迟追踪
             self._latency_tracker.record_order_rtt(managed.latency)
 
+            rtt_str = (
+                f" rtt={managed.latency.order_rtt:.3f}s"
+                if managed.latency.order_rtt else ""
+            )
             self._logger.info(
-                f"[{cid}] 订单已确认: eid={managed.exchange_order_id}, "
-                f"state={managed.state.value}, "
-                f"rtt={managed.latency.order_rtt:.3f}s"
-                if managed.latency.order_rtt else
-                f"[{cid}] 订单已确认: eid={managed.exchange_order_id}, "
-                f"state={managed.state.value}"
+                f"[{cid}] 订单已确认: eid={managed.exchange_order_id}  "
+                f"state={managed.state.value}  源={source}{rtt_str}"
             )
 
             self._emit("order_submitted", managed)
@@ -630,7 +649,9 @@ class OrderManager:
         except Exception as e:
             managed.transition_to(OrderState.REJECTED)
             managed.reject_reason = str(e)
-            self._logger.error(f"[{cid}] 下单失败: {e}")
+            self._logger.error(
+                f"[{cid}] 下单失败: 源={source}  exc={type(e).__name__}: {e}"
+            )
             self._emit("order_rejected", managed)
             return managed
 
@@ -945,31 +966,104 @@ class OrderManager:
                     self._emit("order_state_change", managed)
 
             else:
-                # 交易所侧没有这个订单
-                if managed.state in (OrderState.OPEN, OrderState.PARTIALLY_FILLED, OrderState.STALE):
-                    # 可能已成交或已被撤销
-                    if managed.filled and managed.filled >= managed.amount:
-                        managed.transition_to(OrderState.FILLED)
-                        self._logger.info(
-                            f"[{managed.client_order_id}] 对账发现已成交: "
-                            f"filled={managed.filled}"
-                        )
-                        self._emit("order_filled", managed)
-                    elif managed.state == OrderState.PENDING_CANCEL:
-                        managed.transition_to(OrderState.CANCELLED)
-                        self._emit("order_cancelled", managed)
-                    else:
-                        # 无法确定原因 -> 标记为 LOST
-                        managed.transition_to(OrderState.LOST)
-                        self._logger.warning(
-                            f"[{managed.client_order_id}] 对账发现订单丢失 (eid={eid})"
-                        )
-                        self._emit("order_lost", managed)
-                        self._emit("reconcile_conflict", {
-                            "type": "order_lost",
-                            "client_order_id": managed.client_order_id,
-                            "exchange_order_id": eid,
-                        })
+                # 交易所侧没有这个订单 —— 可能是：成交 / 撤销 / 丢失
+                if managed.state == OrderState.PENDING_CANCEL:
+                    # 已主动发起撤单 → CANCELLED
+                    managed.transition_to(OrderState.CANCELLED)
+                    self._emit("order_cancelled", managed)
+                    continue
+
+                if managed.state not in (
+                    OrderState.OPEN,
+                    OrderState.PARTIALLY_FILLED,
+                    OrderState.STALE,
+                ):
+                    continue
+
+                # 本地已经观测到 filled 达到 amount → 直接 FILLED
+                if managed.filled and managed.filled >= managed.amount:
+                    managed.transition_to(OrderState.FILLED)
+                    self._logger.info(
+                        f"[{managed.client_order_id}] 对账发现已成交: "
+                        f"filled={managed.filled}  "
+                        f"源={managed.source}  age={managed.age:.1f}s  via=local_state"
+                    )
+                    self._emit("order_filled", managed)
+                    continue
+
+                # 尝试从成交历史推断真实结局
+                final_state = self._infer_final_state_via_trades(managed)
+                if final_state == OrderState.FILLED:
+                    managed.transition_to(OrderState.FILLED)
+                    self._logger.info(
+                        f"[{managed.client_order_id}] 对账发现已成交: "
+                        f"filled={managed.filled}  "
+                        f"源={managed.source}  age={managed.age:.1f}s  via=trade_history"
+                    )
+                    self._emit("order_filled", managed)
+                elif final_state == OrderState.CANCELLED:
+                    managed.transition_to(OrderState.CANCELLED)
+                    self._emit("order_cancelled", managed)
+                else:
+                    # 拉不到成交历史 → 启发式：没主动撤单时默认判 FILLED（maker 成交最常见）
+                    # managed.filled 通常为 0，需按 amount 补齐以驱动 on_fill 下游
+                    if not managed.filled or managed.filled == 0:
+                        managed.filled = managed.amount
+                        managed.remaining = 0.0
+                    managed.transition_to(OrderState.FILLED)
+                    self._logger.warning(
+                        f"[{managed.client_order_id}] 订单在交易所消失但无成交历史匹配，"
+                        f"启发式判为 FILLED (eid={eid}, amount={managed.amount}, "
+                        f"源={managed.source}, age={managed.age:.1f}s)"
+                    )
+                    self._emit("order_filled", managed)
+
+    def _infer_final_state_via_trades(
+        self, managed: "ManagedOrder"
+    ) -> Optional[OrderState]:
+        """
+        通过交易所成交历史推断订单的最终状态。
+
+        调用 gateway.fetch_my_trades(symbol)，扫描最近成交记录，按 order_id
+        匹配 managed.exchange_order_id。
+
+        返回:
+            OrderState.FILLED : 找到匹配的成交记录，更新 managed.filled / remaining
+            None              : 拉取失败、未实现或无匹配（由上层走启发式）
+        """
+        eid = managed.exchange_order_id
+        if not eid:
+            return None
+        try:
+            trades = self._gateway.fetch_my_trades(
+                symbol=managed.symbol, limit=50
+            )
+        except AttributeError:
+            return None
+        except Exception as e:
+            self._logger.warning(
+                f"[{managed.client_order_id}] 拉取成交历史失败: {e}"
+            )
+            return None
+
+        total_filled = 0.0
+        last_price = 0.0
+        for t in trades or []:
+            if str(t.get("order") or "") == str(eid):
+                try:
+                    total_filled += float(t.get("amount", 0) or 0)
+                    last_price = float(t.get("price", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+
+        if total_filled <= 0:
+            return None
+
+        managed.filled = total_filled
+        managed.remaining = max(managed.amount - total_filled, 0.0)
+        if last_price > 0:
+            managed.avg_price = last_price
+        return OrderState.FILLED
 
     # =========================================================================
     # 内部：冷启动恢复
@@ -1063,6 +1157,7 @@ class OrderManager:
             order_type=OrderType(old_order.order_type),
             amount=new_amount,
             price=new_price,
+            source=f"amend:{old_order.source}",
         )
 
         if new_order.state == OrderState.REJECTED:
@@ -1096,6 +1191,7 @@ class OrderManager:
             order_type=OrderType(old_order.order_type),
             amount=new_amount,
             price=new_price,
+            source=f"amend:{old_order.source}",
         )
 
         if new_order.state == OrderState.REJECTED:

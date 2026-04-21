@@ -61,6 +61,7 @@ class Hedger:
         inventory: "InventoryTracker",
         trading_pairs: List[TradingPairConfig],
         hedge_slippage: float = 0.002,
+        hedge_threshold: float = 0.05,
         dry_run: bool = False,
         logger: Optional[logging.Logger] = None,
     ):
@@ -70,6 +71,8 @@ class Hedger:
         self._inventory = inventory
         self._trading_pairs = trading_pairs
         self._hedge_slippage = hedge_slippage
+        # 净 delta 绝对值小于此阈值时跳过对冲（默认 0.05 ≈ 单笔做市 size 的一半）
+        self._hedge_threshold = hedge_threshold
         self._dry_run = dry_run
         self._logger = logger or logging.getLogger("hedger")
 
@@ -84,6 +87,17 @@ class Hedger:
         # 统计
         self._total_hedged: int = 0
         self._total_failed: int = 0
+
+        # 失败原因分类计数（供关停摘要 [HEDGE] 失败原因分布 用）
+        self._failure_reasons: Dict[str, int] = {
+            "timeout": 0,       # submit 返回时非 FILLED
+            "risk_reject": 0,   # pre_trade_check 拒绝
+            "api_error": 0,     # 下单异常 / 获取行情失败
+            "other": 0,         # 精度、size<=0 等其他
+        }
+
+        # 单调递增的对冲序号，用于 [HEDGE] #N 日志标签贯穿触发→决策→成交链路
+        self._hedge_sequence: int = 0
 
         # 暂停开关：InventoryBootstrap 期间置 True，防止建仓单触发重复对冲
         self._paused: bool = False
@@ -113,6 +127,10 @@ class Hedger:
 
         由 main.py 的 on_fill 回调调用（在 OM-Reconcile 线程中执行）。
         忽略对冲腿自己的成交，避免无限循环。
+
+        决策基于 inventory.get_net_delta —— 读取做市腿 + 对冲腿当前持仓的聚合
+        净 delta，方向和数量都由净 delta 的符号/幅度决定。避免早期实现"只按
+        本次 fill_qty 增量 ± pending_debt"导致过对冲后回不来的 bug。
         """
         # ── 暂停保护：bootstrap 期间不对冲（避免重复对冲建仓单） ──────────
         if self._paused:
@@ -127,42 +145,51 @@ class Hedger:
         hedge_symbol = pair.hedge_symbol
         base = pair.base
 
-        # ── 第三步：计算对冲方向和数量 ───────────────────────────────────
         fill_qty = managed.filled or 0.0
         if fill_qty <= 0:
             return
 
-        # 现货买入 → 永续开空（sell），现货卖出 → 永续开多（buy）
-        if managed.side == "buy":
-            debt_change = fill_qty    # 正=需要卖出对冲
-        else:
-            debt_change = -fill_qty   # 负=需要买入对冲
+        # ── 第三步：分配序号并打印触发日志 ───────────────────────────────
+        self._hedge_sequence += 1
+        seq = self._hedge_sequence
 
-        # ── 第四步：加上未对冲残量 ───────────────────────────────────────
-        total_debt = debt_change + self._pending_hedge_debt.get(base, 0.0)
-
-        if abs(total_debt) < 1e-12:
-            self._logger.info(f"[HEDGE] {base} 净对冲需求为零，跳过")
-            return
-
-        hedge_side = "sell" if total_debt > 0 else "buy"
-        hedge_amount = abs(total_debt)
+        asset_map = {pair.market_symbol: base, pair.hedge_symbol: base}
+        net_delta = self._inventory.get_net_delta(base, asset_map)
+        pending_residual = self._pending_hedge_debt.get(base, 0.0)
 
         self._logger.info(
-            f"[HEDGE] 做市腿成交: {managed.symbol} {managed.side} "
-            f"{fill_qty:.6f} → 需对冲 {hedge_symbol} {hedge_side} {hedge_amount:.6f} "
-            f"(含残量 {self._pending_hedge_debt.get(base, 0.0):+.6f})"
+            f"[HEDGE] #{seq} 触发: 做市腿成交 {managed.symbol} {managed.side} "
+            f"{fill_qty:.6f}  当前净delta={net_delta:+.6f}  "
+            f"已pending残量={pending_residual:+.6f}"
         )
+
+        # 阈值内视为平衡，不对冲
+        if abs(net_delta) < self._hedge_threshold:
+            self._logger.info(
+                f"[HEDGE] #{seq} 跳过: 需对冲量 {net_delta:+.6f} "
+                f"在阈值 ±{self._hedge_threshold:.6f} 内"
+            )
+            self._pending_hedge_debt.pop(base, None)
+            return
+
+        # net_delta > 0：现货偏多 / 永续不够空 → 卖永续
+        # net_delta < 0：现货偏少 / 永续过空 → 买永续（反向修正）
+        if net_delta > 0:
+            hedge_side = "sell"
+            hedge_amount = net_delta
+        else:
+            hedge_side = "buy"
+            hedge_amount = -net_delta
 
         # ── Dry-run 模式：只打印不下单 ──────────────────────────────────
         if self._dry_run:
             self._logger.info(
-                f"[HEDGE] [DRY-RUN] 跳过对冲下单: "
+                f"[HEDGE] #{seq} [DRY-RUN] 跳过对冲下单: "
                 f"{hedge_symbol} {hedge_side} {hedge_amount:.6f}"
             )
             return
 
-        # ── 第五步：拉取 ticker 获取 mid，计算激进限价 ───────────────────
+        # ── 第四步：拉取 ticker 获取 mid，计算激进限价 ───────────────────
         try:
             ticker = self._gateway.fetch_ticker(hedge_symbol)
             mid = None
@@ -174,9 +201,13 @@ class Hedger:
             if not mid:
                 raise ValueError(f"无法获取 {hedge_symbol} 中间价")
         except Exception as e:
-            self._logger.error(f"[HEDGE] 获取 {hedge_symbol} 行情失败: {e}")
-            self._pending_hedge_debt[base] = total_debt
+            self._logger.error(
+                f"[HEDGE] #{seq} 获取行情失败: {hedge_symbol} "
+                f"exc={type(e).__name__}: {e}  → 保留 pending={net_delta:+.6f}"
+            )
+            self._pending_hedge_debt[base] = net_delta
             self._total_failed += 1
+            self._failure_reasons["api_error"] += 1
             return
 
         if hedge_side == "sell":
@@ -184,7 +215,7 @@ class Hedger:
         else:
             hedge_price = mid * (1 + self._hedge_slippage)
 
-        # ── 第六步：精度处理 ─────────────────────────────────────────────
+        # ── 第五步：精度处理 ─────────────────────────────────────────────
         try:
             hedge_price = float(
                 self._gateway.price_to_precision(hedge_symbol, hedge_price)
@@ -193,31 +224,49 @@ class Hedger:
                 self._gateway.amount_to_precision(hedge_symbol, hedge_amount)
             )
         except Exception as e:
-            self._logger.error(f"[HEDGE] 精度处理失败 [{hedge_symbol}]: {e}")
-            self._pending_hedge_debt[base] = total_debt
+            self._logger.error(
+                f"[HEDGE] #{seq} 精度处理失败: {hedge_symbol} "
+                f"exc={type(e).__name__}: {e}  → 保留 pending={net_delta:+.6f}"
+            )
+            self._pending_hedge_debt[base] = net_delta
             self._total_failed += 1
+            self._failure_reasons["other"] += 1
             return
 
         if hedge_amount <= 0:
-            self._logger.warning(f"[HEDGE] 精度处理后数量为零，跳过")
-            self._pending_hedge_debt[base] = total_debt
+            self._logger.warning(
+                f"[HEDGE] #{seq} 精度处理后数量为零，跳过  "
+                f"→ 保留 pending={net_delta:+.6f}"
+            )
+            self._pending_hedge_debt[base] = net_delta
+            self._failure_reasons["other"] += 1
             return
 
-        # ── 第七步：风控检查 ─────────────────────────────────────────────
+        # 决策日志（拿到最终 price/amount 之后）
+        self._logger.info(
+            f"[HEDGE] #{seq} 决策: {hedge_symbol} {hedge_side} "
+            f"{hedge_amount:.6f} @ {hedge_price:.4f}  "
+            f"(slip={self._hedge_slippage:.3%}  mid={mid:.4f})"
+        )
+
+        # ── 第六步：风控检查 ─────────────────────────────────────────────
         risk_result = self._rm.pre_trade_check(
             hedge_symbol, hedge_side, hedge_amount,
             price=hedge_price, mid_price=mid,
         )
         if not risk_result.passed:
             self._logger.warning(
-                f"[HEDGE] 风控拒绝: {hedge_symbol} {hedge_side} "
-                f"{hedge_amount:.6f} @ {hedge_price} — {risk_result.reason}"
+                f"[HEDGE] #{seq} 风控拒绝: {hedge_symbol} {hedge_side} "
+                f"{hedge_amount:.6f} @ {hedge_price:.4f}  "
+                f"reason={risk_result.reason}  "
+                f"→ 动作: 保留 pending={net_delta:+.6f}，等待下次成交触发重试"
             )
-            self._pending_hedge_debt[base] = total_debt
+            self._pending_hedge_debt[base] = net_delta
             self._total_failed += 1
+            self._failure_reasons["risk_reject"] += 1
             return
 
-        # ── 第八步：通过 OrderManager 下单 ───────────────────────────────
+        # ── 第七步：通过 OrderManager 下单 ───────────────────────────────
         strategy_trigger_ts = (
             managed.state_changed_at or managed.ack_at or time.time()
         )
@@ -232,13 +281,16 @@ class Hedger:
                 price=hedge_price,
                 strategy_trigger_ts=strategy_trigger_ts,
                 priority=RequestPriority.HEDGE,
+                source="hedger",
             )
         except Exception as e:
             self._logger.error(
-                f"[HEDGE] 下单异常: {hedge_symbol} {hedge_side} — {e}"
+                f"[HEDGE] #{seq} 下单异常: {hedge_symbol} {hedge_side}  "
+                f"exc={type(e).__name__}: {e}  → 保留 pending={net_delta:+.6f}"
             )
-            self._pending_hedge_debt[base] = total_debt
+            self._pending_hedge_debt[base] = net_delta
             self._total_failed += 1
+            self._failure_reasons["api_error"] += 1
             return
 
         # ── 判断对冲结果 ─────────────────────────────────────────────────
@@ -256,20 +308,29 @@ class Hedger:
             self._total_hedged += 1
             hedge_latency = time.time() - strategy_trigger_ts
             self._logger.info(
-                f"[HEDGE] 对冲成功: {hedge_symbol} {hedge_side} "
-                f"{filled:.6f} @ {hedge_price}  "
+                f"[HEDGE] #{seq} 成交确认 cid={hedge_order.client_order_id}: "
+                f"filled={filled:.6f} @ {hedge_price:.4f}  "
                 f"延迟={hedge_latency:.3f}s"
             )
         else:
-            # 失败或未立即成交：记入债务，等待下次做市腿成交时重试
-            self._pending_hedge_debt[base] = total_debt
-            self._total_failed += 1
-            self._logger.warning(
-                f"[HEDGE] 对冲未成交: {hedge_symbol} {hedge_side} "
-                f"state={hedge_order.state.value} filled={filled:.6f}  "
-                f"未对冲={total_debt:+.6f}  "
-                f"reason={hedge_order.reject_reason or 'N/A'}"
+            # 未立即成交：submit 返回但还没成交（OPEN / PARTIALLY_FILLED / REJECTED）
+            # REJECTED 时 reject_reason 有效；其他视为"等 reconcile 确认"即超时
+            reject_reason = hedge_order.reject_reason
+            is_rejected = hedge_order.state.name == "REJECTED"
+            category = "api_error" if is_rejected else "timeout"
+
+            reason_tag = (
+                f"reason={reject_reason}" if reject_reason
+                else f"state={hedge_order.state.value}"
             )
+            self._logger.warning(
+                f"[HEDGE] #{seq} 未成交 cid={hedge_order.client_order_id}: "
+                f"{reason_tag}  filled={filled:.6f}  "
+                f"→ 保留 pending={net_delta:+.6f}，等待 reconcile / 下次触发"
+            )
+            self._pending_hedge_debt[base] = net_delta
+            self._total_failed += 1
+            self._failure_reasons[category] += 1
 
     # =========================================================================
     # 辅助方法
