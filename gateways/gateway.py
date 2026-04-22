@@ -802,6 +802,79 @@ class HyperliquidGateway(BaseGateway):
             self._on_error(e, f"fetch_my_trades({symbol})")
             raise
 
+    def fetch_user_fills(self, start_time_ms: Optional[int] = None) -> List[Dict]:
+        """
+        通过 Hyperliquid 原生 /info userFills 拉取用户成交历史。
+
+        CCXT 的 fetch_my_trades 在 defaultType="swap" 下对现货成交返回为空，而
+        reconcile/_infer_final_state_via_trades 又强依赖成交历史精确判最终状态。
+        这里绕开 CCXT 直接走 REST /info，现货与永续一次性全拉回来，上层按 oid
+        精确匹配 managed.exchange_order_id 即可。
+
+        返回结构样例（混合现货和永续）:
+            {
+              'oid': 392723517075,        # 订单 ID（== 程序里的 exchange_order_id）
+              'coin': 'SOL',              # 永续: 字母；现货: "@N"（token_index）
+              'px': '88.684',             # 成交价
+              'sz': '0.13',               # 成交量
+              'side': 'B',                # 'B' = Buy, 'A' = Sell (Ask)
+              'dir': 'Close Short',       # 方向语义
+              'fee': '0.006132',
+              'feeToken': 'USDC',
+              'time': 1776863556087,      # Unix ms
+              'hash': '0x...',
+              'tid': 683109186144482,     # trade id
+              ...
+            }
+
+        Args:
+            start_time_ms: 可选，只返回这个时间之后的成交（Unix ms）。
+                           None 则请求全量 userFills（最近 2000 笔上下）
+
+        Returns:
+            List[dict]: 成交列表（按时间倒序，最新的在前）。失败时返回空列表，不抛异常。
+        """
+        self._ensure_authenticated()
+
+        wallet = self._auth_config.get("wallet_address", "").strip()
+        if not wallet:
+            raise ValueError("wallet_address 未配置，无法拉取 userFills")
+
+        base_url = self._api_config.get("base_url", "https://api.hyperliquid.xyz")
+        url = base_url.rstrip("/") + "/info"
+
+        if start_time_ms is not None:
+            payload = {
+                "type": "userFillsByTime",
+                "user": wallet,
+                "startTime": int(start_time_ms),
+            }
+        else:
+            payload = {"type": "userFills", "user": wallet}
+
+        try:
+            import requests
+            resp = requests.post(url, json=payload, timeout=self._timeout)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            self._logger.warning(
+                f"fetch_user_fills 异常: {type(e).__name__}: {e}"
+            )
+            return []
+
+        if not isinstance(data, list):
+            self._logger.warning(
+                f"fetch_user_fills 返回非列表: type={type(data).__name__} data={data!r:.200}"
+            )
+            return []
+
+        self._logger.debug(
+            f"fetch_user_fills: 返回 {len(data)} 条成交"
+            + (f" (startTime={start_time_ms})" if start_time_ms else "")
+        )
+        return data
+
     # ---- 订单管理 ----
 
     def create_order(

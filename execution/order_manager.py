@@ -483,6 +483,13 @@ class OrderManager:
         self._op_locks: Dict[str, threading.RLock] = {}
         self._op_locks_lock = threading.Lock()
 
+        # ---- 待复查队列：撤单判 CANCELLED 但可能延迟成交的订单 ----
+        # 格式：[(recheck_time_ts, client_order_id), ...]
+        # 修 Bug B (live_20260422_224158 22:50:46 @88.820) —— 撤单瞬间交易所还在撮合，
+        # userFills 当时没同步，判 CANCELLED 后几秒才真成交；5 秒后 reconcile 复查。
+        self._pending_cancel_recheck: List[Tuple[float, str]] = []
+        self._pending_recheck_lock = threading.Lock()
+
         # ---- 回调 ----
         self._callbacks: Dict[str, List[Callable]] = {}
 
@@ -711,9 +718,44 @@ class OrderManager:
                         f"[{client_order_id}] 撤单成功"
                     )
                 else:
-                    # cancel_order 返回 False 可能是订单已不存在
+                    # cancel_order 返回 False → 交易所说订单不存在。这可能是：
+                    #   a) 已经成交（maker 单被吃掉）——旧版直接判 CANCELLED 会漏记成交
+                    #   b) 已经被对账/用户网页撤了
+                    # 立刻查 userFills 精确区分，避免漏记成交（见 live_20260422_210538 复盘）
+                    final_state = self._infer_final_state_via_trades(managed)
+                    if final_state == OrderState.FILLED:
+                        # Bug A 竞态保护：reconcile 可能已经在另一个线程把这单判为 FILLED
+                        # 并 emit 过了（gateway.cancel_order 阻塞的那 ~1s 里）。如果 state
+                        # 已经是 FILLED，说明已 emit，不要重复 emit。
+                        # (live_20260422_224158 22:43:17→22:43:18 双重 emit 复盘)
+                        if managed.state == OrderState.FILLED:
+                            self._logger.debug(
+                                f"[{client_order_id}] 撤单时发现已被 reconcile "
+                                f"判 FILLED，不重复 emit"
+                            )
+                            return True
+                        managed.transition_to(OrderState.FILLED)
+                        avg = getattr(managed, "avg_price", None)
+                        self._logger.info(
+                            f"[{client_order_id}] 撤单前已成交: "
+                            f"filled={managed.filled} avg={avg} "
+                            f"(via=userFills after cancel-not-found)"
+                        )
+                        self._emit("order_filled", managed)
+                        return True
+
                     managed.transition_to(OrderState.CANCELLED)
-                    self._logger.info(f"[{client_order_id}] 订单可能已成交或已撤销")
+                    # Bug B 修复：排入延迟复查队列 —— 撤单瞬间可能正在成交，
+                    # userFills 当时没同步；5 秒后 reconcile 会再查一次
+                    # (live_20260422_224158 22:50:46 @88.820 漏记复盘)
+                    with self._pending_recheck_lock:
+                        self._pending_cancel_recheck.append(
+                            (time.time() + 5.0, client_order_id)
+                        )
+                    self._logger.info(
+                        f"[{client_order_id}] 撤单确认（交易所无成交记录），"
+                        f"5s 后复查防漏记"
+                    )
 
                 self._emit("order_cancelled", managed)
                 return True
@@ -896,11 +938,49 @@ class OrderManager:
         """
         一次对账巡检
 
+        0. 延迟复查队列（Bug B 修复）—— 撤单瞬间可能正在成交，5s 后再查 userFills
         1. 检测 STALE 订单（PENDING_NEW 超时）
         2. 拉取交易所挂单列表
         3. 交叉比对解决冲突
         """
         now = time.time()
+
+        # ---- Step 0: 延迟复查队列（Bug B 修复）----
+        to_recheck: List[str] = []
+        with self._pending_recheck_lock:
+            remaining: List[Tuple[float, str]] = []
+            for recheck_ts, cid in self._pending_cancel_recheck:
+                if recheck_ts <= now:
+                    to_recheck.append(cid)
+                else:
+                    remaining.append((recheck_ts, cid))
+            self._pending_cancel_recheck = remaining
+
+        for cid in to_recheck:
+            with self._orders_lock:
+                managed = self._orders.get(cid)
+            if managed is None:
+                continue
+            # 只复查仍处于 CANCELLED 状态的（其他状态已被正常处理过）
+            if managed.state != OrderState.CANCELLED:
+                continue
+            final = self._infer_final_state_via_trades(managed)
+            if final == OrderState.FILLED:
+                # 5 秒后延迟发现成交 → 强制 transition 到 FILLED
+                # 注意: CANCELLED 是终态，transition_to 允许无约束赋值，这里展开
+                # 改字段让意图显式（previous_state 保留为 CANCELLED 便于事后溯源）
+                old_state = managed.state
+                managed.previous_state = old_state
+                managed.state = OrderState.FILLED
+                managed.state_changed_at = time.time()
+                managed.last_updated_at = managed.state_changed_at
+                avg = getattr(managed, "avg_price", None)
+                self._logger.warning(
+                    f"[{cid}] 撤单 5 秒后延迟发现成交，"
+                    f"state 修正 {old_state.value} -> FILLED  "
+                    f"filled={managed.filled} avg={avg}"
+                )
+                self._emit("order_filled", managed)
 
         # ---- Step 1: STALE 检测 ----
         with self._orders_lock:
@@ -1005,56 +1085,81 @@ class OrderManager:
                     managed.transition_to(OrderState.CANCELLED)
                     self._emit("order_cancelled", managed)
                 else:
-                    # 拉不到成交历史 → 启发式：没主动撤单时默认判 FILLED（maker 成交最常见）
-                    # managed.filled 通常为 0，需按 amount 补齐以驱动 on_fill 下游
-                    if not managed.filled or managed.filled == 0:
-                        managed.filled = managed.amount
-                        managed.remaining = 0.0
-                    managed.transition_to(OrderState.FILLED)
+                    # 订单从交易所 open_orders 消失、userFills 也没匹配 —— 可能是：
+                    #   a) 真成交了但 userFills 还没落盘（给 1-2 个对账周期）
+                    #   b) 被对手方撮合后原生端点暂时返回不全
+                    #   c) 极少见：用户在网页撤单 / Hyperliquid 清理
+                    # 旧版在此处启发式判 FILLED，但已证实会把活着的现货挂单错判成 FILLED
+                    # (live_20260422_210538 复盘)。改为保持当前 state，下轮再查。
                     self._logger.warning(
-                        f"[{managed.client_order_id}] 订单在交易所消失但无成交历史匹配，"
-                        f"启发式判为 FILLED (eid={eid}, amount={managed.amount}, "
-                        f"源={managed.source}, age={managed.age:.1f}s)"
+                        f"[{managed.client_order_id}] 订单在交易所消失但 userFills 无匹配，"
+                        f"保持 state={managed.state.value} 等下轮对账 "
+                        f"(eid={eid}, amount={managed.amount}, age={managed.age:.1f}s, "
+                        f"源={managed.source})"
                     )
-                    self._emit("order_filled", managed)
+                    if managed.age > 600:
+                        self._logger.error(
+                            f"[{managed.client_order_id}] ⚠️ 订单状态未知超过 10 分钟，"
+                            f"可能需要人工对账 (fetch_positions + fetch_spot_balance + "
+                            f"historicalOrders eid={eid})"
+                        )
 
     def _infer_final_state_via_trades(
         self, managed: "ManagedOrder"
     ) -> Optional[OrderState]:
         """
-        通过交易所成交历史推断订单的最终状态。
+        通过 Hyperliquid 原生 userFills 端点精确匹配订单的最终状态。
 
-        调用 gateway.fetch_my_trades(symbol)，扫描最近成交记录，按 order_id
-        匹配 managed.exchange_order_id。
+        相较旧版 CCXT fetch_my_trades 的改进：
+          1. 现货和永续都能拉到（CCXT swap 模式对 Hyperliquid 现货成交返回为空）
+          2. 用 oid 精确匹配，不依赖 symbol 字段（避免 CCXT base/baseName 不一致坑）
+          3. 一次拉回最近 2000 笔，覆盖一个对账周期内的所有成交
 
         返回:
-            OrderState.FILLED : 找到匹配的成交记录，更新 managed.filled / remaining
-            None              : 拉取失败、未实现或无匹配（由上层走启发式）
+            OrderState.FILLED : 找到匹配的成交记录，更新 managed.filled / remaining / avg_price
+            None              : 拉取失败、未实现或无匹配（由上层决定怎么处理）
         """
         eid = managed.exchange_order_id
         if not eid:
             return None
+
+        # 只拉订单创建之后的成交，减少传输量并避免匹配到无关老订单
+        start_ms: Optional[int] = None
+        if managed.created_at:
+            # 向前预留 1 秒容差，防止时钟抖动
+            start_ms = int(managed.created_at * 1000) - 1000
+
         try:
-            trades = self._gateway.fetch_my_trades(
-                symbol=managed.symbol, limit=50
-            )
+            fills = self._gateway.fetch_user_fills(start_time_ms=start_ms)
         except AttributeError:
+            # 非 Hyperliquid gateway 不实现此接口 → 返回 None，保留上层决策权
             return None
         except Exception as e:
             self._logger.warning(
-                f"[{managed.client_order_id}] 拉取成交历史失败: {e}"
+                f"[{managed.client_order_id}] userFills 拉取失败: {e}"
             )
             return None
 
         total_filled = 0.0
         last_price = 0.0
-        for t in trades or []:
-            if str(t.get("order") or "") == str(eid):
-                try:
-                    total_filled += float(t.get("amount", 0) or 0)
-                    last_price = float(t.get("price", 0) or 0)
-                except (TypeError, ValueError):
-                    continue
+        last_time = 0
+        for f in fills or []:
+            if str(f.get("oid", "")) != str(eid):
+                continue
+            try:
+                sz = float(f.get("sz", 0) or 0)
+                px = float(f.get("px", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            total_filled += sz
+            if px > 0:
+                last_price = px
+            try:
+                t = int(f.get("time", 0) or 0)
+                if t > last_time:
+                    last_time = t
+            except (TypeError, ValueError):
+                pass
 
         if total_filled <= 0:
             return None
