@@ -812,7 +812,10 @@ def main() -> None:
             except Exception as e:
                 logger.error(f"买单失败 [{symbol}]: {e}")
         else:
-            logger.info(f"[{symbol}] 买单被风控拒绝: {bid_ok.reason}")
+            logger.info(
+                f"[{symbol}] 买单被风控拒绝 (size={size} price={bid_price}): "
+                f"{bid_ok.reason}"
+            )
 
         # ── 卖单：仓位超空头限制时被 RiskManager 拒绝，只报买单 ──────────────
         ask_ok = rm.pre_trade_check(symbol, "sell", size, price=ask_price, mid_price=mid)
@@ -832,7 +835,10 @@ def main() -> None:
             except Exception as e:
                 logger.error(f"卖单失败 [{symbol}]: {e}")
         else:
-            logger.info(f"[{symbol}] 卖单被风控拒绝: {ask_ok.reason}")
+            logger.info(
+                f"[{symbol}] 卖单被风控拒绝 (size={size} price={ask_price}): "
+                f"{ask_ok.reason}"
+            )
 
         last_quoted_mid[symbol] = mid
         return bid_price, ask_price, size

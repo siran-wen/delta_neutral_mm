@@ -253,8 +253,9 @@ class PositionLimiter:
         if abs(projected_delta) > max_symbol:
             return RiskCheckResult.reject(
                 RiskBreach.POSITION_LIMIT_SYMBOL,
-                f"[{symbol}] Delta 将达到 {projected_delta:+.6f}，"
-                f"超过单品种上限 ±{max_symbol}",
+                f"{symbol} 单腿持仓 {current_delta:+.6f} "
+                f"+ 本单 {signed_amount:+.6f} = {projected_delta:+.6f}，"
+                f"超过单腿上限 ±{max_symbol} (max_delta_per_symbol)",
                 symbol=symbol,
                 current_delta=current_delta,
                 projected_delta=projected_delta,
@@ -270,8 +271,8 @@ class PositionLimiter:
         if global_delta > max_global:
             return RiskCheckResult.reject(
                 RiskBreach.POSITION_LIMIT_GLOBAL,
-                f"全局 |Delta| 将达到 {global_delta:.6f}，"
-                f"超过全局上限 {max_global}",
+                f"全局所有单腿 |持仓| 之和 {global_delta:.6f}，"
+                f"超过全局上限 {max_global} (max_delta_global)",
                 symbol=symbol,
                 global_delta=global_delta,
                 limit=max_global,
