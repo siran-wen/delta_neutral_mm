@@ -30,7 +30,7 @@ TODO: 后续迭代实现：
 
 import threading
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 if TYPE_CHECKING:
     from gateways.gateway import Position
@@ -50,20 +50,47 @@ class InventoryTracker:
     positions: Dict[str, float] = field(default_factory=dict)
     # symbol → 加权平均入场价
     avg_entry: Dict[str, float] = field(default_factory=dict)
-    # 已实现 PnL（USDC）
+    # 已实现 PnL（USDC，已扣除 fee —— 见 on_fill 里的 Step 3）
     realized_pnl: float = 0.0
+    # 累积总手续费（折算成 USDC，始终非负）。用于 PnL 日志 gross vs net 对比
+    cumulative_fees_usdc: float = 0.0
     # (account, currency) → 余额，account 为 "spot" 或 "perp"
     balances: Dict[str, Dict[str, float]] = field(default_factory=dict)
     # 线程安全锁：on_fill 可能在 OM-Reconcile 线程中被调用，
     # 而主循环线程同时读取 positions/avg_entry，需要互斥保护
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
-    def on_fill(self, symbol: str, side: str, amount: float, price: float) -> None:
+    def on_fill(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        price: float,
+        fee_cost: float = 0.0,
+        fee_currency: Optional[str] = None,
+    ) -> None:
         """
-        根据成交更新持仓、加权均价、已实现 PnL。
+        根据成交更新持仓、加权均价、已实现 PnL、累积手续费、现货余额。
 
-        已实现 PnL 按加权均价法结算：平仓部分按 (成交价 - 均价) 计入。
+        已实现 PnL 按加权均价法结算：平仓部分按 (成交价 - 均价) 计入，再扣除本笔 fee。
+
+        fee_cost / fee_currency 语义（由 gateway.Order.from_ccxt 解析得到）：
+            - 现货 BUY:  fee 扣 base coin  (fee_currency = "USOL" / 别名 "SOL" 等)
+            - 现货 SELL: fee 扣 USDC       (fee_currency = "USDC")
+            - 永续:      fee 扣 USDC       (fee_currency = "USDC")
+            - 含 builderFee 累加（Gateway 层已按 fill price 折算到对应币种）
+
+        缺省时 fee_cost=0.0 / fee_currency=None，不影响 PnL 和余额字典。
         """
+        # 防御性：None / 负数 / 非法值一律按 0 处理
+        if fee_cost is None or fee_cost < 0:
+            fee_cost = 0.0
+        else:
+            try:
+                fee_cost = float(fee_cost)
+            except (TypeError, ValueError):
+                fee_cost = 0.0
+
         with self._lock:
             prev = self.positions.get(symbol, 0.0)
             change = amount if side == "buy" else -amount
@@ -100,8 +127,10 @@ class InventoryTracker:
             # else: 减仓但未穿越零点 → 保持原均价
 
             # ── 更新余额字典（供 BalanceGuard 实时感知账户余额变化）──
-            # 仅对现货 symbol 生效（永续没有现货余额概念，保证金变动由 fetch_balance 刷）
-            # 不扣 fee —— 上游尚未接入成交费率，余额会略高于实际但方向正确
+            # 仅对现货 symbol 生效（永续没有现货余额概念，保证金变动由 fetch_balance 刷）。
+            # 现货的 fee 都会从 spot balance 扣除（USDC 从 quote 扣、base coin 从 base 扣），
+            # 保持 Inventory 本地余额与 fetch_balance 真实快照的长期对齐。永续的 fee
+            # 不扣 balance 字典（永续没有 spot 余额概念，fee 仅进 realized_pnl）。
             if ":" not in symbol:
                 base_asset, quote_asset = symbol.split("/")
                 notional = amount * price
@@ -114,6 +143,42 @@ class InventoryTracker:
                     spot[base_asset] = spot.get(base_asset, 0.0) - amount
 
             self.positions[symbol] = new_pos
+
+            # ── Step 1: 折算 fee 到 USDC ─────────────────────────────
+            if fee_cost > 0 and fee_currency:
+                if fee_currency == "USDC":
+                    fee_usdc = fee_cost
+                else:
+                    # base coin 扣费（现货 BUY），用当前 price 折算
+                    # price 单位是"每单位 base 多少 USDC"，fee_cost * price 即折算值
+                    fee_usdc = fee_cost * price
+            else:
+                fee_usdc = 0.0
+
+            # ── Step 2: 累积总 fee ──────────────────────────────────
+            self.cumulative_fees_usdc += fee_usdc
+
+            # ── Step 3: 从 realized_pnl 扣除 fee ────────────────────
+            self.realized_pnl -= fee_usdc
+
+            # ── Step 4: 扣 spot 余额（现货 fee，USDC 或 base coin 都扣）──
+            # 修复 A1 遗留：USDC fee（现货 SELL / spot SELL 路径）过去不扣 spot 字典，
+            # 长期会让 spot[USDC] 快照偏高 ≈ notional × fee_rate × N 笔累积。
+            # USDC fee（现货 SELL）：从 quote 币扣，保持 spot[USDC] 快照与真实余额对齐
+            # base coin fee（现货 BUY，Hyperliquid 特例）：从 base 币扣
+            # 永续的 fee 不在此处理（没有 spot balance 概念，fee 已进 realized_pnl）
+            if ":" not in symbol and fee_cost > 0 and fee_currency:
+                base_asset, quote_asset = symbol.split("/")
+                spot = self.balances.setdefault("spot", {})
+                if fee_currency == "USDC":
+                    # quote 币扣费（现货 SELL）
+                    spot[quote_asset] = spot.get(quote_asset, 0.0) - fee_cost
+                else:
+                    # base 币扣费（现货 BUY）
+                    # fee_currency 可能是原生名（"USOL"）或 CCXT base 别名（"SOL"）
+                    # 优先按 fee_currency 查 spot dict key；找不到 fallback 到 symbol 拆出的 base_asset
+                    target_key = fee_currency if fee_currency in spot else base_asset
+                    spot[target_key] = spot.get(target_key, 0.0) - fee_cost
 
     def sync_from_positions(self, positions: List["Position"]) -> int:
         """

@@ -106,27 +106,139 @@ class Order:
     symbol: str
     side: str
     type: str
-    price: Optional[float] = None
+    price: Optional[float] = None           # 限价单的挂单价（市价单可能为 None）
+    average: Optional[float] = None         # 加权成交均价（IOC/部分成交时由交易所回填）
     amount: Optional[float] = None
     filled: Optional[float] = None
     remaining: Optional[float] = None
     status: Optional[str] = None
     timestamp: Optional[int] = None
+    fee_cost: Optional[float] = None        # 手续费金额（可能是 base coin 数量或 USDC 金额）
+    fee_currency: Optional[str] = None      # 手续费币种（"USDC" / "USOL" / "SOL" 等）
     raw: Optional[dict] = None  # 保留原始响应
 
     @classmethod
     def from_ccxt(cls, data: dict) -> "Order":
+        # 加权成交均价三级提取：
+        #   1. CCXT 标准 'average' 字段（最稳）
+        #   2. CCXT 'trades' 数组按 (price, amount) 聚合（部分成交场景）
+        #   3. Hyperliquid 原生 info.response.data.statuses[0].filled.avgPx
+        #      （CCXT 对 hyperliquid 的 IOC 立即成交响应不总会归一化 average）
+        avg = data.get("average")
+        if avg is None and data.get("trades"):
+            total_sz = 0.0
+            total_notional = 0.0
+            for t in data.get("trades") or []:
+                try:
+                    sz = float(t.get("amount") or 0)
+                    px = float(t.get("price") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if sz > 0 and px > 0:
+                    total_sz += sz
+                    total_notional += sz * px
+            if total_sz > 0:
+                avg = total_notional / total_sz
+        if avg is None:
+            try:
+                info = data.get("info") or {}
+                resp = info.get("response") or {}
+                rd = resp.get("data") or {}
+                for st in rd.get("statuses") or []:
+                    filled_info = (st or {}).get("filled") if isinstance(st, dict) else None
+                    if filled_info:
+                        px = float(filled_info.get("avgPx") or 0)
+                        if px > 0:
+                            avg = px
+                            break
+            except (TypeError, ValueError, AttributeError):
+                pass
+
+        # ---- 手续费提取 ----
+        # Hyperliquid 实际 fee 结构（来自 tests/diagnose_hl_spot_orders.py 诊断）：
+        #   现货 BUY  → fee 扣 base coin  (如 {cost: 0.00004761, currency: "USOL"})
+        #   现货 SELL → fee 扣 USDC       (如 {cost: 0.005, currency: "USDC"})
+        #   永续      → fee 扣 USDC       (如 {cost: 0.01, currency: "USDC"})
+        # 另有 info.builderFee 字符串字段，单位 USDC，属于建单方额外加收
+        # 的 0.01% 费率，也得算进总 fee。
+        #
+        # 提取顺序：
+        #   1. 主 fee: data["fee"] = {"cost", "currency"}  (CCXT 单 fee 路径)
+        #   2. 若 1 不可用，data["fees"] 取 [0]            (CCXT list fallback)
+        #   3. 合并 info.builderFee（USDC）。若主 fee 币种非 USDC，按 avg 折算成
+        #      base coin 后再加，保持 fee_currency 不变（方案 A）。
+        fee_cost: Optional[float] = None
+        fee_currency: Optional[str] = None
+
+        def _parse_fee_dict(f: Any) -> None:
+            """把一个 fee dict 解析进外层 fee_cost / fee_currency（防御性）"""
+            nonlocal fee_cost, fee_currency
+            if not isinstance(f, dict):
+                return
+            try:
+                cost = float(f.get("cost") or 0)
+            except (TypeError, ValueError):
+                cost = 0.0
+            if cost <= 0:
+                return
+            currency = f.get("currency")
+            if not isinstance(currency, str) or not currency:
+                return
+            fee_cost = cost
+            fee_currency = currency
+
+        _parse_fee_dict(data.get("fee"))
+        if fee_cost is None:
+            fees_list = data.get("fees")
+            if isinstance(fees_list, list) and fees_list:
+                _parse_fee_dict(fees_list[0])
+
+        # builderFee（USDC）—— 无论主 fee 是否存在都要加
+        builder_fee_usdc = 0.0
+        try:
+            info = data.get("info") or {}
+            bf = info.get("builderFee")
+            if bf is not None and bf != "":
+                builder_fee_usdc = max(float(bf), 0.0)
+        except (TypeError, ValueError):
+            builder_fee_usdc = 0.0
+
+        if builder_fee_usdc > 0:
+            if fee_cost is None:
+                # 没有主 fee，但有 builderFee → 单独作为 USDC 记账
+                fee_cost = builder_fee_usdc
+                fee_currency = "USDC"
+            elif fee_currency == "USDC":
+                # 主 fee 也是 USDC，直接相加
+                fee_cost = fee_cost + builder_fee_usdc
+            else:
+                # 主 fee 是 base coin（如 USOL），按 avg 折算 builderFee→base
+                # fill price avg 缺失时退化到 data["price"]（限价单未成交场景 avg 不稳）
+                conv_px: Optional[float] = avg if (avg and avg > 0) else None
+                if conv_px is None:
+                    try:
+                        raw_px = float(data.get("price") or 0)
+                        conv_px = raw_px if raw_px > 0 else None
+                    except (TypeError, ValueError):
+                        conv_px = None
+                if conv_px:
+                    fee_cost = fee_cost + (builder_fee_usdc / conv_px)
+                # 无可用价格 → 放弃 builderFee 折算（极罕见），避免污染 fee_cost
+
         return cls(
             id=str(data.get("id", "")),
             symbol=data.get("symbol", ""),
             side=data.get("side", ""),
             type=data.get("type", ""),
             price=data.get("price"),
+            average=avg,
             amount=data.get("amount"),
             filled=data.get("filled"),
             remaining=data.get("remaining"),
             status=data.get("status"),
             timestamp=data.get("timestamp"),
+            fee_cost=fee_cost,
+            fee_currency=fee_currency,
             raw=data,
         )
 

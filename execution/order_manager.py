@@ -146,7 +146,10 @@ class ManagedOrder:
     symbol: str = ""
     side: str = ""          # "buy" / "sell"
     order_type: str = ""    # "limit" / "market"
-    price: Optional[float] = None
+    price: Optional[float] = None            # 限价单挂单价（市价单 None）
+    avg_fill_price: Optional[float] = None   # 真实加权成交均价（由 create_order 响应 / userFills 回填）
+    fee_cost: Optional[float] = None         # 手续费金额（含 builderFee 累加；币种见 fee_currency）
+    fee_currency: Optional[str] = None       # 手续费币种（"USDC" / "USOL" 等；None 表示无 fee 数据）
     amount: float = 0.0
     filled: float = 0.0
     remaining: Optional[float] = None
@@ -200,6 +203,16 @@ class ManagedOrder:
             self.remaining = gw_order.remaining
         if gw_order.price is not None:
             self.price = gw_order.price
+        # 真实成交均价（供 Hedger 成交确认日志 / 成本分析使用，避免与 limit price 混淆）
+        gw_avg = getattr(gw_order, "average", None)
+        if gw_avg is not None and gw_avg > 0:
+            self.avg_fill_price = float(gw_avg)
+        # 手续费透传：由 gateway.Order.from_ccxt 解析 fee + builderFee 得到
+        gw_fee_cost = getattr(gw_order, "fee_cost", None)
+        gw_fee_ccy = getattr(gw_order, "fee_currency", None)
+        if gw_fee_cost is not None and gw_fee_cost > 0:
+            self.fee_cost = float(gw_fee_cost)
+            self.fee_currency = gw_fee_ccy
         self.last_updated_at = time.time()
 
     @property

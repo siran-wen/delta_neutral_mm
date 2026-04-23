@@ -219,12 +219,25 @@ class InventoryBootstrap:
         )
         avail_usdc = self._read_available_usdc()
 
-        # ── 5. Dry-run 路径：只预演不下单 ────────────────────────────────────
+        # ── 5. Dry-run 路径：打印预演 + 基于 inventory 的余额拦截 ────────────
         if self._dry_run:
             self._print_dry_run_preview(
                 pair, target_qty, market_mid, hedge_mid, slippage,
                 need_spot, need_perp, avail_usdc,
             )
+            # 修复 B1：dry-run 原逻辑直接 return True，preset 不足时也不拦截，
+            # 用户会误判"余额够建仓"。现改为：基于 inventory 可用余额判断，
+            # 不足则打印错误并返回 False（上抛给 main.py 的 run()），后者会
+            # sys.exit(1)。
+            if avail_usdc is not None and avail_usdc < need_spot + need_perp:
+                self._logger.error(
+                    f"[DRY-RUN][BOOTSTRAP] {pair.base} 余额不足，跳过建仓: "
+                    f"可用 {avail_usdc:.2f} USDC，"
+                    f"需要 {need_spot + need_perp:.2f} "
+                    f"(现货 {need_spot:.2f} + 永续保证金 {need_perp:.2f})，"
+                    f"缺 {need_spot + need_perp - avail_usdc:.2f}"
+                )
+                return False
             return True
 
         # 实盘：余额不足直接 sys.exit（建仓是启动阶段，不允许带病运行）
@@ -338,6 +351,38 @@ class InventoryBootstrap:
     # 行情 / 余额 / 持仓读取
     # =========================================================================
 
+    def _get_available_balance(self, account: str, currency: str) -> float:
+        """
+        获取指定账户 / 币种的可用余额。
+
+        数据源选择（修复 B1 dry-run preset 被 bypass 的 bug）：
+          - dry-run 模式 + inventory.balances[account] 已注入（preset-balance 经
+            main.py 的 inventory.set_balance(...) 写入）：返回 inventory 里的值。
+          - 其他情况（实盘 / dry-run 但未 preset 该账户）：走 gateway.fetch_balance
+            的粗检路径，保持原行为（Hyperliquid 的 CCXT fetch_balance 不区分
+            spot/perp 子账户，统一返回 USDC.free）。
+
+        失败时返回 0.0（gateway 异常视为"余额为零"），而非 None。调用方如需
+        区分"拿不到数据 vs 真的为零"，需上层额外判断。
+        """
+        if self._dry_run and account in self._inventory.balances:
+            val = float(self._inventory.balances[account].get(currency, 0.0))
+            self._logger.debug(
+                f"[BOOTSTRAP] dry-run 使用 inventory 余额: "
+                f"{account}:{currency}={val:.6f}"
+            )
+            return val
+        # 实盘 / dry-run 未 preset：走原 gateway 路径
+        try:
+            bal = self._gateway.fetch_balance()
+        except Exception as e:
+            self._logger.warning(
+                f"[BOOTSTRAP] fetch_balance 失败（视为 {account}:{currency}=0）: {e}"
+            )
+            return 0.0
+        b = bal.balances.get(currency)
+        return float(b.free or 0.0) if b is not None else 0.0
+
     def _fetch_mid(self, symbol: str) -> Optional[float]:
         """拉取 symbol 中间价，失败返回 None"""
         try:
@@ -355,9 +400,34 @@ class InventoryBootstrap:
         """
         读取现有现货底仓（base_asset_spot 的 free）和永续空头数量。
 
+        数据源选择（与 _read_available_usdc 对称，修复 B1 dry-run bug）：
+          - dry-run 模式 + inventory 已有 preset 数据（spot 余额或 hedge 持仓）：
+            全部从 inventory 读取。spot 用 balances["spot"][base]；perp 空头用
+            positions[hedge_sym] 的绝对值（负数=空头），避免 dry-run 走 gateway
+            拿到真实账户状态污染预演。
+          - 实盘 / dry-run 但未 preset：走原 gateway 路径，spot 用 fetch_balance，
+            perp 用 fetch_positions。
+
         Returns:
             (existing_spot_free, existing_perp_short_size)  — 都是 >= 0 的数量
         """
+        # dry-run + preset 注入过：用 inventory 数据源
+        if self._dry_run and (
+            "spot" in self._inventory.balances
+            or self._inventory.positions.get(hedge_sym, 0.0) != 0.0
+        ):
+            spot_bal = self._inventory.balances.get("spot", {}).get(base_asset_spot, 0.0)
+            existing_spot = max(float(spot_bal), 0.0)
+            perp_pos = float(self._inventory.positions.get(hedge_sym, 0.0))
+            existing_short = abs(perp_pos) if perp_pos < 0 else 0.0
+            self._logger.debug(
+                f"[BOOTSTRAP] dry-run 使用 inventory 底仓: "
+                f"spot[{base_asset_spot}]={existing_spot}  "
+                f"perp_short({hedge_sym})={existing_short}"
+            )
+            return existing_spot, existing_short
+
+        # 实盘 / dry-run 未 preset：原 gateway 路径
         existing_spot = 0.0
         try:
             bal = self._gateway.fetch_balance()
@@ -383,10 +453,31 @@ class InventoryBootstrap:
 
     def _read_available_usdc(self) -> Optional[float]:
         """
-        读取可用 USDC 余额。
-        Hyperliquid 在 CCXT 层 spot / perp 账户余额可能聚合在同一 AccountBalance 里，
-        这里取 USDC.free 作为综合可用估算。
+        读取可用 USDC 余额（用于建仓前的余额充足性检查）。
+
+        数据源：
+          - dry-run 模式 + 任一子账户有 preset-balance 注入：
+            返回 spot:USDC + perp:USDC 的合计（经 _get_available_balance）。
+            修复 B1 bug —— 原实现在 dry-run + preset 下直接查 gateway 真实账户，
+            导致预设值被忽略、虚拟建仓按真实账户余额通过。
+          - 实盘 / dry-run 未 preset：走原 gateway.fetch_balance 路径，取 USDC.free
+            作为综合可用估算（Hyperliquid 在 CCXT 层 spot/perp 可能聚合，
+            实盘路径保持既有"粗检"行为）。失败返回 None → 上层跳过余额检查。
         """
+        if self._dry_run and (
+            "spot" in self._inventory.balances
+            or "perp" in self._inventory.balances
+        ):
+            spot_usdc = self._get_available_balance("spot", "USDC")
+            perp_usdc = self._get_available_balance("perp", "USDC")
+            total = spot_usdc + perp_usdc
+            self._logger.debug(
+                f"[BOOTSTRAP] dry-run 使用 inventory USDC 合计: "
+                f"spot={spot_usdc:.4f} + perp={perp_usdc:.4f} = {total:.4f}"
+            )
+            return total
+
+        # 实盘 / dry-run 未 preset：原粗检路径
         try:
             bal = self._gateway.fetch_balance()
         except Exception as e:

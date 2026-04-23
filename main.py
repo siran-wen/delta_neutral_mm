@@ -327,9 +327,11 @@ def print_final_summary(
     session_start: float = 0.0,
     initial_capital: float = 0.0,
 ) -> None:
-    rpnl = inventory.realized_pnl
+    net_realized = inventory.realized_pnl          # 已扣 fee
+    fees_total = inventory.cumulative_fees_usdc
+    gross_realized = net_realized + fees_total     # 反推 gross
     upnl = inventory.unrealized_pnl(last_mids)
-    total = rpnl + upnl
+    total = net_realized + upnl
     lines = inventory.summary_lines(last_mids)
     sep = "=" * 55
     logger.info(sep)
@@ -340,9 +342,11 @@ def print_final_summary(
             logger.info(line)
     else:
         logger.info("  无持仓记录")
-    logger.info(f"  已实现 PnL : {rpnl:+.4f} USDC")
-    logger.info(f"  未实现 PnL : {upnl:+.4f} USDC")
-    logger.info(f"  合计 PnL   : {total:+.4f} USDC")
+    logger.info(f"  已实现 PnL (Gross) : {gross_realized:+.4f} USDC")
+    logger.info(f"  手续费             : -{fees_total:.4f} USDC")
+    logger.info(f"  已实现 PnL (Net)   : {net_realized:+.4f} USDC")
+    logger.info(f"  未实现 PnL         : {upnl:+.4f} USDC")
+    logger.info(f"  合计 PnL           : {total:+.4f} USDC")
     if session_start > 0 and initial_capital > 0:
         elapsed_h = (time.time() - session_start) / 3600
         annual_pct = (
@@ -550,12 +554,20 @@ def main() -> None:
             logger.warning(f"现货余额拉取失败（现货底仓同步跳过）: {e}")
 
         # Step 1: 永续 → inventory.balances["perp"]
+        # 存 total（含保证金占用）而非 free，否则 PnL 账户净值会漏计已占保证金。
+        # 同时把 used 另存到 "perp_used"，便于 PnL 日志显示占用/可提拆分。
         if _perp_bal is not None:
             for currency, bal in _perp_bal.balances.items():
-                free = float(bal.free or 0.0)
-                if free > 0:
-                    inventory.set_balance("perp", currency, free)
-                    logger.info(f"初始余额同步: perp:{currency} = {free:.6f}")
+                total_amt = float(bal.total or 0.0)
+                used_amt = float(bal.used or 0.0)
+                if total_amt > 0:
+                    inventory.set_balance("perp", currency, total_amt)
+                    if used_amt > 0:
+                        inventory.set_balance("perp_used", currency, used_amt)
+                    logger.info(
+                        f"初始余额同步: perp:{currency} = {total_amt:.6f} "
+                        f"(占用 {used_amt:.4f})"
+                    )
 
         # Step 2: 现货全部 coin → inventory.balances["spot"]（BalanceGuard 用）
         if _spot_bal is not None:
@@ -859,11 +871,24 @@ def main() -> None:
         if amount <= 0:
             return
 
-        price  = managed.price or 0.0
+        # 优先用真实加权成交均价（由 OM.sync_from_exchange 从 CCXT 'average' 字段 /
+        # trades 聚合 / Hyperliquid 原生 avgPx 回填）。
+        # 修复 A1 遗留：hedger 的 taker 单限价 = mid ± 0.2%、实际成交 ≈ mid，两者差
+        # 可达 0.2%，用 limit price 会让 realized_pnl（平仓盈亏 = 成交价 − 均价）和
+        # avg_entry（加权均价）长期累积偏差。
+        # fallback 顺序：avg_fill_price → managed.price（限价）→ 0.0
+        price  = managed.avg_fill_price or managed.price or 0.0
         signed = amount if managed.side == "buy" else -amount
 
-        # 更新本地持仓
-        inventory.on_fill(managed.symbol, managed.side, amount, price)
+        # 更新本地持仓（含手续费；fee 字段由 OM.sync_from_exchange 从 gateway 响应透传）
+        inventory.on_fill(
+            managed.symbol,
+            managed.side,
+            amount,
+            price,
+            fee_cost=managed.fee_cost or 0.0,
+            fee_currency=managed.fee_currency,
+        )
 
         # 同步通知 RiskManager 更新 Delta（用于仓位限制检查）
         rm.update_position(managed.symbol, signed)
@@ -1060,17 +1085,24 @@ def main() -> None:
             nonlocal last_pnl_log
             now = time.time()
             if last_mids and now - last_pnl_log >= pnl_log_interval:
-                rpnl = inventory.realized_pnl
+                net_realized = inventory.realized_pnl    # 已扣 fee
+                fees_total = inventory.cumulative_fees_usdc
+                gross_realized = net_realized + fees_total  # 反推 gross
                 upnl = inventory.unrealized_pnl(last_mids)
-                total_pnl = rpnl + upnl
+                total_pnl = net_realized + upnl
                 elapsed_h = (now - session_start) / 3600
                 annual_pct = (
                     (total_pnl / initial_capital) * (8760 / elapsed_h) * 100
                     if elapsed_h > 0 and initial_capital > 0 else 0.0
                 )
                 logger.info(
-                    f"[PnL] 已实现={rpnl:+.4f}  未实现={upnl:+.4f}  "
-                    f"合计={total_pnl:+.4f} USDC  "
+                    f"[PnL] Gross已实现={gross_realized:+.4f}  "
+                    f"Fees=-{fees_total:.4f}  "
+                    f"Net已实现={net_realized:+.4f}  "
+                    f"未实现={upnl:+.4f}"
+                )
+                logger.info(
+                    f"[PnL] 合计={total_pnl:+.4f} USDC  "
                     f"年化={annual_pct:+.1f}%  "
                     f"成交={counters['fills']}笔  "
                     f"量={counters['volume_usdc']:.0f}USDC  "
@@ -1144,13 +1176,28 @@ def main() -> None:
                             for coin, amt in sorted(unique_coins.items())
                         )
                         bal_snapshots.append(f"{acct}{{{inner}}}")
+                # 账户净值 = 现货 USDC + 现货 token × mid + 永续 USDC（含保证金）
+                spot_usdc = inventory.balances.get("spot", {}).get("USDC", 0.0)
+                perp_usdc = inventory.balances.get("perp", {}).get("USDC", 0.0)
+                perp_used = inventory.balances.get("perp_used", {}).get("USDC", 0.0)
+                spot_asset_val = 0.0
+                for sym, qty in inventory.get_all_positions().items():
+                    if ":" in sym or qty <= 0:
+                        continue
+                    mid = last_mids.get(sym, 0.0) or inventory.avg_entry.get(sym, 0.0)
+                    if mid > 0:
+                        spot_asset_val += qty * mid
+                account_equity = spot_usdc + perp_usdc + spot_asset_val
+
                 if bal_snapshots:
-                    total_usdc = sum(
-                        curs.get("USDC", 0.0) for curs in all_bal.values()
+                    perp_detail = (
+                        f" (占用={perp_used:.2f} 可提={perp_usdc - perp_used:.2f})"
+                        if perp_used > 0 else ""
                     )
                     logger.info(
-                        f"[PnL] 余额: {'  '.join(bal_snapshots)}  "
-                        f"totalUSDC={total_usdc:.2f}"
+                        f"[PnL] 余额: {' '.join(bal_snapshots)}  "
+                        f"perp_USDC={perp_usdc:.2f}{perp_detail}  "
+                        f"账户净值≈{account_equity:.2f} USDC"
                     )
 
                 logger.info(
@@ -1256,7 +1303,8 @@ def main() -> None:
             logger.info(
                 f"[HEDGE] 对冲统计: 成功={stats['total_hedged']}  "
                 f"失败={stats['total_failed']}  "
-                f"未对冲残量={stats['pending_hedge_debt']}"
+                f"late捞回={stats.get('late_recovered', 0)}  "
+                f"未对冲残量={stats.get('pending_hedge_debt', {})}"
             )
 
             # 每个 trading_pair 的 delta 分解（现货 / 永续 / 净值 / 裸敞口告警）
