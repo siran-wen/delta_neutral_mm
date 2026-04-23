@@ -1127,9 +1127,12 @@ class OrderManager:
           1. 现货和永续都能拉到（CCXT swap 模式对 Hyperliquid 现货成交返回为空）
           2. 用 oid 精确匹配，不依赖 symbol 字段（避免 CCXT base/baseName 不一致坑）
           3. 一次拉回最近 2000 笔，覆盖一个对账周期内的所有成交
+          4. 聚合 userFills 的 fee 字段到 ManagedOrder（修复 B2 bug：做市订单几乎
+             都走延迟对账路径，原实现漏提取 fee 导致 PnL Fees 始终为 0）
 
         返回:
-            OrderState.FILLED : 找到匹配的成交记录，更新 managed.filled / remaining / avg_price
+            OrderState.FILLED : 找到匹配的成交记录，更新 managed.filled / remaining /
+                                avg_price / fee_cost / fee_currency
             None              : 拉取失败、未实现或无匹配（由上层决定怎么处理）
         """
         eid = managed.exchange_order_id
@@ -1153,9 +1156,34 @@ class OrderManager:
             )
             return None
 
+        # userFills 字段说明（来自 A 阶段 tests/diagnose_hl_spot_orders.py）：
+        #   f['oid']        : 订单 id（字符串或整数）
+        #   f['sz']/'px'    : 成交量 / 成交价（字符串）
+        #   f['fee']        : 主 fee 数值（字符串）
+        #   f['feeToken']   : 主 fee 币种（"USDC" / "USOL" / "SOL" 等）
+        #   f['builderFee'] : 可选，单位 USDC 的建单方额外加收（字符串）
+        #   f['time']       : 毫秒时间戳
+        #
+        # fee 聚合规则（修复 B2 遗漏，与 Gateway.Order.from_ccxt 语义一致）：
+        #   1. 只聚合 oid 匹配的 fill 记录
+        #   2. Hyperliquid 现货 BUY 的 fee 以 base coin 扣（USOL），
+        #      现货 SELL / 永续 以 USDC 扣；同一订单多笔 fill feeToken 应一致，
+        #      但极端场景下不一致时按"出现次数最多的币种"投票选订单级币种
+        #   3. builderFee 永远是 USDC，按主 fee 币种规则累加：
+        #      - 主 fee 是 USDC → 直接相加
+        #      - 主 fee 是 base coin → 按成交均价折算成 base coin 再加
+        #      - 只有 builderFee 没有主 fee → 整笔按 USDC 记入
+        #   4. userFills 无 fee 字段（边角 case）→ 保持 None，不 raise
+
         total_filled = 0.0
         last_price = 0.0
         last_time = 0
+
+        # fee 聚合中间变量
+        main_fee_sum: float = 0.0                # 主 fee 累加（原币种单位）
+        main_fee_ccy_votes: Dict[str, int] = {}  # 主 fee 币种计数（投票选多数）
+        builder_fee_usdc_sum: float = 0.0        # builderFee 累加（USDC）
+
         for f in fills or []:
             if str(f.get("oid", "")) != str(eid):
                 continue
@@ -1174,13 +1202,69 @@ class OrderManager:
             except (TypeError, ValueError):
                 pass
 
+            # ── fee 提取（防御：任何字段异常跳过本条 fee，不中断 fill 累加）──
+            try:
+                fee_val = f.get("fee")
+                fee_ccy = f.get("feeToken")
+                if fee_val is not None and fee_ccy:
+                    fee_num = float(fee_val)
+                    if fee_num > 0:
+                        main_fee_sum += fee_num
+                        main_fee_ccy_votes[fee_ccy] = main_fee_ccy_votes.get(fee_ccy, 0) + 1
+            except (TypeError, ValueError):
+                pass
+
+            # ── builderFee 累加（USDC）────────────────────────────────────
+            try:
+                bfee = f.get("builderFee")
+                if bfee is not None:
+                    bfee_num = float(bfee)
+                    if bfee_num > 0:
+                        builder_fee_usdc_sum += bfee_num
+            except (TypeError, ValueError):
+                pass
+
         if total_filled <= 0:
             return None
 
+        # ── 订单级 fee 聚合 ──────────────────────────────────────────────────
+        # 选主 fee 币种：投票多数（对单订单多笔 fill 时的防御，通常只有 1 种）
+        main_fee_ccy: Optional[str] = None
+        if main_fee_ccy_votes:
+            main_fee_ccy = max(main_fee_ccy_votes.items(), key=lambda x: x[1])[0]
+
+        # 把 builderFee 合并到主 fee（参考 Gateway.Order.from_ccxt 逻辑）
+        final_fee_cost: float = main_fee_sum
+        final_fee_ccy: Optional[str] = main_fee_ccy
+
+        if builder_fee_usdc_sum > 0:
+            if main_fee_ccy == "USDC":
+                # 直接相加
+                final_fee_cost += builder_fee_usdc_sum
+            elif main_fee_ccy is None:
+                # 只有 builderFee 没有主 fee（理论上罕见）→ 按 USDC 记入
+                final_fee_cost = builder_fee_usdc_sum
+                final_fee_ccy = "USDC"
+            elif last_price > 0:
+                # 主 fee 是 base coin，builderFee 按成交均价折算成 base coin
+                final_fee_cost += builder_fee_usdc_sum / last_price
+            else:
+                # 主 fee 是 base coin 但 last_price=0（异常）→ 丢弃 builderFee
+                # 避免用 0 价污染。debug 日志提示。
+                self._logger.debug(
+                    f"[{managed.client_order_id}] userFills builderFee 无法折算 "
+                    f"(last_price=0)，丢弃: builderFee={builder_fee_usdc_sum}"
+                )
+
+        # ── 回填 ManagedOrder ────────────────────────────────────────────
         managed.filled = total_filled
         managed.remaining = max(managed.amount - total_filled, 0.0)
         if last_price > 0:
             managed.avg_price = last_price
+        # 只在取到有效 fee 时才写，避免把已有值（比如 from_ccxt 路径先写入的）覆盖为 None
+        if final_fee_cost > 0 and final_fee_ccy:
+            managed.fee_cost = final_fee_cost
+            managed.fee_currency = final_fee_ccy
         return OrderState.FILLED
 
     # =========================================================================

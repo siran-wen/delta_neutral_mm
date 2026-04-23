@@ -45,8 +45,12 @@ if TYPE_CHECKING:
 _CONSERVATIVE_LEVERAGE = 1.0
 
 # 等待成交的轮询配置
-_FILL_WAIT_TIMEOUT_S = 5.0
-_FILL_POLL_INTERVAL_S = 1.0
+# 从 5s 上调到 15s：OM reconcile 周期 = 3s + trade_history 路径延迟 3-5s，
+# 原 5s 在慢成交时撞墙（B2 bug）。15s 足够 OM 跑 5 轮对账。
+_FILL_WAIT_TIMEOUT_S = 15.0
+# 从 1s 下调到 0.5s：主要靠 order.state（OM 已在后台更新），本地轮询便宜，
+# 缩短确认延迟；fetch_balance/positions 兜底路径也跟随这个节奏。
+_FILL_POLL_INTERVAL_S = 0.5
 
 # 成交比例阈值：实际成交量必须 ≥ target × 此比例才视为成功
 _FILL_RATIO_THRESHOLD = 0.95
@@ -201,6 +205,13 @@ class InventoryBootstrap:
         skip_pct = float(self._cfg["skip_if_existing_pct"])
         skip_threshold = target_qty * skip_pct
 
+        # inventory 基准快照（在任何下单动作之前取），供后续 _wait_inventory_sync
+        # 判定 delta 用。修复 B2 假警报：on_fill 回调可能在 _confirm_fill_via_balance
+        # 返回前就同步累加完毕，方法内自取 baseline 会拿到累加后值、导致必定超时。
+        # 必须在下单前取;skip 分支里取了也无害(当场 return,值不会被使用)。
+        inventory_baseline_spot = self._inventory.get_position(market_sym)
+        inventory_baseline_perp = self._inventory.get_position(hedge_sym)
+
         if existing_spot >= skip_threshold and existing_short >= skip_threshold:
             self._logger.info(
                 f"[BOOTSTRAP] {pair.base} 已有底仓充足，跳过建仓: "
@@ -322,24 +333,86 @@ class InventoryBootstrap:
             self._rollback_spot(market_sym, actual_spot_filled, market_mid, slippage, pair.base)
             sys.exit(1)
 
-        # ── 8. 更新本地状态（inventory.on_fill） ────────────────────────────
-        # 注：OM 订单在 submit_order 返回时若已 FILLED，不会触发 on_fill 回调
-        #    （order_filled 事件只在 reconcile 检测到交易所侧消失时发出），
-        #    因此这里手动写入不会与 main.py 的 on_fill 重复。
-        self._inventory.on_fill(market_sym, "buy", actual_spot_filled, spot_buy_price)
-        self._inventory.on_fill(hedge_sym, "sell", perp_filled, perp_sell_price)
+        # ── 8. 等待 OM 事件链驱动 inventory 同步 ──────────────────────────────
+        # 历史修复：之前这里手动 inventory.on_fill(...)，在 B2 timeout 修复后
+        # 出现双重计入 bug —— OM reconcile 通过 trade_history 发现成交并 emit
+        # order_filled 事件 → main.py on_fill 回调 → inventory 已更新；此时
+        # bootstrap 再手动 on_fill 会造成第二次累加，净 delta 翻倍误报。
+        # 改为：让 OM reconcile 的 order_filled 事件统一驱动 main.py 的 on_fill
+        # 回调，bootstrap 在此等 inventory 追上即可，避免双重数据源。
+        #
+        # 为什么需要显式等待：_confirm_fill_via_balance 返回时 order.state 已是
+        # FILLED，但 main.py on_fill 回调可能还在 OM reconcile 线程的事件分发
+        # 队列里排队执行，inventory 未必立刻反映变化。
+        self._wait_inventory_sync(
+            market_sym, side="buy",
+            expected_delta=actual_spot_filled,
+            baseline=inventory_baseline_spot,
+        )
+        self._wait_inventory_sync(
+            hedge_sym, side="sell",
+            expected_delta=perp_filled,
+            baseline=inventory_baseline_perp,
+        )
 
         # ── 9. 验证净 delta ──────────────────────────────────────────────────
         net_delta = self._compute_net_delta(pair, market_sym, hedge_sym)
         tol = float(self._cfg["verify_net_delta_tolerance"])
+
         if abs(net_delta) > tol:
-            self._logger.critical(
-                f"[BOOTSTRAP] {pair.base} 建仓后净 Delta 超过容差: "
-                f"net_delta={net_delta:+.6f}  tol={tol}  "
-                f"spot_filled={actual_spot_filled}  perp_filled={perp_filled}  "
-                f"请人工核对持仓。"
+            # inventory 报出异常 delta。在抛 critical 前走一次交易所真实查询
+            # 兜底，避免被 inventory 同步延迟（或 OM 回调丢失）误判。
+            self._logger.warning(
+                f"[BOOTSTRAP] {pair.base} inventory 净 delta 异常 "
+                f"({net_delta:+.6f} > tol {tol})，查交易所真实持仓二次验证..."
             )
-            sys.exit(1)
+            exchange_delta = self._compute_net_delta_from_exchange(
+                pair, market_sym, hedge_sym,
+            )
+            if exchange_delta is not None:
+                # 交易所 spot 读的是总余额（含启动前残留 existing_spot），
+                # perp 读的是总空头（含启动前 existing_short）。
+                # 本次 bootstrap 引入的净 delta = 交易所 - 启动前基准
+                #   spot 增量 = exchange_spot - existing_spot（多头 +）
+                #   perp 增量 = exchange_short - existing_short（空头 -）
+                #   adjusted = spot 增量 - perp 增量
+                #            = (exchange_spot - exchange_short) - (existing_spot - existing_short)
+                #            = exchange_delta - existing_spot + existing_short
+                adjusted_exchange_delta = exchange_delta - existing_spot + existing_short
+                self._logger.warning(
+                    f"[BOOTSTRAP] 交易所兜底: exchange_delta={exchange_delta:+.6f}  "
+                    f"existing_spot={existing_spot}  existing_short={existing_short}  "
+                    f"adjusted={adjusted_exchange_delta:+.6f}"
+                )
+                if abs(adjusted_exchange_delta) <= tol:
+                    self._logger.info(
+                        f"[BOOTSTRAP] {pair.base} 交易所真实 delta 在容差内 "
+                        f"({adjusted_exchange_delta:+.6f} <= {tol})，放行。"
+                        f"inventory 可能有同步延迟或重复计入，不影响账户安全。"
+                    )
+                    net_delta = adjusted_exchange_delta  # 用真实值走后续 info 日志
+                else:
+                    inv_delta_final = self._inventory.get_net_delta(
+                        pair.base,
+                        {market_sym: pair.base, hedge_sym: pair.base},
+                    )
+                    self._logger.critical(
+                        f"[BOOTSTRAP] {pair.base} 交易所 delta 也超容差: "
+                        f"exchange={adjusted_exchange_delta:+.6f}  tol={tol}  "
+                        f"spot_filled={actual_spot_filled}  perp_filled={perp_filled}  "
+                        f"inventory_delta={inv_delta_final:+.6f}  "
+                        f"请人工核对持仓。"
+                    )
+                    sys.exit(1)
+            else:
+                # 兜底查询也失败，保守 exit
+                self._logger.critical(
+                    f"[BOOTSTRAP] {pair.base} inventory delta 异常且兜底查询失败: "
+                    f"net_delta={net_delta:+.6f}  tol={tol}  "
+                    f"spot_filled={actual_spot_filled}  perp_filled={perp_filled}  "
+                    f"请人工核对持仓。"
+                )
+                sys.exit(1)
 
         self._logger.info(
             f"[BOOTSTRAP] {pair.base} 建仓完成: "
@@ -551,24 +624,44 @@ class InventoryBootstrap:
         """
         确认现货买入已成交。
 
-        优先路径：若 submit_order 返回时 order.state 已是 FILLED，
-                 直接使用 order.filled 作为实际成交量。
-        降级路径：轮询 fetch_balance，直到 base_asset.free 比 baseline 增加 ≥ target × 0.95
-                 或超时。
+        数据源优先级（每轮循环都查）：
+          1. order.state == FILLED  ← OM 后台对账已更新（主路径）
+             返回 order.filled（OM 从 userFills/trade_history 填入的真实值）
+          2. fetch_balance 差值兜底（应对 OM 对账延迟的极端情况）
+
+        修复 B2 bug：原实现只在 submit 瞬间查一次 order.state，之后完全靠
+        fetch_balance 轮询；gateway balance 刷新延迟可导致 OM 已确认成交但
+        bootstrap 超时失败（裸 delta 敞口）。
 
         Returns:
             实际成交数量；超时未成交返回 None
         """
         threshold = target_qty * _FILL_RATIO_THRESHOLD
 
-        # 优先：订单已立刻 FILLED
+        # 立刻检查（submit 返回就 FILLED 的场景）
         if order.state == OrderState.FILLED and order.filled and order.filled >= threshold:
+            self._logger.debug(
+                f"[BOOTSTRAP] {base_asset} 订单 submit 即 FILLED: "
+                f"filled={order.filled}"
+            )
             return float(order.filled)
 
-        # 降级：轮询余额
         deadline = time.time() + _FILL_WAIT_TIMEOUT_S
         while time.time() < deadline:
             time.sleep(_FILL_POLL_INTERVAL_S)
+
+            # ── 主路径：OM 的订单状态 ─────────────────────────────
+            # OM reconcile 线程会从 userFills/trade_history 把 state 推到 FILLED
+            # 并把 order.filled 更新为真实成交量
+            if order.state == OrderState.FILLED and order.filled and order.filled >= threshold:
+                self._logger.info(
+                    f"[BOOTSTRAP] 通过 OM state 确认现货成交: "
+                    f"{base_asset} filled={order.filled} (via order.state)"
+                )
+                return float(order.filled)
+
+            # ── 兜底：fetch_balance 差值 ──────────────────────────
+            # 如果 OM 因为某种原因漏掉这笔 fill（理论上不该），balance 变化能救一次
             try:
                 bal = self._gateway.fetch_balance()
                 b = bal.balances.get(base_asset)
@@ -579,10 +672,31 @@ class InventoryBootstrap:
             delta = free_now - baseline
             if delta >= threshold:
                 self._logger.info(
-                    f"[BOOTSTRAP] 通过余额差值确认现货成交: "
+                    f"[BOOTSTRAP] 通过余额差值确认现货成交(兜底路径): "
                     f"{base_asset} baseline={baseline} now={free_now} delta={delta}"
                 )
                 return delta
+
+        # 最后一次检查 order.state（避免 sleep 和 deadline 之间的竞态）
+        if order.state == OrderState.FILLED and order.filled and order.filled >= threshold:
+            self._logger.info(
+                f"[BOOTSTRAP] 最终兜底 OM state 检查命中: "
+                f"{base_asset} filled={order.filled}"
+            )
+            return float(order.filled)
+
+        # 诊断日志：超时时打印最终 state + balance，方便排障
+        try:
+            bal = self._gateway.fetch_balance()
+            b = bal.balances.get(base_asset)
+            free_final = float(b.free or 0.0) if b is not None else 0.0
+        except Exception:
+            free_final = None
+        self._logger.error(
+            f"[BOOTSTRAP] {base_asset} 成交确认超时 ({_FILL_WAIT_TIMEOUT_S}s): "
+            f"order.state={order.state}  order.filled={order.filled}  "
+            f"balance_final={free_final}  baseline={baseline}  threshold={threshold}"
+        )
         return None
 
     def _confirm_perp_fill(
@@ -593,16 +707,36 @@ class InventoryBootstrap:
         order: "ManagedOrder",
     ) -> Optional[float]:
         """
-        确认永续空头已成交。与 _confirm_fill_via_balance 对称，但用 fetch_positions。
+        确认永续空头已成交。与 _confirm_fill_via_balance 对称：
+          1. 主路径：order.state == FILLED（OM 后台对账结果）
+          2. 兜底：fetch_positions 查空头持仓差值
+
+        修复 B2 bug（对称于现货腿）：原实现超出 submit 的 snapshot 后就不再看
+        order.state，只靠 fetch_positions 轮询，在交易所持仓传播慢时可能误判超时。
         """
         threshold = target_qty * _FILL_RATIO_THRESHOLD
 
+        # 立刻检查（submit 返回就 FILLED 的场景）
         if order.state == OrderState.FILLED and order.filled and order.filled >= threshold:
+            self._logger.debug(
+                f"[BOOTSTRAP] {hedge_sym} 订单 submit 即 FILLED: "
+                f"filled={order.filled}"
+            )
             return float(order.filled)
 
         deadline = time.time() + _FILL_WAIT_TIMEOUT_S
         while time.time() < deadline:
             time.sleep(_FILL_POLL_INTERVAL_S)
+
+            # ── 主路径：OM state ──────────────────────────────────
+            if order.state == OrderState.FILLED and order.filled and order.filled >= threshold:
+                self._logger.info(
+                    f"[BOOTSTRAP] 通过 OM state 确认永续空头成交: "
+                    f"{hedge_sym} filled={order.filled} (via order.state)"
+                )
+                return float(order.filled)
+
+            # ── 兜底：fetch_positions ─────────────────────────────
             try:
                 positions = self._gateway.fetch_positions([hedge_sym])
                 short_now = 0.0
@@ -616,11 +750,110 @@ class InventoryBootstrap:
             delta = short_now - baseline_short
             if delta >= threshold:
                 self._logger.info(
-                    f"[BOOTSTRAP] 通过持仓差值确认永续空头成交: "
+                    f"[BOOTSTRAP] 通过持仓差值确认永续空头成交(兜底路径): "
                     f"{hedge_sym} baseline_short={baseline_short} now={short_now} delta={delta}"
                 )
                 return delta
+
+        # 最后一次 order.state 检查（避免竞态）
+        if order.state == OrderState.FILLED and order.filled and order.filled >= threshold:
+            self._logger.info(
+                f"[BOOTSTRAP] 最终兜底 OM state 检查命中: "
+                f"{hedge_sym} filled={order.filled}"
+            )
+            return float(order.filled)
+
+        # 诊断日志
+        try:
+            positions = self._gateway.fetch_positions([hedge_sym])
+            short_final = 0.0
+            for p in positions:
+                if p.symbol == hedge_sym and p.side == "short":
+                    short_final = float(p.size or 0.0)
+                    break
+        except Exception:
+            short_final = None
+        self._logger.error(
+            f"[BOOTSTRAP] {hedge_sym} 永续成交确认超时 ({_FILL_WAIT_TIMEOUT_S}s): "
+            f"order.state={order.state}  order.filled={order.filled}  "
+            f"position_final={short_final}  baseline={baseline_short}  threshold={threshold}"
+        )
         return None
+
+    def _wait_inventory_sync(
+        self,
+        symbol: str,
+        side: str,
+        expected_delta: float,
+        baseline: Optional[float] = None,
+        timeout_s: float = 5.0,
+        poll_interval_s: float = 0.2,
+    ) -> bool:
+        """
+        等 inventory 通过 OM 事件链被 main.py on_fill 更新到位。
+
+        数据路径：OM reconcile 检测 fill → emit "order_filled" 事件 →
+        main.py on_fill 回调 → inventory.on_fill()。这里只负责等 inventory
+        追上 caller 给定的基准（或方法开始时自取的基准），不自己写入，避免
+        重复计入（B2 timeout 修复后暴露的 bug）。
+
+        参数：
+          baseline:  可选，"调用建仓前的 inventory 快照"。
+                     如果 on_fill 可能在调用本方法前就已累加（B2 第三次实盘
+                     暴露的假警报：_confirm_fill_via_balance 等到 order.state
+                     == FILLED 时，OM reconcile 线程已同步派发 order_filled
+                     事件并让 main.py on_fill 把累加跑完），caller 必须在下单
+                     前就取 snapshot 并传入,否则方法内自取的 baseline 就等于
+                     累加后值，delta 永远 0，必定超时。
+                     None 时退化到方法开始时自取（向后兼容；不推荐）。
+
+        判定逻辑：
+          - buy  侧：current - baseline >= expected × 0.95
+          - sell 侧：baseline - current >= expected × 0.95
+            （perp 开空：position 从 baseline（如 0）减到更小（如 -0.26），
+              baseline - current = 0 - (-0.26) = 0.26）
+
+        超时返回 False 但不 raise —— 让 caller 继续走净 delta 校验（含交易所
+        兜底路径），inventory 漂移时仍能安全放行或 critical 退出。
+
+        Returns:
+            True  = inventory 已同步到 baseline + expected_delta
+            False = 超时未追上
+        """
+        threshold = expected_delta * 0.95
+        if baseline is None:
+            # 向后兼容：方法开始时自取（可能撞到时序 bug，不推荐）
+            baseline = self._inventory.get_position(symbol)
+            self._logger.debug(
+                f"[BOOTSTRAP] _wait_inventory_sync 未传 baseline，"
+                f"方法内自取 {symbol}={baseline}（注意时序风险）"
+            )
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            current = self._inventory.get_position(symbol)
+            if side == "buy":
+                delta = current - baseline
+            else:  # sell
+                delta = baseline - current
+
+            if delta >= threshold:
+                self._logger.debug(
+                    f"[BOOTSTRAP] inventory 已同步 {symbol} {side}: "
+                    f"baseline={baseline} current={current} delta={delta}"
+                )
+                return True
+            time.sleep(poll_interval_s)
+
+        # 超时：打诊断日志但不 raise
+        final = self._inventory.get_position(symbol)
+        self._logger.warning(
+            f"[BOOTSTRAP] inventory 同步超时 {symbol} {side}: "
+            f"baseline={baseline} final={final} expected_delta={expected_delta} "
+            f"threshold={threshold} timeout={timeout_s}s "
+            f"(OM 事件链可能延迟或丢失回调，后续净 delta 校验会检出)"
+        )
+        return False
 
     def _safe_cancel(self, order: "ManagedOrder") -> None:
         """
@@ -732,11 +965,57 @@ class InventoryBootstrap:
         hedge_sym: str,
     ) -> float:
         """
-        通过 InventoryTracker.get_net_delta 计算 pair 的净 Delta。
+        通过 InventoryTracker.get_net_delta 计算 pair 的净 Delta（主路径）。
 
         现货腿（如 USOL/USDC）和永续腿（如 SOL/USDC:USDC）在 inventory 里是
         两个独立 symbol，但经济上同属 pair.base。用 asset_map 统一映射到 base
         后聚合，与 main.py 关停摘要里的 hedger.build_asset_map 路径保持一致。
+
+        容差判断留给 caller（_bootstrap_one_pair 内已有 verify_net_delta_tolerance
+        检查）。如果 caller 检出异常值，可改调 _compute_net_delta_from_exchange
+        做交易所真实查询二次验证。
         """
         asset_map = {market_sym: pair.base, hedge_sym: pair.base}
         return self._inventory.get_net_delta(pair.base, asset_map)
+
+    def _compute_net_delta_from_exchange(
+        self,
+        pair: "TradingPairConfig",
+        market_sym: str,
+        hedge_sym: str,
+    ) -> Optional[float]:
+        """
+        直接从交易所真实持仓计算净 delta（用于 inventory 异常时的二次验证）。
+
+        现货：fetch_balance 读 base coin 余额
+        永续：fetch_positions 读 short 持仓
+        返回 = spot_qty - perp_short
+
+        ⚠️ 读的是当前**总余额 / 总持仓**，包含启动前已有的残留（existing_spot /
+        existing_short）。调用方用它做 sanity check 时要自行扣除启动前基准，
+        得到"本次 bootstrap 引入的净 delta"。
+
+        Returns:
+            spot_qty - perp_short（未扣除启动前基准）；任一腿查询失败返回 None
+        """
+        try:
+            bal = self._gateway.fetch_balance()
+            base_asset = market_sym.split("/")[0]
+            b = bal.balances.get(base_asset)
+            spot_qty = float(b.free or 0.0) if b is not None else 0.0
+        except Exception as e:
+            self._logger.warning(f"[BOOTSTRAP] 兜底查 spot 余额失败: {e}")
+            return None
+
+        try:
+            positions = self._gateway.fetch_positions([hedge_sym])
+            perp_short = 0.0
+            for p in positions:
+                if p.symbol == hedge_sym and p.side == "short":
+                    perp_short = float(p.size or 0.0)
+                    break
+        except Exception as e:
+            self._logger.warning(f"[BOOTSTRAP] 兜底查 perp 持仓失败: {e}")
+            return None
+
+        return spot_qty - perp_short
