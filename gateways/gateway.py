@@ -119,11 +119,46 @@ class Order:
 
     @classmethod
     def from_ccxt(cls, data: dict) -> "Order":
-        # 加权成交均价三级提取：
+        # ---- Hyperliquid 原生 info.response.data.statuses[0] 提取 ----
+        # HL 的订单状态通过 statuses[0] 的子字典标明：
+        #   - "filled"  sub-dict 存在 → 本单已真实成交（aggressive IOC 语义上
+        #                               all-or-none），内含 avgPx / totalSz
+        #   - "resting" sub-dict 存在 → 本单挂在订单簿（maker）
+        # CCXT 对 HL 同步响应的归一化偶尔失灵（复盘 live_20260424_224447：
+        # 6/6 hedge 收到 status=open / filled=0，但 info.statuses[0].filled
+        # 里有真实 totalSz 和 avgPx）。用 "filled" sub-dict 的存在作为唯一
+        # discriminator 扫一遍 info，同时产出 hl_avg_px_in_info / hl_total_sz_in_info，
+        # 后面 avg / filled 字段的归一化都复用这两个值。
+        hl_avg_px_in_info: Optional[float] = None
+        hl_total_sz_in_info: Optional[float] = None
+        try:
+            info = data.get("info") or {}
+            resp = info.get("response") or {}
+            rd = resp.get("data") or {}
+            for st in rd.get("statuses") or []:
+                filled_info = (st or {}).get("filled") if isinstance(st, dict) else None
+                if not filled_info:
+                    continue
+                try:
+                    px = float(filled_info.get("avgPx") or 0)
+                    if px > 0:
+                        hl_avg_px_in_info = px
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    sz = float(filled_info.get("totalSz") or 0)
+                    if sz > 0:
+                        hl_total_sz_in_info = sz
+                except (TypeError, ValueError):
+                    pass
+                break  # HL 单订单响应只有一个 status，取到即止
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+        # ---- 加权成交均价三级提取 ----
         #   1. CCXT 标准 'average' 字段（最稳）
         #   2. CCXT 'trades' 数组按 (price, amount) 聚合（部分成交场景）
-        #   3. Hyperliquid 原生 info.response.data.statuses[0].filled.avgPx
-        #      （CCXT 对 hyperliquid 的 IOC 立即成交响应不总会归一化 average）
+        #   3. 上面 HL 原生 info.response.data.statuses[0].filled.avgPx
         avg = data.get("average")
         if avg is None and data.get("trades"):
             total_sz = 0.0
@@ -139,19 +174,31 @@ class Order:
                     total_notional += sz * px
             if total_sz > 0:
                 avg = total_notional / total_sz
-        if avg is None:
+        if avg is None and hl_avg_px_in_info is not None:
+            avg = hl_avg_px_in_info
+
+        # ---- filled / remaining 归一化修复 ----
+        # CCXT 对 HL aggressive IOC 的同步响应 bug：status=open、filled=0，
+        # 但 info.statuses[0].filled.totalSz 有真实成交量。discriminator 已由
+        # 上面的 "filled" sub-dict 检查把 maker 挂单（resting）路径过滤掉，
+        # 这里只需保证：
+        #   a. 只在 CCXT 自报 filled=0 / None 时覆盖。若 CCXT 已归一化了部分
+        #      成交（filled > 0 且 < amount），保持原值不动——避免把真正的
+        #      partial-fill 场景压成 full-fill。
+        #   b. filled 被覆盖时同步重算 remaining，保持 filled + remaining = amount。
+        filled_val = data.get("filled")
+        remaining_val = data.get("remaining")
+        try:
+            raw_filled_num = float(filled_val) if filled_val is not None else 0.0
+        except (TypeError, ValueError):
+            raw_filled_num = 0.0
+        if raw_filled_num == 0.0 and hl_total_sz_in_info is not None:
+            filled_val = hl_total_sz_in_info
             try:
-                info = data.get("info") or {}
-                resp = info.get("response") or {}
-                rd = resp.get("data") or {}
-                for st in rd.get("statuses") or []:
-                    filled_info = (st or {}).get("filled") if isinstance(st, dict) else None
-                    if filled_info:
-                        px = float(filled_info.get("avgPx") or 0)
-                        if px > 0:
-                            avg = px
-                            break
-            except (TypeError, ValueError, AttributeError):
+                amt = float(data.get("amount") or 0)
+                if amt > 0:
+                    remaining_val = max(amt - hl_total_sz_in_info, 0.0)
+            except (TypeError, ValueError):
                 pass
 
         # ---- 手续费提取 ----
@@ -196,8 +243,8 @@ class Order:
         # builderFee（USDC）—— 无论主 fee 是否存在都要加
         builder_fee_usdc = 0.0
         try:
-            info = data.get("info") or {}
-            bf = info.get("builderFee")
+            info_for_bf = data.get("info") or {}
+            bf = info_for_bf.get("builderFee")
             if bf is not None and bf != "":
                 builder_fee_usdc = max(float(bf), 0.0)
         except (TypeError, ValueError):
@@ -233,8 +280,8 @@ class Order:
             price=data.get("price"),
             average=avg,
             amount=data.get("amount"),
-            filled=data.get("filled"),
-            remaining=data.get("remaining"),
+            filled=filled_val,
+            remaining=remaining_val,
             status=data.get("status"),
             timestamp=data.get("timestamp"),
             fee_cost=fee_cost,

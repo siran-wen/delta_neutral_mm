@@ -271,7 +271,210 @@ def test_submit_open_only_emits_submitted():
 
 
 # =============================================================================
-# 6. 幂等性：_emit_order_filled 多次调用不覆盖 first_filled_emit_ts
+# 6. CCXT IOC 归一化 bug：filled=0 / status=open 但 info 有 filled sub-dict
+#    → Order.from_ccxt 用 info.totalSz 回填 filled，OM 天然进 FILLED 分支
+# =============================================================================
+#
+# 背景：live_20260424_224447 里 6/6 hedge 遇到 CCXT 把 HL aggressive IOC 的
+# 同步响应归一化成 status=open/filled=0，但 info.response.data.statuses[0].
+# filled 子字典里 totalSz 和 avgPx 都在。修复落在 gateway.Order.from_ccxt，
+# 以 "filled" sub-dict 存在作为 discriminator（"resting" sub-dict 是 maker
+# 挂单，绝不进本分支），用 totalSz 回填 gw_order.filled，上层逻辑不用改。
+#
+# 下面 3 个 case 把三种边界形态锁死在测试层，防止未来有人修 from_ccxt
+# 时把 partial-fill 或 maker-resting 误压进这条路径。
+
+
+def _hl_response_with_info_filled(
+    eid: str,
+    symbol: str,
+    side: str,
+    amount: float,
+    total_sz: float,
+    avg_px: float,
+    ccxt_filled: float = 0.0,
+    ccxt_status: str = "open",
+    ccxt_average: object = None,  # 用 sentinel：None 表示 CCXT 也没归一化 average
+) -> dict:
+    """
+    构造 CCXT 归一化失败 + info.statuses[0].filled 里有真实成交量的响应。
+
+    模拟 live_20260424_224447 观测到的形态：CCXT 层把 status 标成 open、
+    filled 标成 0，但 HL 原生 info 里已经明确这一单全部成交。
+    """
+    resp: dict = {
+        "id": eid,
+        "symbol": symbol,
+        "side": side,
+        "type": "limit",
+        "price": avg_px,
+        "amount": amount,
+        "filled": ccxt_filled,
+        "remaining": max(amount - ccxt_filled, 0.0),
+        "status": ccxt_status,
+        "info": {
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [
+                        {
+                            "filled": {
+                                "oid": 123456,
+                                "totalSz": str(total_sz),  # HL 真实返回是字符串
+                                "avgPx": str(avg_px),
+                            }
+                        }
+                    ]
+                },
+            }
+        },
+    }
+    if ccxt_average is not None:
+        resp["average"] = ccxt_average
+    return resp
+
+
+def test_submit_immediate_ccxt_openzero_info_filled_emits_filled():
+    """
+    CCXT 归一化失败场景：status=open / filled=0，但 info.statuses[0].filled.
+    totalSz 和 avgPx 都在 → from_ccxt 应用 totalSz 回填 gw_order.filled，OM
+    原有 "filled >= amount" 分支自然进 FILLED，emit order_filled 且
+    filled_emit_source = "submit_immediate"。
+
+    同时断言 ManagedOrder.filled 被补齐到真实 totalSz（hedger 的 成交确认
+    日志读这个字段，不补齐会打印 0.000000）。
+    """
+    amount = 0.130
+    total_sz = 0.130
+    avg_px = 86.0080
+    response = _hl_response_with_info_filled(
+        eid="eid-hl-ioc-fixed",
+        symbol="SOL/USDC:USDC",
+        side="sell",
+        amount=amount,
+        total_sz=total_sz,
+        avg_px=avg_px,
+        ccxt_filled=0.0,
+        ccxt_status="open",
+        ccxt_average=None,  # CCXT 也没给 average，由 from_ccxt 从 info 里捞
+    )
+    om, _ = _make_om(response)
+    captured = _capture_events(om)
+
+    managed = om.submit_order(
+        "SOL/USDC:USDC", OrderSide.SELL, OrderType.LIMIT, amount, avg_px,
+        source="hedger",
+    )
+
+    assert managed.state == OrderState.FILLED, (
+        "CCXT 报 open 但 info.statuses[0].filled 存在 → from_ccxt 回填 filled "
+        "后 OM 应直接判 FILLED"
+    )
+    assert managed.filled == pytest.approx(total_sz), (
+        "managed.filled 必须从 info.totalSz 补齐到真实成交量，"
+        "否则 hedger 成交确认日志会误打印 filled=0"
+    )
+    assert managed.avg_fill_price == pytest.approx(avg_px), (
+        "从 info.avgPx 回填的成交均价必须同步 sync 到 ManagedOrder"
+    )
+    assert len(captured["filled"]) == 1
+    assert len(captured["submitted"]) == 1
+    assert managed.filled_emit_source == "submit_immediate"
+    assert managed.first_filled_emit_ts is not None
+
+
+def test_submit_immediate_ccxt_openzero_no_info_stays_open():
+    """
+    反向约束：CCXT 报 filled=0 / status=open，info 里也没有 filled sub-dict
+    （真正的 maker 挂单场景），不能被误判成 FILLED。
+
+    这个 case 专门卡住未来修改：如果有人把 discriminator 换成仅看 avgPx 或
+    仅看 statuses 存在性，本测试会立即炸。
+    """
+    response = {
+        "id": "eid-true-resting",
+        "symbol": "USOL/USDC",
+        "side": "buy",
+        "type": "limit",
+        "price": 85.00,
+        "amount": 0.10,
+        "filled": 0.0,
+        "remaining": 0.10,
+        "status": "open",
+        # info.statuses[0] 里只有 resting（挂单），没有 filled sub-dict
+        "info": {
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [
+                        {"resting": {"oid": 987654}}
+                    ]
+                },
+            }
+        },
+    }
+    om, _ = _make_om(response)
+    captured = _capture_events(om)
+
+    managed = om.submit_order(
+        "USOL/USDC", OrderSide.BUY, OrderType.LIMIT, 0.10, 85.00,
+        source="hedger",
+    )
+
+    assert managed.state == OrderState.OPEN, (
+        "info.statuses[0] 只有 resting 没有 filled → 不能误判成 FILLED"
+    )
+    assert managed.filled == 0.0
+    assert len(captured["filled"]) == 0
+    assert len(captured["submitted"]) == 1
+    assert managed.filled_emit_source is None
+
+
+def test_submit_partial_fill_not_overridden_by_info():
+    """
+    反向约束：CCXT 已归一化了部分成交（filled>0 且 <amount），即便 info 里
+    也给了 totalSz（可能早于 CCXT 归一化前的半截数据），from_ccxt 不应覆盖
+    CCXT 已有的 filled 值——避免把真正的 partial-fill 压成 full-fill。
+
+    中间状态保持走老路径（OPEN / PARTIALLY_FILLED 由 reconcile 或后续事件
+    推动），新的 filled-from-info 分支只捕获 "filled=0" 的 CCXT bug 形态。
+    """
+    amount = 0.10
+    ccxt_partial = 0.05  # CCXT 已归一化的部分成交
+    info_total_sz = 0.08  # 假想的 info 里 totalSz（不一致，但不应被采纳）
+    response = _hl_response_with_info_filled(
+        eid="eid-true-partial",
+        symbol="USOL/USDC",
+        side="sell",
+        amount=amount,
+        total_sz=info_total_sz,
+        avg_px=85.50,
+        ccxt_filled=ccxt_partial,
+        ccxt_status="open",
+        ccxt_average=85.50,
+    )
+    om, _ = _make_om(response)
+    captured = _capture_events(om)
+
+    managed = om.submit_order(
+        "USOL/USDC", OrderSide.SELL, OrderType.LIMIT, amount, 85.50,
+        source="hedger",
+    )
+
+    assert managed.state == OrderState.OPEN, (
+        "真正的 partial-fill (filled>0 且 <amount) 必须保持 OPEN，不进"
+        "submit-immediate FILLED 分支"
+    )
+    assert managed.filled == pytest.approx(ccxt_partial), (
+        "CCXT 自带的 filled (partial) 不应被 info.totalSz 覆盖，"
+        "否则会把 partial-fill 误压成 full-fill"
+    )
+    assert len(captured["filled"]) == 0
+    assert len(captured["submitted"]) == 1
+
+
+# =============================================================================
+# 7. 幂等性：_emit_order_filled 多次调用不覆盖 first_filled_emit_ts
 # =============================================================================
 
 def test_emit_order_filled_idempotent():
