@@ -171,6 +171,13 @@ class ManagedOrder:
     # ---- 追溯：触发订单的模块来源（quoter / hedger / bootstrap / killswitch / amend） ----
     source: str = "unknown"
 
+    # ---- 诊断：order_filled 首次 emit 的时间戳和代码路径 ----
+    # 用于回答"hedge 订单从 submit 到最终 emit order_filled 的延迟"和
+    # "最终从哪条代码路径 emit"两个问题。幂等写入：第一次 emit 时设置，
+    # 后续重复 emit（理论上不应该发生）会被 _emit_order_filled 跳过。
+    first_filled_emit_ts: Optional[float] = None
+    filled_emit_source: Optional[str] = None
+
     # ---- 原子改单锁标记 ----
     locked: bool = False
 
@@ -633,6 +640,43 @@ class OrderManager:
             ack_ts = time.time()
             managed.latency.exchange_ack_ts = ack_ts
             managed.ack_at = ack_ts
+
+            # ── CCXT 响应归一化诊断（仅 hedger 源，避免 quoter maker 单刷屏）──
+            # 目标：区分 "status=closed 立即 FILLED" / "status=open 但 info 有 avgPx
+            # (CCXT 未归一化成交)" / "info 也没 avgPx (真的还没成交)" 三种情况。
+            # 仅 DEBUG 级别：实盘默认 INFO 不会输出；--log-level DEBUG 时才落日志。
+            if source == "hedger":
+                try:
+                    raw = gw_order.raw or {}
+                    info_field = raw.get("info") or {}
+                    resp = info_field.get("response") or {}
+                    resp_data = resp.get("data") or {}
+                    statuses = resp_data.get("statuses") or []
+                    avg_px_in_info = None
+                    if statuses and isinstance(statuses[0], dict):
+                        filled_info = statuses[0].get("filled")
+                        if isinstance(filled_info, dict):
+                            avg_px_in_info = filled_info.get("avgPx")
+                    fee_in_resp = (
+                        raw.get("fee") is not None
+                        or bool(raw.get("fees"))
+                        or info_field.get("builderFee") is not None
+                    )
+                    self._logger.debug(
+                        f"[{cid}] CCXT响应诊断 "
+                        f"status={raw.get('status')!r} "
+                        f"filled={raw.get('filled')!r} "
+                        f"amount={amount} "
+                        f"avgPx_in_info={avg_px_in_info!r} "
+                        f"fee_in_resp={fee_in_resp}"
+                    )
+                except Exception as diag_err:
+                    # 诊断日志永不阻塞主流程
+                    self._logger.debug(
+                        f"[{cid}] CCXT响应诊断 抽取失败: "
+                        f"{type(diag_err).__name__}: {diag_err}"
+                    )
+
             managed.sync_from_exchange(gw_order)
 
             # 建立 ExchangeOrderId -> ClientOrderId 映射
@@ -664,6 +708,41 @@ class OrderManager:
             )
 
             self._emit("order_submitted", managed)
+
+            # ── submit-immediate 终态事件补发 ────────────────────────
+            # 当 CCXT 同步响应把订单直接置为终态（激进限价被撮合吃掉 →
+            # FILLED；被交易所拒 → REJECTED；边缘 canceled 状态），老实现
+            # 只 emit order_submitted，reconcile 的状态过滤又只看
+            # OPEN/PARTIAL/STALE，导致 order_filled / order_cancelled /
+            # order_rejected 永远不触发，下游 inventory / risk 更新全丢。
+            # 复盘：bootstrap 激进下单立即成交 → inventory.positions 没
+            # 更新 → 下一笔 SELL 被 BalanceGuard 判余额不足。
+            #
+            # 发射顺序: submitted → terminal，与正常 OPEN → FILLED 的
+            # 事件链语义一致。order_filled 走 _emit_order_filled 助手，
+            # 和其他四条路径一样给 first_filled_emit_ts / filled_emit_source
+            # 打戳，保证 Hedger 的 [HEDGE-LATENCY] 统计口径统一。
+            if managed.state == OrderState.FILLED:
+                # submit-immediate 路径的 fee 回填（FILLED 分支独有）：
+                # CCXT 对 Hyperliquid 现货 BUY 的同步响应经常缺 fee 字段；
+                # reconcile 不会处理 submit-immediate 终态订单，fee 只能
+                # 在此处补拉 userFills。只在 fee_cost 缺失时触发（CCXT 已
+                # 归一化 fee 的路径不打扰）。拉取失败/userFills 滞后都不
+                # 阻塞事件发射，由下次 reconcile 兜底。
+                if not managed.fee_cost:
+                    try:
+                        self._backfill_fee_from_userfills(managed)
+                    except Exception as be:
+                        self._logger.warning(
+                            f"[{cid}] submit-immediate fee 回填失败: "
+                            f"{type(be).__name__}: {be}  (reconcile 会再试一次)"
+                        )
+                self._emit_order_filled(managed, source="submit_immediate")
+            elif managed.state == OrderState.CANCELLED:
+                self._emit("order_cancelled", managed)
+            elif managed.state == OrderState.REJECTED:
+                self._emit("order_rejected", managed)
+
             return managed
 
         except Exception as e:
@@ -754,7 +833,7 @@ class OrderManager:
                             f"filled={managed.filled} avg={avg} "
                             f"(via=userFills after cancel-not-found)"
                         )
-                        self._emit("order_filled", managed)
+                        self._emit_order_filled(managed, source="cancel_recover_userfills")
                         return True
 
                     managed.transition_to(OrderState.CANCELLED)
@@ -934,6 +1013,25 @@ class OrderManager:
             except Exception as e:
                 self._logger.error(f"回调 '{event_name}' 异常: {e}")
 
+    def _emit_order_filled(self, managed: ManagedOrder, source: str) -> None:
+        """
+        发布 order_filled 事件并记录首次 emit 的时间戳和来源（幂等）。
+
+        source 取值（当前 4 条代码路径，与任务文档一致）:
+            - "cancel_recover_userfills" : cancel_order 撤单时 gateway 返回 OrderNotFound，
+                                            通过 userFills 找到成交记录
+            - "reconcile_pending_recheck": 撤单判 CANCELLED 后 5s 延迟复查（Bug B 修复路径）
+            - "reconcile_local_state"    : reconcile 发现交易所无挂单但本地 filled>=amount
+            - "reconcile_userfills"      : reconcile 发现交易所无挂单 → userFills 匹配成交
+
+        首次调用时写入 first_filled_emit_ts / filled_emit_source；
+        重复调用不覆盖已有值（防守性幂等，正常流程不应重复 emit）。
+        """
+        if managed.first_filled_emit_ts is None:
+            managed.first_filled_emit_ts = time.time()
+            managed.filled_emit_source = source
+        self._emit("order_filled", managed)
+
     # =========================================================================
     # 内部：对账巡检
     # =========================================================================
@@ -993,7 +1091,7 @@ class OrderManager:
                     f"state 修正 {old_state.value} -> FILLED  "
                     f"filled={managed.filled} avg={avg}"
                 )
-                self._emit("order_filled", managed)
+                self._emit_order_filled(managed, source="reconcile_pending_recheck")
 
         # ---- Step 1: STALE 检测 ----
         with self._orders_lock:
@@ -1081,7 +1179,7 @@ class OrderManager:
                         f"filled={managed.filled}  "
                         f"源={managed.source}  age={managed.age:.1f}s  via=local_state"
                     )
-                    self._emit("order_filled", managed)
+                    self._emit_order_filled(managed, source="reconcile_local_state")
                     continue
 
                 # 尝试从成交历史推断真实结局
@@ -1093,7 +1191,7 @@ class OrderManager:
                         f"filled={managed.filled}  "
                         f"源={managed.source}  age={managed.age:.1f}s  via=trade_history"
                     )
-                    self._emit("order_filled", managed)
+                    self._emit_order_filled(managed, source="reconcile_userfills")
                 elif final_state == OrderState.CANCELLED:
                     managed.transition_to(OrderState.CANCELLED)
                     self._emit("order_cancelled", managed)
@@ -1175,14 +1273,12 @@ class OrderManager:
         #      - 只有 builderFee 没有主 fee → 整笔按 USDC 记入
         #   4. userFills 无 fee 字段（边角 case）→ 保持 None，不 raise
 
+        # ── 过滤 + 累加 fill 级字段（供 state 推断使用）─────────────────
+        # fee 聚合从这里抽到 _aggregate_fee_from_fills，submit-immediate 共用
+        matching_fills: List[Dict] = []
         total_filled = 0.0
         last_price = 0.0
         last_time = 0
-
-        # fee 聚合中间变量
-        main_fee_sum: float = 0.0                # 主 fee 累加（原币种单位）
-        main_fee_ccy_votes: Dict[str, int] = {}  # 主 fee 币种计数（投票选多数）
-        builder_fee_usdc_sum: float = 0.0        # builderFee 累加（USDC）
 
         for f in fills or []:
             if str(f.get("oid", "")) != str(eid):
@@ -1191,7 +1287,10 @@ class OrderManager:
                 sz = float(f.get("sz", 0) or 0)
                 px = float(f.get("px", 0) or 0)
             except (TypeError, ValueError):
+                # sz/px 解析失败：该 fill 整体丢弃，不计入 total 也不计入 fee 聚合，
+                # 保持与旧版完全一致的行为（旧版是 continue 跳过整条 fill）
                 continue
+            matching_fills.append(f)
             total_filled += sz
             if px > 0:
                 last_price = px
@@ -1202,7 +1301,65 @@ class OrderManager:
             except (TypeError, ValueError):
                 pass
 
-            # ── fee 提取（防御：任何字段异常跳过本条 fee，不中断 fill 累加）──
+        if total_filled <= 0:
+            return None
+
+        # ── fee 聚合（共享 helper，submit-immediate 路径也走这一套）────
+        final_fee_cost, final_fee_ccy = self._aggregate_fee_from_fills(
+            matching_fills, managed, avg_px_hint=last_price
+        )
+
+        # ── 回填 ManagedOrder ────────────────────────────────────────────
+        managed.filled = total_filled
+        managed.remaining = max(managed.amount - total_filled, 0.0)
+        if last_price > 0:
+            managed.avg_price = last_price
+        # 只在取到有效 fee 时才写，避免把已有值（比如 from_ccxt 路径先写入的）覆盖为 None
+        if final_fee_cost is not None and final_fee_ccy:
+            managed.fee_cost = final_fee_cost
+            managed.fee_currency = final_fee_ccy
+        return OrderState.FILLED
+
+    def _aggregate_fee_from_fills(
+        self,
+        fills: List[Dict],
+        managed: "ManagedOrder",
+        avg_px_hint: float,
+    ) -> Tuple[Optional[float], Optional[str]]:
+        """
+        从已按 oid 过滤的 userFills 列表聚合订单级 fee。
+
+        复用路径:
+          a. _infer_final_state_via_trades（reconcile 循环的成交推断）
+          b. _backfill_fee_from_userfills（submit-immediate 路径，CCXT 同步
+             响应不带 fee 时的补拉兜底）
+
+        聚合规则（同 Gateway.Order.from_ccxt 语义）：
+          1. Hyperliquid 现货 BUY 的 fee 以 base coin（USOL 等）扣，
+             现货 SELL / 永续以 USDC 扣；同订单多笔 fill 的 feeToken 通常
+             一致，不一致时按"出现次数最多的币种"投票选订单级币种。
+          2. builderFee 永远是 USDC：
+             - 主 fee 是 USDC → 直接相加
+             - 主 fee 是 base coin → 按 avg_px_hint 折算成 base coin 再加
+             - 只有 builderFee 没有主 fee → 整笔按 USDC 记入
+          3. 任一条 fill 的 fee 字段解析异常跳过本条 fee，不影响其他 fill。
+          4. 无可聚合 fee 时返回 (None, None)，调用方自行决定是否覆写。
+
+        Args:
+            fills:        已按 oid 过滤的 fill 列表（空列表返回 (None, None)）
+            managed:      ManagedOrder，仅用于日志中的 cid 显示
+            avg_px_hint:  builderFee 从 USDC 折算成 base coin 用的价格；
+                          <=0 时若主 fee 是 base coin 则丢弃 builderFee（debug 日志）
+
+        Returns:
+            (fee_cost, fee_currency) — 聚合失败时 (None, None)
+        """
+        main_fee_sum: float = 0.0
+        main_fee_ccy_votes: Dict[str, int] = {}
+        builder_fee_usdc_sum: float = 0.0
+
+        for f in fills or []:
+            # 主 fee（fee + feeToken）
             try:
                 fee_val = f.get("fee")
                 fee_ccy = f.get("feeToken")
@@ -1210,11 +1367,12 @@ class OrderManager:
                     fee_num = float(fee_val)
                     if fee_num > 0:
                         main_fee_sum += fee_num
-                        main_fee_ccy_votes[fee_ccy] = main_fee_ccy_votes.get(fee_ccy, 0) + 1
+                        main_fee_ccy_votes[fee_ccy] = (
+                            main_fee_ccy_votes.get(fee_ccy, 0) + 1
+                        )
             except (TypeError, ValueError):
                 pass
-
-            # ── builderFee 累加（USDC）────────────────────────────────────
+            # builderFee（USDC）
             try:
                 bfee = f.get("builderFee")
                 if bfee is not None:
@@ -1224,48 +1382,108 @@ class OrderManager:
             except (TypeError, ValueError):
                 pass
 
-        if total_filled <= 0:
-            return None
-
-        # ── 订单级 fee 聚合 ──────────────────────────────────────────────────
-        # 选主 fee 币种：投票多数（对单订单多笔 fill 时的防御，通常只有 1 种）
+        # 选主 fee 币种：投票多数（单订单多笔 fill 通常只有 1 种）
         main_fee_ccy: Optional[str] = None
         if main_fee_ccy_votes:
             main_fee_ccy = max(main_fee_ccy_votes.items(), key=lambda x: x[1])[0]
 
-        # 把 builderFee 合并到主 fee（参考 Gateway.Order.from_ccxt 逻辑）
+        # 合并 builderFee 到主 fee
         final_fee_cost: float = main_fee_sum
         final_fee_ccy: Optional[str] = main_fee_ccy
 
         if builder_fee_usdc_sum > 0:
             if main_fee_ccy == "USDC":
-                # 直接相加
                 final_fee_cost += builder_fee_usdc_sum
             elif main_fee_ccy is None:
-                # 只有 builderFee 没有主 fee（理论上罕见）→ 按 USDC 记入
                 final_fee_cost = builder_fee_usdc_sum
                 final_fee_ccy = "USDC"
-            elif last_price > 0:
-                # 主 fee 是 base coin，builderFee 按成交均价折算成 base coin
-                final_fee_cost += builder_fee_usdc_sum / last_price
+            elif avg_px_hint > 0:
+                final_fee_cost += builder_fee_usdc_sum / avg_px_hint
             else:
-                # 主 fee 是 base coin 但 last_price=0（异常）→ 丢弃 builderFee
-                # 避免用 0 价污染。debug 日志提示。
                 self._logger.debug(
-                    f"[{managed.client_order_id}] userFills builderFee 无法折算 "
-                    f"(last_price=0)，丢弃: builderFee={builder_fee_usdc_sum}"
+                    f"[{managed.client_order_id}] builderFee 无法折算到 base coin "
+                    f"(avg_px_hint=0)，丢弃: builderFee={builder_fee_usdc_sum}"
                 )
 
-        # ── 回填 ManagedOrder ────────────────────────────────────────────
-        managed.filled = total_filled
-        managed.remaining = max(managed.amount - total_filled, 0.0)
-        if last_price > 0:
-            managed.avg_price = last_price
-        # 只在取到有效 fee 时才写，避免把已有值（比如 from_ccxt 路径先写入的）覆盖为 None
         if final_fee_cost > 0 and final_fee_ccy:
-            managed.fee_cost = final_fee_cost
-            managed.fee_currency = final_fee_ccy
-        return OrderState.FILLED
+            return final_fee_cost, final_fee_ccy
+        return None, None
+
+    def _backfill_fee_from_userfills(self, managed: "ManagedOrder") -> None:
+        """
+        submit-immediate 路径专用：CCXT 同步响应不含 fee 时，从 userFills 补拉。
+
+        目的：Hyperliquid 现货 BUY（taker）的 fee 扣 base coin（USOL/UBTC…），
+        CCXT 对 create_order 的同步响应通常不带 fee 字段，fee 只在 userFills
+        能拿到。老实现依赖 reconcile 循环走 _infer_final_state_via_trades 回填，
+        但 submit-immediate 终态订单会被 reconcile 跳过（非 OPEN/PARTIAL/STALE），
+        fee 永远回填不上。
+        复盘：live_20260424_172016 bootstrap 两笔 fill 后 Fees=-0.0000，
+        下一笔 quoter SELL 因本地余额漏扣 fee 认为够而被交易所拒。
+
+        行为:
+          - 只写 fee_cost / fee_currency；不改 filled / remaining / avg_fill_price
+            （这些已由 sync_from_exchange 用 CCXT 响应正确写入）
+          - userFills 滞后（oid 还未落盘，1-2s）→ 留空，不抛异常，等下次
+            reconcile 的 _infer_final_state_via_trades 再补
+          - 非 Hyperliquid 网关不实现 fetch_user_fills → AttributeError 静默跳过
+        """
+        eid = managed.exchange_order_id
+        if not eid:
+            return
+
+        start_ms: Optional[int] = None
+        if managed.created_at:
+            # 向前预留 1 秒容差，防止时钟抖动
+            start_ms = int(managed.created_at * 1000) - 1000
+
+        try:
+            all_fills = self._gateway.fetch_user_fills(start_time_ms=start_ms)
+        except AttributeError:
+            # 非 Hyperliquid gateway（或 mock）不实现此接口 → 静默跳过
+            return
+
+        matching = [
+            f for f in all_fills or []
+            if str(f.get("oid", "")) == str(eid)
+        ]
+
+        if not matching:
+            # userFills 滞后 → 留空，由 reconcile 下轮兜底
+            self._logger.debug(
+                f"[{managed.client_order_id}] submit-immediate fee 回填: "
+                f"userFills 无匹配 oid={eid}（可能滞后 1-2s），"
+                f"留空待 reconcile 补拉"
+            )
+            return
+
+        # avg_px_hint 优先用 ManagedOrder.avg_fill_price（sync_from_exchange
+        # 已从 CCXT 'average' 或 Hyperliquid 原生 avgPx 回填）；缺失时从第
+        # 一条匹配 fill 的 px 取，最后兜底 0（_aggregate_fee_from_fills 里
+        # 遇到 0 会对 base-coin fee 的 builderFee 折算降级丢弃）
+        avg_px: float = float(managed.avg_fill_price or 0.0)
+        if avg_px <= 0:
+            for f in matching:
+                try:
+                    px = float(f.get("px", 0) or 0)
+                    if px > 0:
+                        avg_px = px
+                        break
+                except (TypeError, ValueError):
+                    pass
+
+        fee_cost, fee_ccy = self._aggregate_fee_from_fills(
+            matching, managed, avg_px_hint=avg_px
+        )
+
+        if fee_cost is not None and fee_ccy:
+            managed.fee_cost = fee_cost
+            managed.fee_currency = fee_ccy
+            self._logger.info(
+                f"[{managed.client_order_id}] submit-immediate fee 回填: "
+                f"fee_cost={fee_cost:.8f} {fee_ccy} "
+                f"(from {len(matching)} userFill(s))"
+            )
 
     # =========================================================================
     # 内部：冷启动恢复

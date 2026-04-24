@@ -264,9 +264,13 @@ class InventoryTracker:
                 self.balances[account] = {}
             self.balances[account][currency] = cur - amount
 
-    def unrealized_pnl(self, mid_prices: Dict[str, float]) -> float:
+    def unrealized_pnl_by_leg(
+        self, mid_prices: Dict[str, float]
+    ) -> Dict[str, float]:
         """
-        按当前 mid 估算未实现 PnL。
+        按 symbol 分腿返回未实现 PnL，供"按腿拆分"的 PnL 日志/报表使用。
+
+        缺 mid 或缺 avg_entry 的腿记 0.0（不参与总 PnL，也不歪曲分解显示）。
 
         TODO: 替换为标记价格（mark price），考虑资金费率。
         """
@@ -274,13 +278,102 @@ class InventoryTracker:
         with self._lock:
             pos_snapshot = dict(self.positions)
             entry_snapshot = dict(self.avg_entry)
-        total = 0.0
+        result: Dict[str, float] = {}
         for sym, delta in pos_snapshot.items():
             mid = mid_prices.get(sym)
             entry = entry_snapshot.get(sym)
-            if mid and entry:
-                total += delta * (mid - entry)
-        return total
+            if mid and entry and mid > 0 and entry > 0:
+                result[sym] = delta * (mid - entry)
+            else:
+                result[sym] = 0.0
+        return result
+
+    def unrealized_pnl(self, mid_prices: Dict[str, float]) -> float:
+        """
+        按当前 mid 估算未实现 PnL（所有腿之和）。
+
+        为保持兼容性与调用成本最低，内部复用 unrealized_pnl_by_leg 实现。
+        TODO: 替换为标记价格（mark price），考虑资金费率。
+        """
+        return sum(self.unrealized_pnl_by_leg(mid_prices).values())
+
+    def get_entry_basis(
+        self, base_asset: str, asset_map: Dict[str, str]
+    ) -> Optional[float]:
+        """
+        取 spot 腿入场均价 - perp 腿入场均价，单位 USDC / base。
+
+        用于拆解"建仓时付出的 basis 成本"——当 spot 比 perp 贵，建仓时就是为
+        basis 掏钱，这部分随时间会通过 funding / mid 回归被冲销。
+
+        Args:
+            base_asset: 标的资产（如 "SOL"）
+            asset_map:  symbol → base_asset 映射；用 ":" 判断现货/永续
+
+        Returns:
+            basis (USDC/base)；若任一腿无持仓或 avg_entry 缺失则 None。
+        """
+        spot_symbol, perp_symbol = self._find_leg_pair(base_asset, asset_map)
+        if spot_symbol is None or perp_symbol is None:
+            return None
+        with self._lock:
+            spot_pos = self.positions.get(spot_symbol, 0.0)
+            perp_pos = self.positions.get(perp_symbol, 0.0)
+            spot_entry = self.avg_entry.get(spot_symbol, 0.0)
+            perp_entry = self.avg_entry.get(perp_symbol, 0.0)
+        if abs(spot_pos) < 1e-10 or abs(perp_pos) < 1e-10:
+            return None
+        if spot_entry <= 0 or perp_entry <= 0:
+            return None
+        return spot_entry - perp_entry
+
+    def get_current_basis(
+        self,
+        base_asset: str,
+        asset_map: Dict[str, str],
+        mid_prices: Dict[str, float],
+    ) -> Optional[float]:
+        """
+        取 spot 腿当前 mid - perp 腿当前 mid，单位 USDC / base。
+
+        用来观察"建仓以来 basis 是否回归":
+            当前 basis ≈ 建仓 basis → 还未发生回归，未实现 PnL 在两腿之间对冲掉
+            当前 basis < 建仓 basis → basis 收敛，组合累计正向 uPnL
+        """
+        spot_symbol, perp_symbol = self._find_leg_pair(base_asset, asset_map)
+        if spot_symbol is None or perp_symbol is None:
+            return None
+        spot_mid = mid_prices.get(spot_symbol)
+        perp_mid = mid_prices.get(perp_symbol)
+        if not spot_mid or not perp_mid or spot_mid <= 0 or perp_mid <= 0:
+            return None
+        # 要求持仓都非零（basis 只对当前敞口有意义）
+        with self._lock:
+            if (
+                abs(self.positions.get(spot_symbol, 0.0)) < 1e-10
+                or abs(self.positions.get(perp_symbol, 0.0)) < 1e-10
+            ):
+                return None
+        return spot_mid - perp_mid
+
+    def _find_leg_pair(
+        self, base_asset: str, asset_map: Dict[str, str]
+    ) -> "tuple[Optional[str], Optional[str]]":
+        """
+        从 asset_map 中找出 base_asset 对应的 (spot_symbol, perp_symbol)。
+        永续以 symbol 含 ":" 判定（CCXT 格式 "BASE/QUOTE:SETTLE"）。
+        任一缺失返回 None。不加锁：asset_map 是调用方提供的只读映射。
+        """
+        spot_symbol: Optional[str] = None
+        perp_symbol: Optional[str] = None
+        for sym, base in asset_map.items():
+            if base != base_asset:
+                continue
+            if ":" in sym:
+                perp_symbol = sym
+            else:
+                spot_symbol = sym
+        return spot_symbol, perp_symbol
 
     def summary_lines(self, mid_prices: Dict[str, float]) -> List[str]:
         """生成持仓摘要行，供 shutdown 时打印"""

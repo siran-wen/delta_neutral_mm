@@ -25,8 +25,9 @@
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from execution.order_manager import ManagedOrder, OrderState, RequestPriority
 from gateways import OrderSide, OrderType
@@ -121,10 +122,17 @@ class Hedger:
         # 累积的"被捞回"次数（从 failed 纠正为 hedged，只增不减）
         self._late_recovered: int = 0
 
+        # ── Latency 诊断记录 ─────────────────────────────────────────────
+        # 按 cid 索引，保留最近 _latency_records_cap 笔 hedge 的延迟分布数据，
+        # 关停时 latency_report() 汇总输出。
+        # 字段：ccxt_rtt / emit_delay / source / final_state / registered_ts / ack_ts
+        self._latency_records: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._latency_records_cap: int = 200
+
         # 线程安全锁：OM 回调在 reconcile/main 线程触发、hedger 主路径在 on_market_fill
         # 调用线程运行，跨线程读写 _late_fill_candidates / _total_failed /
-        # _failure_reasons / _total_hedged / _late_recovered / _pending_hedge_debt
-        # 需互斥保护。
+        # _failure_reasons / _total_hedged / _late_recovered / _pending_hedge_debt /
+        # _latency_records 需互斥保护。
         self._stats_lock: threading.Lock = threading.Lock()
 
         # 订阅 OM order_filled 事件。OM 的接口是 om.on(event_name, callback)。
@@ -331,18 +339,20 @@ class Hedger:
         # ── 判断对冲结果 ─────────────────────────────────────────────────
         filled = hedge_order.filled or 0.0
 
+        # submit 返回后的链路诊断数据（两分支共享）。
+        # ccxt_rtt = gateway.create_order 的 HTTP RTT（不含风控/精度处理）。
+        ccxt_rtt: Optional[float] = (
+            hedge_order.latency.order_rtt if hedge_order.latency else None
+        )
+
         if hedge_order.state == OrderState.FILLED and filled > 0:
-            # 成功：更新对冲腿持仓和风控（fee 由 OM.sync_from_exchange 透传）
-            self._inventory.on_fill(
-                hedge_symbol,
-                hedge_side,
-                filled,
-                hedge_price,
-                fee_cost=hedge_order.fee_cost or 0.0,
-                fee_currency=hedge_order.fee_currency,
-            )
-            signed_delta = filled if hedge_side == "buy" else -filled
-            self._rm.update_position(hedge_symbol, signed_delta)
+            # 成功：inventory / RiskManager 的更新不再在此处做。
+            # OM 的 submit-immediate 修复（2026-04-24）之后，submit 返回即终态
+            # 的 FILLED 会同步 emit "order_filled"，main.py 注册的 on_fill
+            # 回调统一走 inventory.on_fill + rm.update_position，这里再重复调
+            # 就是双计。_handle_late_fill 走 late-fill 捞回路径时也只改
+            # stats，不碰 inventory，逻辑一致。
+            # 这里只保留 hedger 自己的账本：对冲债务 + 成功计数。
 
             # 清除债务（激进限价单假设全量成交）+ 累计成功次数
             with self._stats_lock:
@@ -358,6 +368,17 @@ class Hedger:
                 f"[HEDGE] #{seq} 成交确认 cid={hedge_order.client_order_id}: "
                 f"filled={filled:.6f} @ {real_avg:.4f}  "
                 f"延迟={hedge_latency:.3f}s"
+            )
+            # submit 返回诊断（成功分支：state=FILLED，submit 时即归一化为 FILLED）
+            self._log_submit_return_diag(seq, hedge_order, hedge_amount, filled, ccxt_rtt)
+            # Latency 记录：FILLED at submit ack → emit_delay=0 / source=submit_immediate
+            self._record_latency(
+                cid=hedge_order.client_order_id,
+                ccxt_rtt=ccxt_rtt,
+                emit_delay=0.0,
+                source="submit_immediate",
+                final_state="FILLED",
+                ack_ts=(hedge_order.latency.exchange_ack_ts if hedge_order.latency else 0.0),
             )
         else:
             # 未立即成交：submit 返回但还没成交（OPEN / PARTIALLY_FILLED / REJECTED）
@@ -388,6 +409,18 @@ class Hedger:
                 f"[HEDGE] #{seq} 未成交 cid={hedge_order.client_order_id}: "
                 f"{reason_tag}  filled={filled:.6f}  "
                 f"→ 保留 pending={net_delta:+.6f}，等待 reconcile / 下次触发"
+            )
+            # submit 返回诊断（失败分支：叠加在现有 warning 之后）
+            self._log_submit_return_diag(seq, hedge_order, hedge_amount, filled, ccxt_rtt)
+            # Latency 记录：待 _handle_late_fill 捞回时填 emit_delay/source；
+            # final_state 先记 submit 返回时的 state.value，捞回后会被修正为 FILLED。
+            self._record_latency(
+                cid=hedge_order.client_order_id,
+                ccxt_rtt=ccxt_rtt,
+                emit_delay=None,
+                source=None,
+                final_state=hedge_order.state.value,
+                ack_ts=(hedge_order.latency.exchange_ack_ts if hedge_order.latency else 0.0),
             )
 
     # =========================================================================
@@ -491,6 +524,19 @@ class Hedger:
         if not cid:
             return
 
+        # ── emit_delay 计算（锁外，只读 ManagedOrder 的原子字段）────────
+        # emit_delay = first_filled_emit_ts - exchange_ack_ts
+        # 语义：CCXT 接受 submit 的回执时刻到 order_filled 事件首次 fire 的延迟。
+        # 绝大多数 late-fill 应体现为 3~6s（reconcile 周期 + 5s pending_recheck）。
+        emit_ts = getattr(order, "first_filled_emit_ts", None)
+        ack_ts = (
+            order.latency.exchange_ack_ts if getattr(order, "latency", None) else 0.0
+        ) or 0.0
+        emit_delay: Optional[float] = None
+        if emit_ts and ack_ts and emit_ts >= ack_ts:
+            emit_delay = emit_ts - ack_ts
+        emit_source = getattr(order, "filled_emit_source", None)
+
         with self._stats_lock:
             if cid not in self._late_fill_candidates:
                 # 不在候选表：
@@ -519,6 +565,15 @@ class Hedger:
             self._total_hedged += 1
             self._late_recovered += 1
 
+            # ── 更新 latency 记录（填充 late-fill 对应的 emit_delay / source）──
+            rec = self._latency_records.get(cid)
+            if rec is not None:
+                rec["final_state"] = "FILLED"
+                if emit_source:
+                    rec["source"] = emit_source
+                if emit_delay is not None:
+                    rec["emit_delay"] = emit_delay
+
         # ── 日志打印在锁外，避免持锁阻塞 logging I/O ──────────────────
         real_avg = (
             getattr(order, "avg_fill_price", None)
@@ -527,10 +582,13 @@ class Hedger:
         )
         filled = getattr(order, "filled", 0.0) or 0.0
         delay = time.time() - registered_ts
+        emit_delay_str = f"{emit_delay:.3f}s" if emit_delay is not None else "N/A"
+        emit_source_str = emit_source or "unknown"
         self._logger.info(
             f"[HEDGE] late-fill 捞回 cid={cid}: "
             f"base={base} filled={filled:.6f} @ {real_avg:.4f}  "
-            f"注册延迟={delay:.1f}s  "
+            f"注册延迟={delay:.1f}s  emit_delay={emit_delay_str}  "
+            f"emit_source={emit_source_str}  "
             f"(stats: recovered+1 failed-1 hedged+1)"
         )
 
@@ -564,3 +622,143 @@ class Hedger:
             asset_map[pair.market_symbol] = pair.base
             asset_map[pair.hedge_symbol] = pair.base
         return asset_map
+
+    # =========================================================================
+    # Latency 诊断
+    # =========================================================================
+
+    def _log_submit_return_diag(
+        self,
+        seq: int,
+        hedge_order: ManagedOrder,
+        amount: float,
+        filled: float,
+        ccxt_rtt: Optional[float],
+    ) -> None:
+        """
+        submit_order 返回后的链路诊断日志（两分支共享）。
+
+        字段语义:
+            state           - OrderManager 根据 CCXT status 归一化后的本地状态
+            ccxt_rtt        - gateway.create_order 的 HTTP RTT
+                              (= latency.exchange_ack_ts - latency.api_send_ts)
+            filled / amount - ManagedOrder.filled / 本次 hedge 目标数量
+            avg_fill_price  - ManagedOrder.avg_fill_price（None 表示 CCXT 响应
+                              里没有 average 字段且 userFills 兜底未匹配）
+        """
+        rtt_str = f"{ccxt_rtt:.3f}s" if ccxt_rtt is not None else "N/A"
+        avg = getattr(hedge_order, "avg_fill_price", None)
+        avg_str = f"{avg:.4f}" if avg else "None"
+        self._logger.info(
+            f"[HEDGE] #{seq} submit 返回诊断: "
+            f"state={hedge_order.state.value} "
+            f"ccxt_rtt={rtt_str} "
+            f"filled={filled:.6f} amount={amount:.6f} "
+            f"avg_fill_price={avg_str}"
+        )
+
+    def _record_latency(
+        self,
+        cid: str,
+        ccxt_rtt: Optional[float],
+        emit_delay: Optional[float],
+        source: Optional[str],
+        final_state: str,
+        ack_ts: float,
+    ) -> None:
+        """
+        追加一笔 hedge 的延迟诊断记录（OrderedDict + cap 淘汰最旧）。
+
+        线程安全：内部持 stats_lock，调用方不应已持锁。
+        """
+        with self._stats_lock:
+            if (
+                cid not in self._latency_records
+                and len(self._latency_records) >= self._latency_records_cap
+            ):
+                # OrderedDict FIFO 淘汰：popitem(last=False) 弹出最早插入的
+                self._latency_records.popitem(last=False)
+            self._latency_records[cid] = {
+                "cid": cid,
+                "ccxt_rtt": ccxt_rtt,
+                "emit_delay": emit_delay,
+                "source": source,
+                "final_state": final_state,
+                "registered_ts": time.time(),
+                "ack_ts": ack_ts,
+            }
+
+    @staticmethod
+    def _percentiles(xs: List[float]) -> Tuple[float, float, float]:
+        """
+        返回 (p50, p95, max)。样本为空时返回 (0, 0, 0)。
+        最近秩法（nearest-rank），对诊断场景精度足够。
+        """
+        if not xs:
+            return (0.0, 0.0, 0.0)
+        s = sorted(xs)
+        n = len(s)
+        p50 = s[max(0, int((n - 1) * 0.5))]
+        p95 = s[max(0, int((n - 1) * 0.95))]
+        return (p50, p95, s[-1])
+
+    def latency_report(self, logger: Optional[logging.Logger] = None) -> None:
+        """
+        关停前打印 [HEDGE-LATENCY] 分布报告。
+
+        输出四块：
+            1. CCXT_RTT    — gateway.create_order 的 HTTP 来回延迟
+            2. EMIT_DELAY  — submit ack 到 order_filled 事件首次 fire 的延迟
+                             （FILLED 分支 submit_immediate=0；late-fill 为 3~6s 典型）
+            3. EMIT_SOURCE — order_filled 的代码路径分布（按 filled_emit_source 计数）
+            4. FINAL_STATE — hedge 订单最终状态分布
+        """
+        log = logger or self._logger
+
+        with self._stats_lock:
+            records = list(self._latency_records.values())
+
+        n = len(records)
+        if n == 0:
+            log.info("[HEDGE-LATENCY] N=0 (无 hedge 订单记录)")
+            return
+
+        ccxt_rtts = [r["ccxt_rtt"] for r in records if r["ccxt_rtt"] is not None]
+        emit_delays = [r["emit_delay"] for r in records if r["emit_delay"] is not None]
+
+        rtt_p50, rtt_p95, rtt_max = self._percentiles(ccxt_rtts)
+        emd_p50, emd_p95, emd_max = self._percentiles(emit_delays)
+
+        # EMIT_SOURCE: None 归为 "未捞回/未emit"（超时后从未 fire order_filled）
+        source_counts: Dict[str, int] = {}
+        for r in records:
+            src = r.get("source") or "未捞回(emit未触发)"
+            source_counts[src] = source_counts.get(src, 0) + 1
+
+        # FINAL_STATE: late-fill 捞回会把 final_state 改为 FILLED；其他保留 submit 时状态
+        state_counts: Dict[str, int] = {}
+        for r in records:
+            st = r.get("final_state") or "unknown"
+            state_counts[st] = state_counts.get(st, 0) + 1
+
+        log.info(f"[HEDGE-LATENCY] N={n}")
+        log.info(
+            f"  CCXT_RTT        p50={rtt_p50:.3f}s p95={rtt_p95:.3f}s "
+            f"max={rtt_max:.3f}s (samples={len(ccxt_rtts)})"
+        )
+        log.info(
+            f"  EMIT_DELAY      p50={emd_p50:.3f}s p95={emd_p95:.3f}s "
+            f"max={emd_max:.3f}s (samples={len(emit_delays)})"
+        )
+        src_str = "  ".join(
+            f"{src}={cnt}" for src, cnt in sorted(
+                source_counts.items(), key=lambda kv: -kv[1]
+            )
+        )
+        log.info(f"  EMIT_SOURCE     {src_str}")
+        state_str = "  ".join(
+            f"{st}={cnt}" for st, cnt in sorted(
+                state_counts.items(), key=lambda kv: -kv[1]
+            )
+        )
+        log.info(f"  FINAL_STATE     {state_str}")

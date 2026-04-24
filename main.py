@@ -707,10 +707,22 @@ def main() -> None:
         s: {"bid": None, "ask": None} for s in symbols
     }
 
+    # ── 行情轮询范围 ─────────────────────────────────────────────────────
+    # quotable_symbols : 只报价/挂单的 market 腿（_place_symbol_quotes 作用域）
+    # poll_symbols     : 拉 ticker 的完整列表 = market 腿 + hedge 腿
+    # 过去只轮询 market 腿导致 last_mids 里缺永续腿 mid，PnL 分解时永续腿
+    # uPnL 恒为 0，严重误导归因——这里扩展轮询但不扩展报价。
+    quotable_symbols: set = set(symbols)
+    poll_symbols: List[str] = list(symbols)
+    if hedger_cfg.get("enabled") and hedger_cfg.get("trading_pairs"):
+        for _pair in hedger_cfg["trading_pairs"]:
+            if _pair.hedge_symbol not in poll_symbols:
+                poll_symbols.append(_pair.hedge_symbol)
+
     # 上次触发报价时的 mid（用于重报阈值判断）
     last_quoted_mid: Dict[str, float] = {}
 
-    # 最新 mid（供最终摘要使用）
+    # 最新 mid（供最终摘要使用；含 hedge 腿）
     last_mids: Dict[str, float] = {}
 
     # 成交后需补单的品种集合（由回调线程写，主循环读）
@@ -749,6 +761,12 @@ def main() -> None:
     pnl_log_interval = 60.0               # P&L 日志间隔（秒）
     last_pnl_log = session_start
     counters = {"fills": 0, "volume_usdc": 0.0}  # 成交计数器
+
+    # 每 N 次 PnL 日志做一次交易所快照交叉校验（N=5 即 5 分钟一次）。
+    # 目的：若本地 realized+unrealized 与交易所快照 (余额+持仓估值) 的差异持续
+    # 放大，说明 funding / fee 口径 / mark-vs-mid / 估值别名等出现漂移。
+    pnl_log_count = 0
+    exchange_reconcile_every = 5
 
     # =========================================================================
     # 3. 内部操作函数
@@ -1022,7 +1040,10 @@ def main() -> None:
           4. 打印行情摘要
           5. 精确等待剩余间隔（或被成交事件提前唤醒）
         """
-        logger.info(f"行情轮询启动: {symbols}  interval={poll_interval}s")
+        logger.info(
+            f"行情轮询启动: {poll_symbols}  "
+            f"(报价 {sorted(quotable_symbols)})  interval={poll_interval}s"
+        )
 
         while not shutdown_event.is_set():
             # 断连时等待重连（每 1s 检查一次 shutdown_event）
@@ -1031,11 +1052,11 @@ def main() -> None:
 
             loop_start = time.time()
 
-            for symbol in symbols:
+            for symbol in poll_symbols:
                 if shutdown_event.is_set() or not is_connected.is_set():
                     break
 
-                # ── 拉取行情 ────────────────────────────────────────────────
+                # ── 拉取行情（market + hedge 两腿都拉，保证 PnL 分解有 mid）─
                 try:
                     ticker = gateway.fetch_ticker(symbol)
                     mid = _compute_mid(ticker)
@@ -1045,6 +1066,10 @@ def main() -> None:
                     last_mids[symbol] = mid
                 except Exception as e:
                     logger.warning(f"行情获取失败 [{symbol}]: {e}")
+                    continue
+
+                # Hedge 腿（永续）只被动跟踪 mid，不走 quoter/报价逻辑
+                if symbol not in quotable_symbols:
                     continue
 
                 # ── 判断是否需要重新报价 ─────────────────────────────────────
@@ -1082,7 +1107,7 @@ def main() -> None:
                 logger.info(f"[行情] {summary}")
 
             # ── 定期 P&L 日志 ────────────────────────────────────────────
-            nonlocal last_pnl_log
+            nonlocal last_pnl_log, pnl_log_count
             now = time.time()
             if last_mids and now - last_pnl_log >= pnl_log_interval:
                 net_realized = inventory.realized_pnl    # 已扣 fee
@@ -1109,53 +1134,110 @@ def main() -> None:
                     f"运行={elapsed_h:.2f}h"
                 )
 
-                # 按 symbol 打印每腿明细，遍历 inventory.positions（含对冲腿）
+                # ── 按 pair 聚合分解（现货腿 / 永续腿 / basis 成本 / 净敞口）──
+                # 行情轮询已扩展到 hedge 腿，last_mids 现在同时包含两腿 mid，
+                # 永续腿 uPnL 不再恒为 0。basis 成本拆出来后，可以直观看到
+                # "建仓时 basis 成本"与"当前 basis 回归"的差，观察对冲收敛情况。
+                by_leg_upnl = inventory.unrealized_pnl_by_leg(last_mids)
+                covered_symbols: set = set()
+                if hedger is not None and hedger_cfg["trading_pairs"]:
+                    for pair in hedger_cfg["trading_pairs"]:
+                        spot_sym = pair.market_symbol
+                        perp_sym = pair.hedge_symbol
+                        spot_pos = inventory.get_position(spot_sym)
+                        perp_pos = inventory.get_position(perp_sym)
+                        # 两腿都无持仓 → 跳过
+                        if abs(spot_pos) < 1e-10 and abs(perp_pos) < 1e-10:
+                            continue
+
+                        covered_symbols.add(spot_sym)
+                        covered_symbols.add(perp_sym)
+
+                        spot_entry = inventory.avg_entry.get(spot_sym, 0.0)
+                        perp_entry = inventory.avg_entry.get(perp_sym, 0.0)
+                        spot_mid = last_mids.get(spot_sym, 0.0)
+                        perp_mid = last_mids.get(perp_sym, 0.0)
+                        spot_upnl = by_leg_upnl.get(spot_sym, 0.0)
+                        perp_upnl = by_leg_upnl.get(perp_sym, 0.0)
+
+                        asset_map = {spot_sym: pair.base, perp_sym: pair.base}
+                        entry_basis = inventory.get_entry_basis(pair.base, asset_map)
+                        current_basis = inventory.get_current_basis(
+                            pair.base, asset_map, last_mids
+                        )
+                        net_delta = inventory.get_net_delta(pair.base, asset_map)
+
+                        # 名义敞口：|净Delta| × 现货 mid；缺则用永续 mid 兜底
+                        ref_mid = spot_mid if spot_mid > 0 else perp_mid
+                        nominal_exposure = (
+                            abs(net_delta) * ref_mid if ref_mid > 0 else 0.0
+                        )
+
+                        logger.info(f"[PnL] 聚合 {pair.base}:")
+                        logger.info(
+                            f"    现货腿: delta={spot_pos:+.6f}  "
+                            f"entry={spot_entry:.4f}  mid={spot_mid:.4f}  "
+                            f"uPnL={spot_upnl:+.4f}"
+                        )
+                        logger.info(
+                            f"    永续腿: delta={perp_pos:+.6f}  "
+                            f"entry={perp_entry:.4f}  mid={perp_mid:.4f}  "
+                            f"uPnL={perp_upnl:+.4f}"
+                        )
+                        logger.info(
+                            f"    ——腿合计 uPnL={spot_upnl + perp_upnl:+.4f}"
+                        )
+
+                        if entry_basis is not None:
+                            # basis 建仓成本 = basis × min(|spot|, |perp|) —— 取两腿
+                            # 实际配对的数量。两腿差额部分是裸敞口，不属于 basis 成本。
+                            eff_delta = min(abs(spot_pos), abs(perp_pos))
+                            basis_cost = entry_basis * eff_delta
+                            logger.info(
+                                f"    建仓 basis = entry_spot - entry_perp = "
+                                f"{entry_basis:+.4f} USDC/{pair.base}"
+                            )
+                            logger.info(
+                                f"      → basis 建仓成本 = basis × |delta| = "
+                                f"{basis_cost:+.4f}"
+                            )
+
+                        if current_basis is not None:
+                            logger.info(
+                                f"    当前 basis = mid_spot - mid_perp = "
+                                f"{current_basis:+.4f} USDC/{pair.base}"
+                            )
+
+                        logger.info(
+                            f"    净 Delta = {net_delta:+.6f}  "
+                            f"(名义敞口 ≈ ±{nominal_exposure:.2f} USDC at mid)"
+                        )
+
+                # ── 未被 pair 覆盖的持仓（裸单边敞口或未配置 hedger）──
+                # 删除原"mid <= 0 时 fallback 到 entry"逻辑（那会让永续腿 uPnL
+                # 恒为 0，伪装成对冲完美）。mid 缺失时显式打 N/A。
                 for sym, qty in sorted(inventory.get_all_positions().items()):
                     if abs(qty) < 1e-10:
+                        continue
+                    if sym in covered_symbols:
                         continue
                     base = sym.split("/")[0]
                     tag = "合约" if ":" in sym else "现货"
                     entry = inventory.avg_entry.get(sym, 0.0)
                     mid = last_mids.get(sym, 0.0)
-                    # 对冲腿 mid 可能不在 last_mids（行情轮询只覆盖做市腿），用 entry 兜底
-                    if mid <= 0:
-                        mid = entry
-                    leg_upnl = qty * (mid - entry) if entry > 0 and mid > 0 else 0.0
+                    if mid > 0 and entry > 0:
+                        leg_upnl = qty * (mid - entry)
+                        mid_str = f"{mid:.4f}"
+                        upnl_str = f"{leg_upnl:+.4f}"
+                    else:
+                        mid_str = f"{mid:.4f}" if mid > 0 else "N/A"
+                        upnl_str = "N/A"
                     logger.info(
                         f"[PnL] {tag} {sym:<20s}: "
                         f"{qty:+.6f} {base:<5s}  "
-                        f"entry={entry:.4f}  mid={mid:.4f}  "
-                        f"uPnL={leg_upnl:+.4f}"
+                        f"entry={entry:.4f}  mid={mid_str}  "
+                        f"uPnL={upnl_str}"
                     )
-
-                # hedger 启用时按 base 聚合净 delta 和组合 uPnL
-                if hedger is not None and hedger_cfg["trading_pairs"]:
-                    for pair in hedger_cfg["trading_pairs"]:
-                        # 两腿都无持仓 → 跳过（避免打印 +0.000000 噪声）
-                        if (
-                            abs(inventory.get_position(pair.market_symbol)) < 1e-10
-                            and abs(inventory.get_position(pair.hedge_symbol)) < 1e-10
-                        ):
-                            continue
-                        asset_map = {
-                            pair.market_symbol: pair.base,
-                            pair.hedge_symbol: pair.base,
-                        }
-                        net_delta = inventory.get_net_delta(pair.base, asset_map)
-                        combo_upnl = 0.0
-                        for sym in (pair.market_symbol, pair.hedge_symbol):
-                            q = inventory.get_position(sym)
-                            if abs(q) < 1e-10:
-                                continue
-                            e = inventory.avg_entry.get(sym, 0.0)
-                            m = last_mids.get(sym, 0.0) or e
-                            if e > 0 and m > 0:
-                                combo_upnl += q * (m - e)
-                        logger.info(
-                            f"[PnL] 聚合 {pair.base:<20s}: "
-                            f"净Delta={net_delta:+.6f}  "
-                            f"组合uPnL={combo_upnl:+.4f} USDC"
-                        )
 
                 # 余额快照（方便追踪 balances 是否随成交同步更新）
                 all_bal = inventory.get_all_balances()
@@ -1207,6 +1289,97 @@ def main() -> None:
                     f"skew={strategy_cfg['skew_intensity']}  "
                     f"delta_max={risk_cfg.position_limit.max_delta_per_symbol}"
                 )
+
+                # ── 与交易所快照交叉校验（每 N 次 PnL 日志一次）─────────
+                # 不同交易所字段语义差异很大，这里写死 Hyperliquid 口径：
+                #   fetch_balance()      → perp 子账户；marginSummary.accountValue
+                #                          已含未实现 PnL，所以 perp.USDC.total 本身
+                #                          就代表 "带 mark-to-market 的保证金净值"，
+                #                          不要再加 perp.unrealized_pnl（会双计）。
+                #   fetch_spot_balance() → spot 子账户；USDC.total 是账户总持有量
+                #                          (含被现货挂单 hold 住的部分)，
+                #                          token.total 是持有量（含挂单占用）。
+                # 若以后换别家交易所，此块必须按该所的余额语义重新审视。
+                pnl_log_count += 1
+                if (
+                    not dry_run
+                    and pnl_log_count % exchange_reconcile_every == 0
+                ):
+                    try:
+                        perp_snap = gateway.fetch_balance()
+                        spot_snap = gateway.fetch_spot_balance()
+
+                        # 口径：用 .total 不是 .free。
+                        #  1) initial_capital 在启动时用 _perp_bal.USDC.total +
+                        #     _spot_bal.USDC.total 算出，本身就是 total 口径。
+                        #  2) inventory 里的 balances["spot"]["USDC"] 只在 on_fill
+                        #     (成交) 时增减，不反映挂单 hold——也是 total 语义。
+                        #  3) hold 住的 USDC 仍然是账户的钱，只是被现货买单暂时锁住，
+                        #     平仓或撤单就回来。用 .free 会把挂单期间的这部分算出账户外，
+                        #     任何一个 bid 在挂着 diff 就会 > 阈值，误报 WARNING。
+                        _spot_usdc_bal = spot_snap.balances.get("USDC")
+                        ex_spot_usdc = (
+                            float(_spot_usdc_bal.total or 0.0)
+                            if _spot_usdc_bal is not None else 0.0
+                        )
+                        _perp_usdc_bal = perp_snap.balances.get("USDC")
+                        ex_perp_usdc = (
+                            float(_perp_usdc_bal.total or 0.0)
+                            if _perp_usdc_bal is not None else 0.0
+                        )
+
+                        # 现货 token 估值：遍历 poll 的现货 symbol（非 ":"），
+                        # 查原生 base 名对应的余额，用 last_mids 换算。
+                        # 通过 symbol 口径聚合避免 USOL/SOL 别名双计。
+                        ex_spot_asset_val = 0.0
+                        for _sym in poll_symbols:
+                            if ":" in _sym:
+                                continue
+                            _base_native = _sym.split("/")[0]
+                            _bal = spot_snap.balances.get(_base_native)
+                            if _bal is None:
+                                continue
+                            _qty = float(_bal.total or 0.0)
+                            if _qty <= 0:
+                                continue
+                            _m = last_mids.get(_sym, 0.0)
+                            if _m > 0:
+                                ex_spot_asset_val += _qty * _m
+
+                        exchange_side_total = (
+                            ex_spot_usdc + ex_spot_asset_val + ex_perp_usdc
+                        )
+                        local_side_total = (
+                            initial_capital
+                            + inventory.realized_pnl
+                            + inventory.unrealized_pnl(last_mids)
+                        )
+                        diff = local_side_total - exchange_side_total
+
+                        logger.info(
+                            f"[PnL-对账] 本地={local_side_total:+.4f}  "
+                            f"交易所={exchange_side_total:+.4f}  "
+                            f"差异={diff:+.4f}"
+                        )
+                        logger.info(
+                            f"[PnL-对账]   构成: spot_USDC={ex_spot_usdc:.4f} + "
+                            f"spot资产={ex_spot_asset_val:.4f} + "
+                            f"perp_USDC(含uPnL)={ex_perp_usdc:.4f}"
+                        )
+                        logger.info(
+                            "[PnL-对账]   差异来源候选: funding未入账 / fee汇率差 / "
+                            "mark_price vs mid / USOL估值口径"
+                        )
+                        if abs(diff) > 0.10:
+                            logger.warning(
+                                f"[PnL-对账] 差异 |{diff:+.4f}| > 0.10 USDC — "
+                                f"检查 funding / fee 折算 / mark-vs-mid / USOL 估值"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"[PnL-对账] 快照拉取失败: {type(e).__name__}: {e}"
+                        )
+
                 last_pnl_log = now
 
             # ── 精确睡眠（扣除本轮耗时），或被成交事件提前唤醒 ──────────────
@@ -1335,6 +1508,12 @@ def main() -> None:
                 for reason, count in reasons.items():
                     if count > 0:
                         logger.info(f"  {reason:<15s}: {count} 次")
+
+            # Latency 分布报告（CCXT_RTT / EMIT_DELAY / EMIT_SOURCE / FINAL_STATE）
+            try:
+                hedger.latency_report(logger)
+            except Exception as e:
+                logger.warning(f"[HEDGE-LATENCY] 生成报告失败: {e}")
 
         gateway.disconnect()
         logger.info("系统已关停")
