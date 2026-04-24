@@ -1,6 +1,21 @@
-"""Direct Lighter WebSocket client (market_stats + order_book channels).
+"""Direct Lighter WebSocket client (market_stats channel only).
 
-Phase 1.0 observer-only. No account channels, no order channels.
+Phase 1.0 observer. No account channels, no order channels. Order book
+depth is pulled via REST (``LighterGateway.get_orderbook``); the WS is
+used strictly for real-time mark/index/last price updates.
+
+Why market_stats-only on the direct WS:
+
+* The reference adapter (``crypto-trading-open`` / lighter_websocket.py)
+  only subscribes to ``market_stats/{mi}`` over direct WS. It uses the
+  SDK's sync WsClient for order-book callbacks. We avoid the SDK's
+  WsClient (it's sync-only and pushes events on threads, which doesn't
+  play well with the rest of our asyncio stack).
+* Empirically, sending an ``order_book/{mi}`` subscribe message over
+  the direct WS causes the server to silently ignore *all* subscribes
+  in that connection — including the valid market_stats ones. The
+  "order_book" direct-WS channel either doesn't exist or uses a
+  different name; either way it's not worth discovering at this stage.
 
 Critical Lighter WS quirks — these are load-bearing, do not remove:
 
@@ -24,9 +39,18 @@ Critical Lighter WS quirks — these are load-bearing, do not remove:
     (1s → 60s). This matches the reference adapter's pattern.
 
 5.  **market_stats for realtime prices.** ~13 updates/sec per market.
-    We do NOT use the SDK's WsClient — we speak the /stream protocol
-    directly because the SDK's WsClient is sync and pushes data on
-    threads, which is awkward to drive from asyncio.
+    Carries mark/index/last/funding_rate. The initial subscription
+    confirmation (``subscribed/market_stats``) already carries a
+    full payload, so the handler dispatches both ``subscribed/...``
+    and ``update/...`` to the same parser.
+
+6.  **Active keep-alive ping every 30s.** Passive pong-in-response-to-
+    server-ping alone is not enough — the server drops the connection
+    after ~117s (observed 14 disconnects in a 27-minute run). We send
+    a client-initiated ``{"type":"ping"}`` every 30s to keep the
+    connection marked alive. The server's ``{"type":"pong"}`` reply is
+    tracked for diagnostics but isn't required for the keep-alive to
+    work.
 """
 
 from __future__ import annotations
@@ -59,6 +83,10 @@ MarketStatsCallback = Callable[[int, Dict[str, Any]], Union[None, Awaitable[None
 _SUBSCRIBE_BATCH_SIZE = 10
 _SUBSCRIBE_BATCH_DELAY_SEC = 0.1
 _RECONNECT_BACKOFF_CAP_SEC = 60.0
+# Client-initiated keep-alive cadence. Lighter drops connections at
+# ~117s without active pings from the client (passive pong response
+# to server pings is insufficient). Send well under that window.
+_KEEPALIVE_INTERVAL_SEC = 30.0
 
 
 def _safe_decimal(value: Any, default: Optional[Decimal] = None) -> Optional[Decimal]:
@@ -118,6 +146,13 @@ class LighterWebSocket:
         self._last_connect_ts_ms: Optional[int] = None
         self._subscription_confirmations: set = set()
 
+        # Keep-alive state (see quirk #6 in module docstring)
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._ping_sent: int = 0
+        self._pong_received: int = 0
+        self._last_ping_ts_ms: Optional[int] = None
+        self._last_pong_ts_ms: Optional[int] = None
+
     # --------------------------------------------------------------
     # lifecycle
     # --------------------------------------------------------------
@@ -154,6 +189,7 @@ class LighterWebSocket:
     async def disconnect(self) -> None:
         """Stop the background task and close the connection."""
         self._running = False
+        await self._stop_keepalive_task()
         ws = self._direct_ws
         self._direct_ws = None
         if ws is not None:
@@ -170,6 +206,49 @@ class LighterWebSocket:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("ws task raised on shutdown: %s", exc)
         self._ws_task = None
+
+    async def _stop_keepalive_task(self) -> None:
+        """Idempotently cancel the keep-alive task if it is running."""
+        task = self._keepalive_task
+        self._keepalive_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("keep-alive task raised on cancel: %s", exc)
+
+    async def _keepalive_loop(self) -> None:
+        """Send ``{"type":"ping"}`` every ~30s to prevent server timeout.
+
+        Runs until cancelled. Send failures are silent — if the WS
+        connection has closed, ``_run_loop`` will detect it through
+        its ``async for message`` iterator and reconnect. We don't
+        want this task to raise and fight the reconnect path.
+        """
+        try:
+            while True:
+                await asyncio.sleep(_KEEPALIVE_INTERVAL_SEC)
+                ws = self._direct_ws
+                if ws is None:
+                    # Connection gone; reconnect will restart this task
+                    return
+                try:
+                    await ws.send(json.dumps({"type": "ping"}))
+                    self._ping_sent += 1
+                    self._last_ping_ts_ms = int(time.time() * 1000)
+                    logger.debug("keep-alive ping sent (total=%d)", self._ping_sent)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "keep-alive ping send failed (will be handled by reconnect): %s",
+                        exc,
+                    )
+                    return
+        except asyncio.CancelledError:
+            raise
 
     async def add_markets(self, market_indices: List[int]) -> None:
         """Add markets to the subscription set while connection is live."""
@@ -211,6 +290,10 @@ class LighterWebSocket:
             "last_connect_ts_ms": self._last_connect_ts_ms,
             "subscribed_markets": list(self._market_indices),
             "subscription_confirmations": list(self._subscription_confirmations),
+            "ping_sent": self._ping_sent,
+            "pong_received": self._pong_received,
+            "last_ping_ts_ms": self._last_ping_ts_ms,
+            "last_pong_ts_ms": self._last_pong_ts_ms,
         }
 
     def is_connected(self) -> bool:
@@ -240,6 +323,15 @@ class LighterWebSocket:
                     )
                     # Subscribe in batches
                     await self._send_subscriptions(self._market_indices)
+
+                    # Start (or restart) the client-initiated keep-alive
+                    # task so we stay well under the ~117s server timeout.
+                    # Any previous task from an earlier connection should
+                    # already be done at this point, but stop defensively.
+                    await self._stop_keepalive_task()
+                    self._keepalive_task = asyncio.create_task(
+                        self._keepalive_loop(), name="lighter-ws-keepalive"
+                    )
 
                     # mark connected so connect() can return
                     if self._connected_event is not None and not self._connected_event.is_set():
@@ -273,6 +365,7 @@ class LighterWebSocket:
                     retry_count,
                 )
                 self._direct_ws = None
+                await self._stop_keepalive_task()
                 await asyncio.sleep(delay)
             except Exception as exc:  # noqa: BLE001
                 retry_count += 1
@@ -285,14 +378,24 @@ class LighterWebSocket:
                     exc_info=True,
                 )
                 self._direct_ws = None
+                await self._stop_keepalive_task()
                 await asyncio.sleep(delay)
             finally:
                 self._direct_ws = None
+                # Defensive: if the async-with exited cleanly (server
+                # closed the iterator), the except blocks above don't
+                # fire, so stop the keep-alive here too.
+                await self._stop_keepalive_task()
 
         logger.info("Lighter WS background loop exited cleanly")
 
     async def _send_subscriptions(self, market_indices: List[int]) -> None:
-        """Send market_stats + order_book subs in batches of 10 with 100ms gap."""
+        """Send ``market_stats/{mi}`` subs in batches of 10 with a 100ms gap.
+
+        Order-book depth is intentionally NOT subscribed here — see
+        the module docstring for why. Depth comes from REST
+        (``LighterGateway.get_orderbook``).
+        """
         if self._direct_ws is None:
             logger.warning("No WS connection — skipping subscription send")
             return
@@ -300,34 +403,26 @@ class LighterWebSocket:
         if total == 0:
             return
 
-        logger.info("Sending subscriptions for %d markets", total)
+        logger.info("Sending market_stats subscriptions for %d markets", total)
         sent_ok = 0
         sent_fail = 0
         for i in range(0, total, _SUBSCRIBE_BATCH_SIZE):
             batch = market_indices[i : i + _SUBSCRIBE_BATCH_SIZE]
             for market_index in batch:
-                # market_stats channel — realtime mark/index/last prices
                 msg_stats = {
                     "type": "subscribe",
                     "channel": f"market_stats/{market_index}",
                 }
-                # order_book channel — depth updates
-                msg_book = {
-                    "type": "subscribe",
-                    "channel": f"order_book/{market_index}",
-                }
-                for msg in (msg_stats, msg_book):
-                    try:
-                        await self._direct_ws.send(json.dumps(msg))
-                        sent_ok += 1
-                    except Exception as exc:  # noqa: BLE001
-                        sent_fail += 1
-                        logger.warning(
-                            "Subscribe send failed (market_index=%s, channel=%s): %s",
-                            market_index,
-                            msg["channel"],
-                            exc,
-                        )
+                try:
+                    await self._direct_ws.send(json.dumps(msg_stats))
+                    sent_ok += 1
+                except Exception as exc:  # noqa: BLE001
+                    sent_fail += 1
+                    logger.warning(
+                        "Subscribe send failed (market_index=%s): %s",
+                        market_index,
+                        exc,
+                    )
             if i + _SUBSCRIBE_BATCH_SIZE < total:
                 await asyncio.sleep(_SUBSCRIBE_BATCH_DELAY_SEC)
         logger.info("Subscriptions sent: ok=%d fail=%d", sent_ok, sent_fail)
@@ -353,28 +448,35 @@ class LighterWebSocket:
                     logger.debug("pong send failed: %s", exc)
             return
 
+        # Server's reply to our keep-alive ping (quirk #6). Track for
+        # diagnostics; there's no action required — as long as the
+        # keep-alive task keeps sending pings, the server keeps the
+        # connection open whether or not the pong arrives back to us.
+        if msg_type == "pong":
+            self._pong_received += 1
+            self._last_pong_ts_ms = int(time.time() * 1000)
+            logger.debug("keep-alive pong received (total=%d)", self._pong_received)
+            return
+
+        # market_stats: both ``subscribed/market_stats`` (carries initial
+        # snapshot) and ``update/market_stats`` (deltas) go to the same
+        # parser. Check this BEFORE the generic subscribed/ branch below,
+        # otherwise the initial snapshot is dropped on the floor.
+        if msg_type in ("subscribed/market_stats", "update/market_stats") and "market_stats" in data:
+            self._subscription_confirmations.add(channel or msg_type)
+            await self._on_market_stats(data["market_stats"])
+            return
+
         if msg_type.startswith("subscribed/"):
             self._subscription_confirmations.add(channel or msg_type)
             logger.debug("Subscribed: %s", channel or msg_type)
             return
 
-        if msg_type in ("subscribed/market_stats", "update/market_stats") and "market_stats" in data:
-            await self._on_market_stats(data["market_stats"])
-            return
-
-        if msg_type in ("subscribed/order_book", "update/order_book"):
-            # Lighter has historically placed the book under either
-            # "order_book" or directly in the payload — defend against both.
-            ob = data.get("order_book") or data.get("orderbook") or data
-            await self._on_order_book(ob, channel)
-            return
-
-        if msg_type == "update/market_stats":
-            # defensive: already handled above but keep symmetrical
-            stats = data.get("market_stats")
-            if stats:
-                await self._on_market_stats(stats)
-            return
+        # order_book channel is intentionally not subscribed on this WS
+        # (see module docstring). Depth comes from REST. We keep the
+        # dispatch guard here as a no-op in case a future protocol bump
+        # ever starts pushing ``update/order_book`` unsolicited — right
+        # now it just falls through to the "unhandled" debug line.
 
         # Unknown message — log at debug only to keep noise low
         logger.debug("Unhandled WS msg_type=%s channel=%s", msg_type, channel)

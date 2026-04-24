@@ -43,7 +43,9 @@ class ObservationConfig:
     symbols: List[str]
     duration_sec: Optional[float] = None  # None = run forever until SIGINT
     snapshot_interval_sec: float = 60.0
-    log_book_every_sec: float = 1.0
+    # REST-polling cadence for the BBO line. 5s is a safe default;
+    # going lower risks 429 since every tick fetches one book per symbol.
+    log_book_every_sec: float = 5.0
     output_dir: Path = field(default_factory=lambda: Path("logs/lighter_observe"))
     include_account: bool = True
     schedule: MarketSchedule = MarketSchedule.CRYPTO_24X7
@@ -302,11 +304,11 @@ class LighterObserver:
         try:
             while not self._stop_event.is_set():
                 now = time.time()
-                # BBO line
-                self._emit_bbo_line(now)
-                # Snapshot
+                # BBO line (pulls REST order books + WS mark price)
+                await self._emit_bbo_line(now)
+                # Full snapshot
                 if now - last_snapshot_ts >= self.config.snapshot_interval_sec:
-                    self._emit_snapshot(now)
+                    await self._emit_snapshot(now)
                     last_snapshot_ts = now
                 # Sleep until the next BBO tick or stop
                 try:
@@ -319,42 +321,67 @@ class LighterObserver:
         except asyncio.CancelledError:
             pass
 
-    def _emit_bbo_line(self, now: float) -> None:
+    async def _fetch_rest_book(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """REST-fetch a depth-5 order book, returning None on error.
+
+        WS doesn't push order_book depth for us (see lighter_ws module
+        docstring), so BBO and snapshots pull it over REST instead.
+        Keep depth small (5) and cadence ≥5s to stay clear of 429.
+        """
+        try:
+            return await self.gateway.get_orderbook(symbol, limit=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("REST get_orderbook(%s) failed: %s", symbol, exc)
+            return None
+
+    async def _emit_bbo_line(self, now: float) -> None:
         self._bbo_print_count += 1
         for sym, market_index in self._symbol_markets.items():
-            book = self.ws.get_orderbook_snapshot(market_index)
-            mid = self.ws.get_latest_mid(market_index)
+            book = await self._fetch_rest_book(sym)
+            # mid prefers WS mark_price; falls back to REST-derived BBO mid.
+            ws_mid = self.ws.get_latest_mid(market_index)
             if book is None or not book.get("bids") or not book.get("asks"):
-                logger.info("[BBO] %s: no book yet", sym)
+                logger.info("[BBO] %s: no book (REST fetch returned empty)", sym)
                 continue
-            bb = book.get("best_bid")
-            ba = book.get("best_ask")
+            bb = book["bids"][0][0]
+            ba = book["asks"][0][0]
+            rest_mid = (bb + ba) / Decimal(2)
+            mid = ws_mid if ws_mid is not None else rest_mid
             spread_bp = None
-            if bb and ba and mid and mid > 0:
+            if mid and mid > 0:
                 spread_bp = (ba - bb) / mid * Decimal("10000")
             logger.info(
-                "[BBO] %s bid=%s ask=%s mid=%s spread=%sbp depth=%d/%d",
+                "[BBO] %s bid=%s ask=%s mid=%s(src=%s) spread=%sbp depth=%d/%d",
                 sym,
                 bb,
                 ba,
                 mid,
+                "ws" if ws_mid is not None else "rest",
                 f"{spread_bp:.2f}" if spread_bp is not None else "?",
                 len(book.get("bids", [])),
                 len(book.get("asks", [])),
             )
 
-    def _emit_snapshot(self, now: float) -> None:
+    async def _emit_snapshot(self, now: float) -> None:
         self._snapshot_count += 1
         stats = self.ws.get_message_stats()
         per_symbol_books: Dict[str, Any] = {}
         for sym, market_index in self._symbol_markets.items():
-            book = self.ws.get_orderbook_snapshot(market_index)
+            book = await self._fetch_rest_book(sym)
             ms = self.ws.get_market_stats(market_index)
+            ws_mid = self.ws.get_latest_mid(market_index)
+            best_bid = book["bids"][0][0] if book and book.get("bids") else None
+            best_ask = book["asks"][0][0] if book and book.get("asks") else None
+            rest_mid = None
+            if best_bid is not None and best_ask is not None:
+                rest_mid = (best_bid + best_ask) / Decimal(2)
+            mid = ws_mid if ws_mid is not None else rest_mid
             per_symbol_books[sym] = {
                 "market_index": market_index,
-                "best_bid": _safe_str(book.get("best_bid") if book else None),
-                "best_ask": _safe_str(book.get("best_ask") if book else None),
-                "mid": _safe_str(book.get("mid") if book else None),
+                "best_bid": _safe_str(best_bid),
+                "best_ask": _safe_str(best_ask),
+                "mid": _safe_str(mid),
+                "mid_source": "ws" if ws_mid is not None else ("rest" if rest_mid is not None else None),
                 "bid_depth": len(book.get("bids", [])) if book else 0,
                 "ask_depth": len(book.get("asks", [])) if book else 0,
                 "mark_price": _safe_str(ms.get("mark_price") if ms else None),

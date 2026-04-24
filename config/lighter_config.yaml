@@ -27,7 +27,8 @@ lighter:
 observe:
   # How often to emit a full [OBSERVE] snapshot line (seconds).
   snapshot_interval_s: 60
-  # How often to print a BBO summary line (seconds).
-  log_book_state_every_s: 1
+  # How often to print a BBO summary line (seconds). Each tick pulls
+  # one REST order book per symbol; keep >=5 to stay clear of 429.
+  log_book_state_every_s: 5
   # Where to write JSONL files. Created on first run.
   output_dir: logs/lighter_observe

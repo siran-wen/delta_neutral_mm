@@ -91,8 +91,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--bbo-interval",
         type=float,
-        default=1.0,
-        help="BBO log cadence in seconds (default: 1)",
+        default=5.0,
+        help="BBO log cadence in seconds (default: 5). Each tick pulls "
+        "one REST order book per symbol, so don't go much below 5 or "
+        "you'll trip the 429 rate limit.",
     )
     p.add_argument(
         "--output-dir",
