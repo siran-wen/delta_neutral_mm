@@ -10,7 +10,7 @@ Delta-neutral market making framework for the Hyperliquid exchange. The infrastr
 
 ```bash
 # Install dependencies
-pip install -r utils/requirements_test.txt
+pip install -r utils/requirements.txt
 
 # Run connectivity tests against Hyperliquid
 python utils/test_hyperliquid_connectivity.py --config config/hyperliquid_config.yaml

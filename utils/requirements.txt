@@ -1,5 +1,5 @@
 # Hyperliquid连通性测试工具依赖 (使用CCXT)
-# 安装命令: pip install -r utils/requirements_test.txt
+# 安装命令: pip install -r utils/requirements.txt
 
 # CCXT统一交易所API库 (必需)
 ccxt>=4.0.0
@@ -9,3 +9,14 @@ eth-account>=0.9.0
 
 # YAML配置文件解析 (通常已包含在Python标准库或项目中)
 PyYAML>=6.0
+
+# ---------------------------------------------------------------------------
+# Lighter exchange observer (Phase 1.0 read-only)
+#   Install via: pip install -r utils/requirements.txt
+# ---------------------------------------------------------------------------
+
+# Lighter Python SDK (official, installs from GitHub)
+lighter-sdk @ git+https://github.com/elliottech/lighter-python.git
+
+# Direct WebSocket client used by gateways/lighter_ws.py
+websockets>=12.0

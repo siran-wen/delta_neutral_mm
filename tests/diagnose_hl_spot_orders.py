@@ -159,6 +159,8 @@ for default_type in ("swap", "spot"):
                 "defaultType": default_type,
             },
         })
+        # 绕过 CCXT 4.5.x 新增 HIP-3 DEX 市场导致的 "Too many DEXes" 报错
+        exchange.options.setdefault("fetchMarkets", {})["types"] = ["spot", "swap"]
         exchange.load_markets()
         print(f"  已加载 {len(exchange.markets)} 个 markets")
 
@@ -249,17 +251,31 @@ try:
         from collections import Counter
         coins = Counter(str(f.get("coin", "")) for f in data)
         print(f"  按 coin 分布: {dict(coins)}")
-        # 筛出最近 1 小时的 SOL 现货成交
+        # 专门查"现货"类型的记录：
+        # Hyperliquid userFills 里，现货成交的 'coin' 字段可能是 '@NNN' (token_id) 或者 coin name
+        # 而永续的 'coin' 是简短 base name
+        # 另外 'dir' 字段在永续是 Open/Close + Long/Short，现货是 Buy/Sell
+        subsection2 = lambda x: print(f"\n  -- {x} --")
+        subsection2("按 dir 字段分类（辨别现货 vs 永续）")
+        dirs = Counter(str(f.get("dir", "")) for f in data)
+        print(f"  dir 分布: {dict(dirs)}")
+        # 取几个不同 dir 的示例
+        seen_dirs = set()
+        for f in data:
+            d = str(f.get("dir", ""))
+            if d not in seen_dirs:
+                seen_dirs.add(d)
+                print(f"    dir='{d}' 样例: coin={f.get('coin')} oid={f.get('oid')} side={f.get('side')} px={f.get('px')}")
+
+        # 筛选最近 1 小时的成交，逐笔看清 "现货 SOL" 的 coin 字段是什么
         import time as _time
         now_ms = int(_time.time() * 1000)
-        recent_sol_spot = [
-            f for f in data
-            if (now_ms - int(f.get("time", 0))) < 3600_000  # 1 小时
-            and str(f.get("coin", "")).upper() in ("SOL", "USOL", "@107", "@126", "@254")
-        ]
-        print(f"  最近 1 小时 SOL/USOL 相关成交: {len(recent_sol_spot)} 笔")
-        for f in recent_sol_spot[:5]:
-            print(f"    {pformat(f, width=140, compact=True)}")
+        recent = [f for f in data if (now_ms - int(f.get("time", 0))) < 3600_000]
+        print(f"\n  最近 1 小时共 {len(recent)} 笔成交（按时间倒序）：")
+        for f in recent[:20]:
+            print(f"    time={f.get('time')} coin={f.get('coin'):8s} "
+                  f"dir={str(f.get('dir','')):20s} oid={f.get('oid')} "
+                  f"side={f.get('side')} sz={f.get('sz'):8s} px={f.get('px')}")
 except Exception as e:
     print(f"  异常: {type(e).__name__}: {e}")
 
