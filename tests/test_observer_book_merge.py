@@ -72,7 +72,22 @@ class _StubWs:
         return self._stats.get(market_index)
 
     def get_message_stats(self) -> Dict[str, Any]:
-        return {"msg_count_by_type": {}, "connect_count": 1, "subscribed_markets": []}
+        return {
+            "msg_count_by_type": {},
+            "connect_count": 1,
+            "subscribed_markets": [],
+            "trade_subscription_failed": [],
+        }
+
+    def get_recent_trades(
+        self, market_index: int, since_ts_ms: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        # No trades — exercises the empty-tape branch of the snapshot.
+        return []
+
+    def get_recent_latency_stats(self) -> Optional[Dict[str, Any]]:
+        # No samples → observer omits the field.
+        return None
 
 
 def _make_observer(

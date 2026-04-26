@@ -102,6 +102,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Where to write JSONL output (default: from config or logs/lighter_observe)",
     )
     p.add_argument(
+        "--depth-tiers",
+        default="5,10,15,25,50,100,200",
+        help="Comma-separated list of spread tiers (bp) for cumulative-depth aggregation. "
+        "Default covers regular and RWA-weekend LPP tiers.",
+    )
+    p.add_argument(
+        "--top-levels",
+        type=int,
+        default=5,
+        help="Number of bid/ask levels to persist verbatim per snapshot (default: 5)",
+    )
+    p.add_argument(
+        "--snapshot-book-depth",
+        type=int,
+        default=20,
+        help="Order-book depth fetched per snapshot via REST (default: 20)",
+    )
+    p.add_argument(
         "--verbose",
         "-v",
         action="count",
@@ -109,6 +127,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Increase verbosity (-v=INFO, -vv=DEBUG)",
     )
     return p
+
+
+def _parse_tiers(spec: str) -> tuple:
+    """Parse '5,10,15' into a tuple of Decimals. Reject empty / NaN."""
+    from decimal import Decimal, InvalidOperation
+    out = []
+    for piece in (spec or "").split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            value = Decimal(piece)
+        except InvalidOperation as exc:
+            raise ValueError(f"invalid depth tier value: {piece!r}") from exc
+        if value <= 0:
+            raise ValueError(f"depth tier must be positive: {piece}")
+        out.append(value)
+    if not out:
+        raise ValueError("--depth-tiers must contain at least one value")
+    return tuple(out)
 
 
 def _setup_logging(verbosity: int) -> None:
@@ -207,6 +245,12 @@ async def _run_observe(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
         args.bbo_interval or obs_cfg_raw.get("log_book_state_every_s", 1)
     )
 
+    try:
+        depth_tiers = _parse_tiers(args.depth_tiers)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     obs_cfg = ObservationConfig(
         symbols=markets,
         duration_sec=duration_sec,
@@ -215,6 +259,9 @@ async def _run_observe(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
         output_dir=Path(output_dir),
         include_account=not args.no_account,
         schedule=_schedule_from_arg(args.schedule),
+        depth_tiers_bp=depth_tiers,
+        top_levels=int(args.top_levels),
+        snapshot_book_depth=int(args.snapshot_book_depth),
     )
 
     gateway = LighterGateway(gw_kwargs)

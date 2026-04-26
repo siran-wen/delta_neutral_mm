@@ -51,6 +51,13 @@ Critical Lighter WS quirks — these are load-bearing, do not remove:
     connection marked alive. The server's ``{"type":"pong"}`` reply is
     tracked for diagnostics but isn't required for the keep-alive to
     work.
+
+7.  **Trade tape is best-effort.** ``trade/{mi}`` subscription succeeds
+    on every Lighter market we have observed, but a server-side
+    rejection (``{"type":"error", "channel":"trade/N", ...}``) must
+    not poison the connection. We log once per market and continue
+    serving market_stats. ``get_recent_trades(mi)`` will return
+    ``[]`` for markets where the channel is silent or rejected.
 """
 
 from __future__ import annotations
@@ -59,9 +66,9 @@ import asyncio
 import json
 import logging
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from decimal import Decimal
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Tuple, Union
 
 try:
     import websockets
@@ -79,6 +86,7 @@ _TESTNET_WS_URL = "wss://testnet.zklighter.elliot.ai/stream"
 
 OrderbookCallback = Callable[[int, Dict[str, Any]], Union[None, Awaitable[None]]]
 MarketStatsCallback = Callable[[int, Dict[str, Any]], Union[None, Awaitable[None]]]
+TradeCallback = Callable[[int, Dict[str, Any]], Union[None, Awaitable[None]]]
 
 _SUBSCRIBE_BATCH_SIZE = 10
 _SUBSCRIBE_BATCH_DELAY_SEC = 0.1
@@ -87,6 +95,12 @@ _RECONNECT_BACKOFF_CAP_SEC = 60.0
 # ~117s without active pings from the client (passive pong response
 # to server pings is insufficient). Send well under that window.
 _KEEPALIVE_INTERVAL_SEC = 30.0
+# How long to retain in-memory trade records for ad-hoc 60s windows.
+# Five minutes gives the observer headroom for delayed snapshot ticks
+# without unbounded growth on quiet markets.
+_TRADE_RETENTION_MS = 5 * 60 * 1000
+# Max samples for the rolling latency window (server_ts → local_ts).
+_LATENCY_SAMPLES_MAXLEN = 200
 
 
 def _safe_decimal(value: Any, default: Optional[Decimal] = None) -> Optional[Decimal]:
@@ -139,6 +153,24 @@ class LighterWebSocket:
 
         self._orderbook_callbacks: List[OrderbookCallback] = []
         self._market_stats_callbacks: List[MarketStatsCallback] = []
+        self._trade_callbacks: List[TradeCallback] = []
+
+        # Trade tape: per-market rolling list of recent trades. Each
+        # element is a dict with the fields produced by ``_on_trade``.
+        # Pruned to ``_TRADE_RETENTION_MS`` on every insert so memory
+        # stays bounded even on quiet markets that we never query.
+        self._recent_trades_by_market: Dict[int, List[Dict[str, Any]]] = {}
+        # Markets where the trade subscription was rejected by the
+        # server. We log once and degrade gracefully — observers must
+        # treat trade data as best-effort.
+        self._trade_subscription_failed: set = set()
+
+        # Server→local latency samples for diagnostic p50/p95/p99.
+        # Sample format: (server_ts_ms, local_ts_ms). Bounded deque so
+        # the buffer cannot grow unbounded if no one ever drains it.
+        self._latency_samples: Deque[Tuple[int, int]] = deque(
+            maxlen=_LATENCY_SAMPLES_MAXLEN
+        )
 
         self._msg_count_by_type: Dict[str, int] = defaultdict(int)
         self._last_msg_ts_ms_by_channel: Dict[str, int] = {}
@@ -282,6 +314,55 @@ class LighterWebSocket:
     def register_market_stats_callback(self, cb: MarketStatsCallback) -> None:
         self._market_stats_callbacks.append(cb)
 
+    def register_trade_callback(self, cb: TradeCallback) -> None:
+        self._trade_callbacks.append(cb)
+
+    def get_recent_trades(
+        self,
+        market_index: int,
+        since_ts_ms: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return trades for ``market_index`` with ``ts_ms >= since_ts_ms``.
+
+        ``since_ts_ms`` defaults to "everything currently retained". The
+        returned list is a copy — callers can sort/aggregate freely
+        without affecting the rolling buffer.
+        """
+        trades = self._recent_trades_by_market.get(int(market_index))
+        if not trades:
+            return []
+        if since_ts_ms is None:
+            return list(trades)
+        cutoff = int(since_ts_ms)
+        return [t for t in trades if t.get("ts_ms", 0) >= cutoff]
+
+    def get_recent_latency_stats(self) -> Optional[Dict[str, Any]]:
+        """Compute p50/p95/p99 latency over the rolling sample window.
+
+        Returns ``None`` when there are no samples (e.g. server never
+        included a server-side timestamp), which the observer treats
+        as "omit the field".
+        """
+        samples = list(self._latency_samples)
+        if not samples:
+            return None
+        deltas = sorted((local - server) for server, local in samples)
+        n = len(deltas)
+        if n == 0:
+            return None
+
+        def _q(p: float) -> int:
+            # Nearest-rank percentile. Cheap and stable for small n.
+            idx = max(0, min(n - 1, int(round(p * (n - 1)))))
+            return int(deltas[idx])
+
+        return {
+            "p50_ms": _q(0.50),
+            "p95_ms": _q(0.95),
+            "p99_ms": _q(0.99),
+            "samples": n,
+        }
+
     def get_message_stats(self) -> Dict[str, Any]:
         return {
             "msg_count_by_type": dict(self._msg_count_by_type),
@@ -294,6 +375,7 @@ class LighterWebSocket:
             "pong_received": self._pong_received,
             "last_ping_ts_ms": self._last_ping_ts_ms,
             "last_pong_ts_ms": self._last_pong_ts_ms,
+            "trade_subscription_failed": sorted(self._trade_subscription_failed),
         }
 
     def is_connected(self) -> bool:
@@ -390,11 +472,20 @@ class LighterWebSocket:
         logger.info("Lighter WS background loop exited cleanly")
 
     async def _send_subscriptions(self, market_indices: List[int]) -> None:
-        """Send ``market_stats/{mi}`` subs in batches of 10 with a 100ms gap.
+        """Subscribe to ``market_stats`` and ``trade`` per market.
+
+        Sends two subscribe messages per market. Server batching limit
+        is per-message, so the unit of batching is messages (not
+        markets) — sleep every ``_SUBSCRIBE_BATCH_SIZE`` messages.
 
         Order-book depth is intentionally NOT subscribed here — see
         the module docstring for why. Depth comes from REST
         (``LighterGateway.get_orderbook``).
+
+        Trade channel is best-effort: if the server replies with an
+        ``error`` for ``trade/{mi}``, the market is added to
+        ``_trade_subscription_failed`` and observer code treats that
+        market's trade-tape as empty. ``market_stats`` is unaffected.
         """
         if self._direct_ws is None:
             logger.warning("No WS connection — skipping subscription send")
@@ -403,27 +494,44 @@ class LighterWebSocket:
         if total == 0:
             return
 
-        logger.info("Sending market_stats subscriptions for %d markets", total)
+        # Build the flat list of subscribe messages first so the per-
+        # message batching is easy to reason about.
+        messages: List[Tuple[int, str, Dict[str, Any]]] = []
+        for mi in market_indices:
+            messages.append((
+                mi,
+                "market_stats",
+                {"type": "subscribe", "channel": f"market_stats/{mi}"},
+            ))
+            messages.append((
+                mi,
+                "trade",
+                {"type": "subscribe", "channel": f"trade/{mi}"},
+            ))
+
+        logger.info(
+            "Sending subscriptions for %d markets (%d messages)",
+            total,
+            len(messages),
+        )
         sent_ok = 0
         sent_fail = 0
-        for i in range(0, total, _SUBSCRIBE_BATCH_SIZE):
-            batch = market_indices[i : i + _SUBSCRIBE_BATCH_SIZE]
-            for market_index in batch:
-                msg_stats = {
-                    "type": "subscribe",
-                    "channel": f"market_stats/{market_index}",
-                }
-                try:
-                    await self._direct_ws.send(json.dumps(msg_stats))
-                    sent_ok += 1
-                except Exception as exc:  # noqa: BLE001
-                    sent_fail += 1
-                    logger.warning(
-                        "Subscribe send failed (market_index=%s): %s",
-                        market_index,
-                        exc,
-                    )
-            if i + _SUBSCRIBE_BATCH_SIZE < total:
+        for i, (mi, kind, msg) in enumerate(messages):
+            try:
+                await self._direct_ws.send(json.dumps(msg))
+                sent_ok += 1
+            except Exception as exc:  # noqa: BLE001
+                sent_fail += 1
+                logger.warning(
+                    "Subscribe send failed (kind=%s market_index=%s): %s",
+                    kind,
+                    mi,
+                    exc,
+                )
+            # Pause every batch to avoid the silent-drop quirk. Use
+            # 1-based count so the first sleep happens after exactly
+            # _SUBSCRIBE_BATCH_SIZE sends.
+            if (i + 1) % _SUBSCRIBE_BATCH_SIZE == 0 and (i + 1) < len(messages):
                 await asyncio.sleep(_SUBSCRIBE_BATCH_DELAY_SEC)
         logger.info("Subscriptions sent: ok=%d fail=%d", sent_ok, sent_fail)
 
@@ -435,8 +543,17 @@ class LighterWebSocket:
         msg_type = data.get("type", "")
         self._msg_count_by_type[msg_type] = self._msg_count_by_type.get(msg_type, 0) + 1
         channel = data.get("channel", "")
+        local_ts_ms = int(time.time() * 1000)
         if channel:
-            self._last_msg_ts_ms_by_channel[channel] = int(time.time() * 1000)
+            self._last_msg_ts_ms_by_channel[channel] = local_ts_ms
+
+        # Best-effort server timestamp capture for latency stats. Lighter
+        # is inconsistent here: market_stats payloads usually carry
+        # `transaction_time` or `timestamp`; trades carry `timestamp` or
+        # `transaction_time`. We sample only update/* frames so the
+        # subscribe-snapshot bursts don't pollute the distribution.
+        if msg_type.startswith("update/"):
+            self._maybe_record_latency(data, local_ts_ms)
 
         # Application-layer heartbeat — load-bearing. Without this the
         # server drops us at ~120s silently.
@@ -465,6 +582,38 @@ class LighterWebSocket:
         if msg_type in ("subscribed/market_stats", "update/market_stats") and "market_stats" in data:
             self._subscription_confirmations.add(channel or msg_type)
             await self._on_market_stats(data["market_stats"])
+            return
+
+        # trade channel: both subscribed/trade (initial backfill, may be
+        # an empty list) and update/trade (live ticks) carry an array
+        # of trades under the "trades" key. The subscribed/ form
+        # confirms the channel exists; the update/ form delivers data.
+        if msg_type in ("subscribed/trade", "update/trade"):
+            self._subscription_confirmations.add(channel or msg_type)
+            await self._on_trade(data, channel)
+            return
+
+        # Server may emit an "error" for unknown channels. We treat
+        # the trade channel specifically as best-effort: log once and
+        # continue so market_stats keeps working.
+        if msg_type == "error":
+            err_msg = str(data.get("message") or data.get("error") or "")
+            ch = data.get("channel") or ""
+            if ch.startswith("trade/"):
+                try:
+                    mi = int(ch.split("/", 1)[1])
+                except (ValueError, IndexError):
+                    mi = -1
+                if mi >= 0 and mi not in self._trade_subscription_failed:
+                    self._trade_subscription_failed.add(mi)
+                    logger.warning(
+                        "Trade channel rejected by server for market_index=%s "
+                        "(message=%r); continuing without trade tape.",
+                        mi,
+                        err_msg,
+                    )
+                return
+            logger.warning("WS server error: channel=%s message=%r", ch, err_msg)
             return
 
         if msg_type.startswith("subscribed/"):
@@ -525,6 +674,134 @@ class LighterWebSocket:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("market_stats callback raised: %s", exc)
 
+    async def _on_trade(
+        self,
+        data: Dict[str, Any],
+        channel: str,
+    ) -> None:
+        """Parse a ``trade/{mi}`` payload into per-market tape.
+
+        Lighter's WS protocol delivers trades as a list under the
+        ``trades`` key (subscribed-snapshot has the same shape as a
+        live update — both go through this parser). Expected per-
+        trade keys (from the SDK ``Trade`` model):
+
+        * ``market_id`` — int (also recoverable from the channel name)
+        * ``size`` — string base-asset amount
+        * ``price`` — string
+        * ``usd_amount`` — string USDC notional
+        * ``timestamp`` — int ms (or sec — we normalize)
+        * ``is_maker_ask`` — bool. ``True`` ⇒ maker was the ask, so the
+          taker bought (a "buy" trade for tape direction). ``False`` ⇒
+          maker was the bid, so the taker sold.
+        * ``type`` — "trade" / "liquidation" / "deleverage" /
+          "market-settlement". Non-trade types are kept for adverse-
+          selection analysis but tagged.
+
+        Defensive: if the payload shape diverges from expectations we
+        skip individual entries rather than failing the message.
+        """
+        # Resolve market_index — prefer payload, fall back to channel
+        # tail for partial messages.
+        mi: Optional[int] = None
+        for key in ("market_id", "market_index"):
+            if key in data:
+                try:
+                    mi = int(data[key])
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if mi is None and channel:
+            try:
+                mi = int(channel.rsplit("/", 1)[-1])
+            except (ValueError, IndexError):
+                mi = None
+
+        trades_raw = data.get("trades")
+        if not isinstance(trades_raw, list):
+            return
+        if mi is None:
+            return
+
+        bucket = self._recent_trades_by_market.setdefault(mi, [])
+        cutoff_ms = int(time.time() * 1000) - _TRADE_RETENTION_MS
+
+        new_records: List[Dict[str, Any]] = []
+        for t in trades_raw:
+            rec = _normalize_trade(t, mi)
+            if rec is None:
+                continue
+            new_records.append(rec)
+
+        if new_records:
+            bucket.extend(new_records)
+
+        # Prune in-place: anything older than retention window goes.
+        # Lighter delivers in mostly-sorted order; we still scan
+        # because liquidations and replays can arrive out-of-order.
+        if bucket and bucket[0].get("ts_ms", 0) < cutoff_ms:
+            self._recent_trades_by_market[mi] = [
+                r for r in bucket if r.get("ts_ms", 0) >= cutoff_ms
+            ]
+
+        # Fan out new records (not the whole tape) to subscribers.
+        for cb in self._trade_callbacks:
+            for rec in new_records:
+                try:
+                    result = cb(mi, rec)
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("trade callback raised: %s", exc)
+
+    def _maybe_record_latency(
+        self,
+        data: Dict[str, Any],
+        local_ts_ms: int,
+    ) -> None:
+        """Sample server→local latency from any ``update/*`` payload.
+
+        Lighter timestamps are inconsistent across channels — we look
+        in a few well-known locations and skip the message if no
+        plausible timestamp is present. Server values that look like
+        seconds (10-digit) are scaled up to ms.
+        """
+        candidate: Any = None
+        for key in ("server_ts_ms", "server_ts", "timestamp", "transaction_time"):
+            if key in data:
+                candidate = data[key]
+                break
+        if candidate is None:
+            # Sometimes the timestamp is nested inside the payload
+            # body (e.g. market_stats.timestamp).
+            for body_key in ("market_stats", "trade", "trades"):
+                body = data.get(body_key)
+                if isinstance(body, dict):
+                    for key in ("timestamp", "transaction_time"):
+                        if key in body:
+                            candidate = body[key]
+                            break
+                if candidate is not None:
+                    break
+        if candidate is None:
+            return
+        try:
+            server_ts = int(candidate)
+        except (TypeError, ValueError):
+            return
+        # Coerce sec → ms when value looks too small to be a 2024+ ms
+        # epoch (≈ 1.7e12). Anything below 1e12 is almost certainly
+        # seconds; below 1e9 we ignore as garbage.
+        if server_ts < 1_000_000_000:
+            return
+        if server_ts < 1_000_000_000_000:
+            server_ts *= 1000
+        # Reject obvious clock-skew or future timestamps (>30s in the
+        # future) so they don't pollute the percentile distribution.
+        if server_ts - local_ts_ms > 30_000:
+            return
+        self._latency_samples.append((server_ts, local_ts_ms))
+
     async def _on_order_book(self, ob: Any, channel: str) -> None:
         """Parse an order_book payload and fan out to callbacks."""
         if not isinstance(ob, dict):
@@ -574,6 +851,62 @@ class LighterWebSocket:
                     await result
             except Exception as exc:  # noqa: BLE001
                 logger.warning("orderbook callback raised: %s", exc)
+
+
+def _normalize_trade(
+    raw: Any,
+    market_index: int,
+) -> Optional[Dict[str, Any]]:
+    """Best-effort normalize a single Lighter trade record.
+
+    Returns ``None`` if the record is missing essentials (price/size).
+    Side detection uses ``is_maker_ask`` per the SDK ``Trade`` model.
+    Falls back to ``side`` / ``taker_side`` if present (defensive
+    against payload shape drift).
+    """
+    if not isinstance(raw, dict):
+        return None
+    price = _safe_decimal(raw.get("price"))
+    size = _safe_decimal(raw.get("size") or raw.get("base_amount"))
+    if price is None or size is None or price <= 0 or size <= 0:
+        return None
+
+    usd = _safe_decimal(raw.get("usd_amount"))
+    if usd is None:
+        usd = price * size
+
+    # ts_ms — Lighter mostly returns ms-epoch ints. Coerce sec → ms.
+    ts_raw: Any = (
+        raw.get("timestamp")
+        or raw.get("transaction_time")
+        or raw.get("ts_ms")
+    )
+    try:
+        ts = int(ts_raw) if ts_raw is not None else int(time.time() * 1000)
+    except (TypeError, ValueError):
+        ts = int(time.time() * 1000)
+    if 0 < ts < 1_000_000_000_000:
+        ts *= 1000
+
+    # Side: True ⇒ taker bought (lifted the ask).
+    side: Optional[str] = None
+    if "is_maker_ask" in raw:
+        side = "buy" if bool(raw["is_maker_ask"]) else "sell"
+    elif raw.get("side") in ("buy", "sell"):
+        side = raw["side"]
+    elif raw.get("taker_side") in ("buy", "sell"):
+        side = raw["taker_side"]
+
+    return {
+        "market_index": int(raw.get("market_id", market_index)),
+        "ts_ms": ts,
+        "price": price,
+        "size": size,
+        "usd_amount": usd,
+        "side": side,
+        "type": str(raw.get("type", "trade")),
+        "trade_id": raw.get("trade_id"),
+    }
 
 
 def _parse_levels(levels: Any) -> List[Tuple[Decimal, Decimal]]:
