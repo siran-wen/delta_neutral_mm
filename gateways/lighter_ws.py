@@ -87,6 +87,11 @@ _TESTNET_WS_URL = "wss://testnet.zklighter.elliot.ai/stream"
 OrderbookCallback = Callable[[int, Dict[str, Any]], Union[None, Awaitable[None]]]
 MarketStatsCallback = Callable[[int, Dict[str, Any]], Union[None, Awaitable[None]]]
 TradeCallback = Callable[[int, Dict[str, Any]], Union[None, Awaitable[None]]]
+# Account callback receives the entire raw msg dict (channel + type + payload).
+# Lighter's ``account_all/<idx>`` channel pushes the full account snapshot
+# (positions + orders + balances) on every update; downstream consumers
+# (LighterOrderManager) parse the relevant slice themselves.
+AccountCallback = Callable[[Dict[str, Any]], Union[None, Awaitable[None]]]
 
 _SUBSCRIBE_BATCH_SIZE = 10
 _SUBSCRIBE_BATCH_DELAY_SEC = 0.1
@@ -172,6 +177,10 @@ class LighterWebSocket:
         self._orderbook_callbacks: List[OrderbookCallback] = []
         self._market_stats_callbacks: List[MarketStatsCallback] = []
         self._trade_callbacks: List[TradeCallback] = []
+        self._account_callbacks: List[AccountCallback] = []
+        # Account indices we've been asked to follow. Re-sent on every
+        # reconnect so the order-manager keeps seeing fills across drops.
+        self._subscribed_accounts: set = set()
 
         # Trade tape: per-market rolling list of recent trades. Each
         # element is a dict with the fields produced by ``_on_trade``.
@@ -444,6 +453,39 @@ class LighterWebSocket:
     def register_trade_callback(self, cb: TradeCallback) -> None:
         self._trade_callbacks.append(cb)
 
+    def register_account_callback(self, cb: AccountCallback) -> None:
+        """Register a callback to receive ``account_all/<idx>`` ws msgs.
+
+        Multiple callbacks are supported. The callback receives the
+        full ws message dict (with ``type`` / ``channel`` / payload);
+        consumers like ``LighterOrderManager.on_account_event`` walk
+        the payload themselves.
+        """
+        self._account_callbacks.append(cb)
+
+    async def subscribe_account(self, account_index: int) -> None:
+        """Subscribe to ``account_all/<account_index>`` push updates.
+
+        Idempotent: a repeated call for the same index is a no-op
+        beyond keeping the index in ``_subscribed_accounts`` (which
+        ``_run_loop`` re-sends on every reconnect). If the WS isn't
+        live yet, the index is just remembered — the next connect
+        will replay it.
+        """
+        idx = int(account_index)
+        if idx in self._subscribed_accounts:
+            return
+        self._subscribed_accounts.add(idx)
+        if self._direct_ws is None:
+            return
+        try:
+            await self._direct_ws.send(
+                json.dumps({"type": "subscribe", "channel": f"account_all/{idx}"})
+            )
+            logger.info("Subscribed to account_all/%d", idx)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("subscribe_account send failed (idx=%d): %s", idx, exc)
+
     def get_recent_trades(
         self,
         market_index: int,
@@ -551,6 +593,11 @@ class LighterWebSocket:
                     )
                     # Subscribe in batches
                     await self._send_subscriptions(self._market_indices)
+                    # Re-send any account subscriptions the caller asked
+                    # for before the (re)connect — keeps order-manager
+                    # fed across drops without the caller re-driving it.
+                    if self._subscribed_accounts:
+                        await self._send_account_subscriptions()
 
                     # Start (or restart) the client-initiated keep-alive
                     # task so we stay well under the ~117s server timeout.
@@ -699,6 +746,24 @@ class LighterWebSocket:
                 await asyncio.sleep(_SUBSCRIBE_BATCH_DELAY_SEC)
         logger.info("Subscriptions sent: ok=%d fail=%d", sent_ok, sent_fail)
 
+    async def _send_account_subscriptions(self) -> None:
+        """Re-issue every ``account_all/<idx>`` subscribe on the live socket.
+
+        Called after each (re)connect so the order-manager keeps
+        receiving fills/cancellations even after a transient drop.
+        """
+        if self._direct_ws is None:
+            return
+        for idx in sorted(self._subscribed_accounts):
+            try:
+                await self._direct_ws.send(
+                    json.dumps({"type": "subscribe", "channel": f"account_all/{idx}"})
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "account_all subscribe re-send failed (idx=%d): %s", idx, exc
+                )
+
     # --------------------------------------------------------------
     # message routing
     # --------------------------------------------------------------
@@ -762,6 +827,15 @@ class LighterWebSocket:
             await self._on_trade(data, channel)
             return
 
+        # account_all: full account snapshot (positions + orders + balances).
+        # We forward the raw msg dict to every registered AccountCallback
+        # so downstream parsers (LighterOrderManager.on_account_event) can
+        # walk it without us second-guessing the wire shape.
+        if msg_type in ("subscribed/account_all", "update/account_all"):
+            self._subscription_confirmations.add(channel or msg_type)
+            await self._on_account_update(data)
+            return
+
         # Server may emit an "error" for unknown channels. We treat
         # the trade channel specifically as best-effort: log once and
         # continue so market_stats keeps working.
@@ -798,6 +872,23 @@ class LighterWebSocket:
 
         # Unknown message — log at debug only to keep noise low
         logger.debug("Unhandled WS msg_type=%s channel=%s", msg_type, channel)
+
+    async def _on_account_update(self, data: Dict[str, Any]) -> None:
+        """Fan out an ``account_all`` message to every registered callback.
+
+        Callbacks see the full raw dict — payload shape is left to the
+        consumer (e.g. LighterOrderManager) so wire-format drift only
+        breaks the consumer's parser, not this dispatcher. Each
+        callback runs in its own try/except so one buggy subscriber
+        can't poison the others.
+        """
+        for cb in self._account_callbacks:
+            try:
+                result = cb(data)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("account_all callback raised: %s", exc)
 
     async def _on_market_stats(self, stats: Dict[str, Any]) -> None:
         market_id = stats.get("market_id")

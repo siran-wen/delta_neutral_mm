@@ -1,0 +1,689 @@
+"""LppQuoter — Phase 1.1 batch 3 part 2 main loop.
+
+Stitches together the five components built in earlier batches::
+
+    LighterWsClient + LighterGateway   → market data (mark + REST book)
+                                          ↓
+                                   plan_quotes()           (decision)
+                                          ↓
+                                   diff_quotes()           (delta)
+                                          ↓
+                              LighterOrderManager          (execution)
+                                          ↓
+                              LppStateTracker              (audit / reward)
+
+This module owns the once-per-second tick loop, decides whether to
+reprice (mid drift / session change / fill / interval-floor), gates
+the SDK call rate via the order manager's semaphore, and triggers an
+emergency cancel-all on consecutive rejects or ws silence.
+
+What's *not* here
+-----------------
+* No live entry script — that's batch 3 part 3. The unit tests below
+  drive ``run_until`` against fully-mocked dependencies; a runnable
+  CLI lives next to ``scripts/run_lighter_paper.py`` once we wire
+  this class to a real gateway.
+* No paper mode — ``scripts/run_lighter_paper.py`` already plays
+  that role using ``PaperSimulator`` instead of ``LighterOrderManager``.
+
+Reprice priority (high → low)
+-----------------------------
+1. Session change (e.g. KR_OVERNIGHT → KR_BEFORE_OPEN) — overrides
+   the min-interval floor; size/distance changes immediately.
+2. Pending fill signal — overrides the floor; inventory just shifted
+   so the skew side needs adjusting now.
+3. Min-interval floor (default 60s) — silently drop drift triggers
+   that come too close to the previous reprice. Keeps churn down.
+4. Mid drift ≥ ``reprice_drift_bp`` (default 8bp, calibrated from
+   24h SKHYNIX data — 5bp triggered 36% of ticks).
+5. ``last_mid is None`` (first tick) — always plan once on startup.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
+
+from execution.lighter.lighter_order_manager import (
+    LighterOrderManager,
+    ManagedOrder,
+)
+from observe.depth_aggregation import aggregate_depth_by_spread_bp
+from strategy.lpp_state_tracker import LppStateTracker
+from strategy.quote_diff import diff_quotes
+from strategy.quote_planner import plan_quotes
+from strategy.session_aware import get_kr_equity_session
+from strategy.types import InventoryState, MarketSnapshot, Quote, SessionPolicy
+
+logger = logging.getLogger(__name__)
+
+
+# ----- defaults ----------------------------------------------------------
+
+# Spread tiers fed to ``aggregate_depth_by_spread_bp``. Must include
+# every tier that ``plan_quotes`` / ``LppStateTracker`` might index
+# into for KR weekday and weekend sessions (15/25/50 weekday,
+# 50/100/200 weekend).
+DEFAULT_DEPTH_TIERS_BP: Tuple[Decimal, ...] = tuple(
+    Decimal(s) for s in ("5", "10", "15", "25", "50", "100", "200")
+)
+
+QUOTER_DEFAULTS: Dict[str, Any] = {
+    # Inventory management
+    "target_max_delta_usdc": Decimal("500"),
+    "skew_max_offset_bp": Decimal("5"),
+    "hard_position_cap_usdc": Decimal("1000"),
+    # Market state guards
+    "min_market_spread_bp": Decimal("3"),
+    "max_market_spread_bp": Decimal("100"),
+    # Share warn
+    "share_warn_threshold": Decimal("0.95"),
+    "share_warn_widen_bp": Decimal("5"),
+    # Reprice control (calibrated from 24h SKHYNIX observation data)
+    "reprice_drift_bp": Decimal("8"),
+    "reprice_min_interval_sec": Decimal("60"),
+    # Tick / snapshot cadence
+    "tick_interval_sec": Decimal("1"),
+    "snapshot_interval_sec": Decimal("60"),
+    # diff_quotes tolerance — same as paper trading defaults
+    "price_tolerance_bp": Decimal("0.5"),
+    "size_tolerance_pct": Decimal("0.05"),
+    # Emergency stop
+    "emergency_stop_on_consecutive_reject_count": 5,
+    "emergency_stop_on_ws_disconnect_sec": 300,
+}
+
+
+def merge_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Shallow merge user overrides onto ``QUOTER_DEFAULTS``."""
+    cfg = dict(QUOTER_DEFAULTS)
+    if overrides:
+        cfg.update(overrides)
+    return cfg
+
+
+# ----- helpers -----------------------------------------------------------
+
+
+def _coerce_int_keyed_depth(
+    depth_str_keyed: Dict[str, Dict[str, Decimal]],
+) -> Dict[int, Dict[str, Decimal]]:
+    """``aggregate_depth_by_spread_bp`` returns string keys; the
+    strategy contract expects int keys. Same helper as in
+    ``run_lighter_paper.py`` — kept private here to avoid coupling
+    the quoter to a script module."""
+    out: Dict[int, Dict[str, Decimal]] = {}
+    for k, v in depth_str_keyed.items():
+        try:
+            out[int(Decimal(str(k)))] = v
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def _adapt_managed_order(o: ManagedOrder) -> Dict[str, Any]:
+    """Translate ``ManagedOrder`` into the dict shape ``diff_quotes`` expects.
+
+    ``diff_quotes`` was authored for the paper simulator's
+    ``active_orders.values()`` shape (``client_order_id`` / ``side`` /
+    ``price`` / ``size_base``). The order manager uses
+    ``client_order_index`` instead — adapt here so the upstream
+    contract stays untouched.
+    """
+    return {
+        "client_order_id": o.client_order_index,
+        "side": o.side,
+        "price": o.price,
+        "size_base": o.size_base,
+    }
+
+
+# ----- the quoter --------------------------------------------------------
+
+
+class LppQuoter:
+    """Async main-loop class that drives plan_quotes against live Lighter.
+
+    Lifecycle: ``__init__`` → ``await start()`` → ``await run_until(end)``
+    → ``await shutdown()``. ``shutdown`` is also called automatically
+    on emergency-stop conditions and is safe to invoke a second time.
+    """
+
+    def __init__(
+        self,
+        gateway: Any,
+        ws: Any,
+        order_manager: LighterOrderManager,
+        tracker: LppStateTracker,
+        symbol: str,
+        market_index: int,
+        price_decimals: int,
+        size_decimals: int,
+        account_index: int,
+        config: Optional[Dict[str, Any]] = None,
+    ):
+        self._gateway = gateway
+        self._ws = ws
+        self._om = order_manager
+        self._tracker = tracker
+
+        self._symbol = symbol
+        self._market_index = int(market_index)
+        self._price_decimals = int(price_decimals)
+        self._size_decimals = int(size_decimals)
+        self._account_index = int(account_index)
+
+        self.config = merge_config(config)
+
+        self._started: bool = False
+        self._stopping: bool = False
+        self._closed: bool = False
+
+        # Per-session counters surfaced via ``get_summary``.
+        self._stats: Dict[str, Any] = {
+            "tick_count": 0,
+            "skipped_tick_count": 0,
+            "reprice_count": 0,
+            "last_reprice_reason": None,
+            "last_reprice_ts_ms": None,
+            "consecutive_rejects": 0,
+            "emergency_stops": 0,
+            "snapshots_taken": 0,
+            "session_start_ts_ms": None,
+            "session_end_ts_ms": None,
+        }
+
+    # ------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Wire the ws → om callback, subscribe account_all, start om.
+
+        ``market_stats`` and ``trade`` are assumed to have been
+        subscribed already (caller's ``ws.connect([market_index])``
+        does this for us). We only attach the account_all path here
+        so we don't double-subscribe market channels on quoter
+        restart.
+        """
+        if self._started:
+            return
+        # Route every account_all msg into the order manager's parser.
+        if hasattr(self._ws, "register_account_callback"):
+            self._ws.register_account_callback(self._om.on_account_event)
+        else:
+            logger.warning(
+                "ws has no register_account_callback — order updates won't reach OM"
+            )
+        if hasattr(self._ws, "subscribe_account"):
+            await self._ws.subscribe_account(self._account_index)
+        else:
+            logger.warning(
+                "ws has no subscribe_account — running without account_all stream"
+            )
+        await self._om.start()
+        self._started = True
+        self._stats["session_start_ts_ms"] = int(time.time() * 1000)
+        logger.info(
+            "LppQuoter started (symbol=%s, market_index=%d, account_index=%d)",
+            self._symbol,
+            self._market_index,
+            self._account_index,
+        )
+
+    async def shutdown(self) -> None:
+        """Idempotent graceful shutdown.
+
+        1. ``_stopping = True`` so any in-flight ``run_until`` exits
+           after its current tick.
+        2. ``om.cancel_all`` — fire all cancel txs.
+        3. Wait up to 10s for ws confirmations to drain ``_active``.
+        4. Take the final tracker snapshot via ``get_session_summary``
+           and log it.
+        5. ``om.close`` (its inner cancel_all is a no-op since we
+           already drained).
+        """
+        if self._closed:
+            return
+        self._stopping = True
+        self._stats["session_end_ts_ms"] = int(time.time() * 1000)
+
+        try:
+            await self._om.cancel_all()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("om.cancel_all during shutdown raised: %s", exc)
+
+        # Wait for ws confirmations to drain _active. 10s is generous —
+        # under normal conditions the cancellation push lands sub-second.
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if not self._om.get_active_orders():
+                break
+            await asyncio.sleep(0.5)
+        leftover = len(self._om.get_active_orders())
+        if leftover > 0:
+            logger.warning(
+                "Shutdown: %d orders never confirmed cancelled within deadline",
+                leftover,
+            )
+
+        # Final summary.
+        try:
+            summary = self._tracker.get_session_summary(
+                session_start_ms=self._stats["session_start_ts_ms"] or 0,
+                session_end_ms=self._stats["session_end_ts_ms"] or int(time.time() * 1000),
+                symbol=self._symbol,
+            )
+            logger.info("Final tracker summary: %s", summary)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Final tracker summary failed: %s", exc)
+
+        try:
+            await self._om.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("om.close during shutdown raised: %s", exc)
+
+        self._closed = True
+        self._started = False
+
+    # ------------------------------------------------------------
+    # main loop
+    # ------------------------------------------------------------
+
+    async def run_until(self, end_ts: float) -> None:
+        """Drive the tick loop until ``end_ts`` (unix seconds).
+
+        Single-tick exceptions are caught and logged so a transient
+        error never drops the whole run. ``asyncio.CancelledError``
+        is allowed to propagate so a parent task can stop the quoter.
+        """
+        last_reprice_ts: float = 0.0
+        last_snapshot_ts: float = 0.0
+        last_session_name: Optional[str] = None
+        last_mid_for_drift: Optional[Decimal] = None
+
+        tick_interval = float(self.config["tick_interval_sec"])
+
+        while not self._stopping and time.time() < end_ts:
+            tick_start = time.time()
+            self._stats["tick_count"] += 1
+
+            try:
+                # Emergency stop check — runs first so a disconnect or
+                # reject storm shuts us down before another reprice
+                # piles on more failures.
+                if self._should_emergency_stop():
+                    self._stats["emergency_stops"] += 1
+                    logger.error(
+                        "Emergency stop: consecutive_rejects=%d ws_silent=%s",
+                        self._stats["consecutive_rejects"],
+                        self._ws_silence_sec(),
+                    )
+                    break
+
+                market = await self._build_market_snapshot()
+                if market is None:
+                    self._stats["skipped_tick_count"] += 1
+                    await self._sleep_to_next_tick(tick_start, tick_interval)
+                    continue
+
+                session = get_kr_equity_session(datetime.now(timezone.utc))
+                session_changed = (
+                    last_session_name is not None
+                    and session.name != last_session_name
+                )
+
+                pending_fill = self._om.pop_fill_signal()
+
+                reason = self._should_reprice(
+                    last_mid=last_mid_for_drift,
+                    new_mid=market.mid,
+                    session_changed=session_changed,
+                    has_pending_fill=pending_fill,
+                    last_reprice_ts=last_reprice_ts,
+                    now_ts=tick_start,
+                )
+
+                if reason is not None:
+                    await self._execute_reprice(market, session, reason)
+                    last_reprice_ts = tick_start
+                    last_mid_for_drift = market.mid
+
+                last_session_name = session.name
+
+                # Tracker snapshot on snapshot_interval. Independent of
+                # reprice cadence so the LPP audit trail is continuous.
+                snap_interval = float(self.config["snapshot_interval_sec"])
+                if tick_start - last_snapshot_ts >= snap_interval:
+                    await self._record_snapshot(market, session)
+                    last_snapshot_ts = tick_start
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Tick error: %s", exc, exc_info=True)
+
+            await self._sleep_to_next_tick(tick_start, tick_interval)
+
+    async def _sleep_to_next_tick(self, tick_start: float, tick_interval: float) -> None:
+        elapsed = time.time() - tick_start
+        remaining = tick_interval - elapsed
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+    # ------------------------------------------------------------
+    # reprice decision
+    # ------------------------------------------------------------
+
+    def _should_reprice(
+        self,
+        last_mid: Optional[Decimal],
+        new_mid: Decimal,
+        session_changed: bool,
+        has_pending_fill: bool,
+        last_reprice_ts: float,
+        now_ts: float,
+    ) -> Optional[str]:
+        """Return a reason string when reprice should fire, ``None`` otherwise.
+
+        Priority is documented in the module docstring. Implementing
+        each branch as an explicit early-return makes the priority
+        legible at the call site.
+        """
+        if session_changed:
+            return "session_change"
+        if has_pending_fill:
+            return "fill"
+
+        # Min-interval floor. ``last_reprice_ts == 0`` is the "never
+        # repriced yet" sentinel; the floor only kicks in after the
+        # first reprice has fired.
+        if last_reprice_ts > 0:
+            interval = now_ts - last_reprice_ts
+            if interval < float(self.config["reprice_min_interval_sec"]):
+                return None
+
+        if last_mid is None:
+            return "initial"
+
+        if last_mid <= 0:
+            # Defensive — last_mid invariant says it's positive once
+            # set, but a degenerate market snapshot earlier in the
+            # session shouldn't strand us forever.
+            return "initial"
+
+        drift_bp = abs(new_mid - last_mid) / last_mid * Decimal(10000)
+        threshold = self.config["reprice_drift_bp"]
+        if drift_bp >= threshold:
+            return f"mid_drift({drift_bp:.1f}bp)"
+
+        return None
+
+    # ------------------------------------------------------------
+    # reprice execution
+    # ------------------------------------------------------------
+
+    async def _execute_reprice(
+        self,
+        market: MarketSnapshot,
+        session: SessionPolicy,
+        reason: str,
+    ) -> None:
+        """Compute the desired quote set, diff against active, fire SDK calls."""
+        inventory = self._om.get_inventory(mark_price=market.mid)
+
+        desired = plan_quotes(
+            market=market,
+            session=session,
+            inventory=inventory,
+            config=self.config,
+        )
+
+        active = self._om.get_active_orders()
+        cancels, places = diff_quotes(
+            desired=desired,
+            active=[_adapt_managed_order(o) for o in active],
+            price_tolerance_bp=self.config["price_tolerance_bp"],
+            size_tolerance_pct=self.config["size_tolerance_pct"],
+        )
+
+        # Fan the cancels first (lighter on the SDK) so the place's
+        # client-order-id space stays clean if a place lands on the
+        # same tier as a cancel.
+        cancel_results: List[Any] = []
+        if cancels:
+            cancel_results = await asyncio.gather(
+                *(self._om.cancel_order(coid) for coid in cancels),
+                return_exceptions=True,
+            )
+
+        place_results: List[Any] = []
+        if places:
+            place_results = await asyncio.gather(
+                *(
+                    self._om.submit_order(
+                        side=q.side,
+                        market_index=market.market_index,
+                        price=q.price,
+                        size_base=q.size_base,
+                        price_decimals=market.price_decimals,
+                        size_decimals=market.size_decimals,
+                        order_type="limit",
+                        time_in_force="post_only",
+                    )
+                    for q in places
+                ),
+                return_exceptions=True,
+            )
+
+        success_cancels = sum(1 for r in cancel_results if r is True)
+        # ``om.submit_order`` records SDK errors on the ManagedOrder
+        # (status="rejected") rather than raising — so a returned
+        # ``client_order_index`` doesn't on its own prove the place
+        # was accepted. Cross-check the OM state.
+        fail_places = 0
+        for r in place_results:
+            if isinstance(r, BaseException):
+                fail_places += 1
+                continue
+            state = self._om.get_order_state(r)
+            if state is not None and state.status == "rejected":
+                fail_places += 1
+        success_places = len(place_results) - fail_places
+
+        # Track consecutive rejects for emergency-stop. A clean reprice
+        # (no place failures) resets the counter.
+        if fail_places > 0:
+            self._stats["consecutive_rejects"] += fail_places
+        else:
+            self._stats["consecutive_rejects"] = 0
+
+        self._stats["reprice_count"] += 1
+        self._stats["last_reprice_reason"] = reason
+        self._stats["last_reprice_ts_ms"] = int(time.time() * 1000)
+
+        logger.info(
+            "reprice: reason=%s desired=%d cancels=%d/%d places=%d/%d (fail=%d)",
+            reason,
+            len(desired),
+            success_cancels,
+            len(cancels),
+            success_places,
+            len(places),
+            fail_places,
+        )
+
+    # ------------------------------------------------------------
+    # emergency stop
+    # ------------------------------------------------------------
+
+    def _should_emergency_stop(self) -> bool:
+        """True iff any kill condition fires.
+
+        Conditions:
+        1. Consecutive place rejects ≥ ``emergency_stop_on_consecutive_reject_count``
+        2. WS msg gap (any channel) > ``emergency_stop_on_ws_disconnect_sec``
+        """
+        threshold_rejects = int(
+            self.config["emergency_stop_on_consecutive_reject_count"]
+        )
+        if self._stats["consecutive_rejects"] >= threshold_rejects:
+            return True
+
+        gap = self._ws_silence_sec()
+        if gap is not None:
+            threshold_gap = float(
+                self.config["emergency_stop_on_ws_disconnect_sec"]
+            )
+            if gap > threshold_gap:
+                return True
+
+        return False
+
+    def _ws_silence_sec(self) -> Optional[float]:
+        """Seconds since the last inbound ws msg, or None if unknown."""
+        if not hasattr(self._ws, "get_message_stats"):
+            return None
+        try:
+            stats = self._ws.get_message_stats()
+        except Exception:  # noqa: BLE001
+            return None
+        last_ms = stats.get("last_msg_ts_ms_global")
+        if not last_ms:
+            return None
+        return (time.time() * 1000 - last_ms) / 1000.0
+
+    # ------------------------------------------------------------
+    # market snapshot
+    # ------------------------------------------------------------
+
+    async def _build_market_snapshot(self) -> Optional[MarketSnapshot]:
+        """Pull REST depth + WS mark and assemble a ``MarketSnapshot``.
+
+        Returns ``None`` on degenerate input (empty book, zero mid,
+        crossed BBO) so the main loop skips the tick rather than
+        feeding garbage into the planner.
+        """
+        try:
+            book = await self._gateway.get_orderbook(self._symbol, limit=20)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("get_orderbook failed: %s", exc)
+            return None
+        if book is None:
+            return None
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        if not bids or not asks:
+            return None
+        best_bid = bids[0][0]
+        best_ask = asks[0][0]
+        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+            return None
+
+        rest_mid = (best_bid + best_ask) / Decimal(2)
+
+        ws_mid: Optional[Decimal] = None
+        mark_price: Optional[Decimal] = None
+        index_price: Optional[Decimal] = None
+        if hasattr(self._ws, "get_latest_mid"):
+            ws_mid = self._ws.get_latest_mid(self._market_index)
+        if hasattr(self._ws, "get_market_stats"):
+            ms = self._ws.get_market_stats(self._market_index) or {}
+            mark_price = ms.get("mark_price")
+            index_price = ms.get("index_price")
+
+        mid = mark_price or index_price or ws_mid or rest_mid
+        if mid is None or mid <= 0:
+            return None
+
+        spread_bp = (best_ask - best_bid) / mid * Decimal(10000)
+        depth_str = aggregate_depth_by_spread_bp(
+            bids, asks, rest_mid, DEFAULT_DEPTH_TIERS_BP
+        )
+        depth_int = _coerce_int_keyed_depth(depth_str)
+
+        return MarketSnapshot(
+            symbol=self._symbol,
+            market_index=self._market_index,
+            mid=mid,
+            mark_price=mark_price,
+            index_price=index_price,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            spread_bp=spread_bp,
+            depth_by_spread_bp=depth_int,
+            price_decimals=self._price_decimals,
+            size_decimals=self._size_decimals,
+            ts_ms=int(time.time() * 1000),
+        )
+
+    # ------------------------------------------------------------
+    # snapshot
+    # ------------------------------------------------------------
+
+    async def _record_snapshot(
+        self,
+        market: MarketSnapshot,
+        session: SessionPolicy,
+    ) -> None:
+        """Push one snapshot to the LPP state tracker.
+
+        We re-plan to populate ``my_quotes`` with the current desired
+        set rather than reading the OM's active set directly. The
+        tracker cares about *what we wanted* at this instant, which
+        is what the share computation should reflect — even if some
+        orders are still in flight on the SDK side.
+        """
+        inventory = self._om.get_inventory(mark_price=market.mid)
+        desired = plan_quotes(
+            market=market,
+            session=session,
+            inventory=inventory,
+            config=self.config,
+        )
+        try:
+            await self._tracker.record_snapshot(
+                ts_ms=market.ts_ms,
+                market=market,
+                my_quotes=desired,
+                inventory=inventory,
+                session=session,
+            )
+            self._stats["snapshots_taken"] += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tracker.record_snapshot raised: %s", exc)
+
+    # ------------------------------------------------------------
+    # public introspection
+    # ------------------------------------------------------------
+
+    def get_inventory(self) -> InventoryState:
+        """Convenience pass-through (no mark price → uses avg entry)."""
+        return self._om.get_inventory()
+
+    def get_active_quotes_count(self) -> int:
+        return len(self._om.get_active_orders())
+
+    def get_summary(self) -> Dict[str, Any]:
+        """Aggregated quoter + om stats for end-of-session logging."""
+        om_stats = self._om.get_stats()
+        return {
+            "symbol": self._symbol,
+            "market_index": self._market_index,
+            "tick_count": self._stats["tick_count"],
+            "skipped_tick_count": self._stats["skipped_tick_count"],
+            "reprice_count": self._stats["reprice_count"],
+            "last_reprice_reason": self._stats["last_reprice_reason"],
+            "last_reprice_ts_ms": self._stats["last_reprice_ts_ms"],
+            "consecutive_rejects": self._stats["consecutive_rejects"],
+            "emergency_stops": self._stats["emergency_stops"],
+            "snapshots_taken": self._stats["snapshots_taken"],
+            "session_start_ts_ms": self._stats["session_start_ts_ms"],
+            "session_end_ts_ms": self._stats["session_end_ts_ms"],
+            "om": om_stats,
+        }
