@@ -1,0 +1,34 @@
+# Lighter LPP weekly pool allocation.
+#
+# Updated manually each Monday from the LPP spreadsheet — no automation
+# pulls this. The amounts are weekly USDC pool sizes per market (the
+# total reward Lighter pays out across all LPs for a week of quoting on
+# that market). The strategy's estimated reward = pool * window_share *
+# our_weighted_share.
+#
+# Last updated: 2026-04-27
+# Source: Lighter LPP spreadsheet (link in team docs)
+#
+# Cap-table values (per-tier rewardable depth ceilings) live in
+# ``strategy/lpp_state_tracker._CAP_TABLE`` because they shape the
+# share computation directly. If the spreadsheet changes those, edit
+# the module — not this file.
+lpp_pool:
+  SKHYNIXUSD: 12269
+  SAMSUNGUSD: 12269
+  HYUNDAIUSD: 12269
+  # Other RWA / commodities markets we may quote
+  BRENTOIL: 38343
+  WTI: 38343
+  XAU: 23006
+  XAG: 23006
+
+# Weight applied to raw share by tier. Lighter's payout function
+# multiplies your in-tier share by this weight before summing across
+# tiers — L1 (closest to mid) is fully credited, L3 is heavily
+# discounted, OUT is unrewarded.
+tier_weights:
+  L1: 1.0
+  L2: 0.6
+  L3: 0.3
+  OUT: 0.0
