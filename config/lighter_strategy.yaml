@@ -1,0 +1,72 @@
+# Lighter LPP strategy runtime config.
+#
+# Loaded by ``scripts/run_lighter_strategy.py``. CLI flags
+# (``--market`` / ``--duration`` / ``--output-dir``) override the
+# ``strategy`` block below where they overlap; everything else (the
+# planner knobs, recovery thresholds, tracker hookup) comes from
+# this file.
+#
+# LPP weekly pool figures live separately in ``config/lpp_pool.yaml``;
+# this file stays scoped to per-run tuning so the pool numbers can
+# move on a different cadence.
+
+strategy:
+  # Default market — overridable by --market on the CLI.
+  market: SKHYNIXUSD
+  # Lighter on-chain id. Verify via:
+  #   python scripts/observe_lighter.py --probe-rwa
+  market_index: 161
+  price_decimals: 3
+  size_decimals: 3
+
+  # Inventory management
+  target_max_delta_usdc: "500"
+  skew_max_offset_bp: "5"
+  hard_position_cap_usdc: "1000"
+
+  # Market-state guards
+  min_market_spread_bp: "3"
+  max_market_spread_bp: "100"
+
+  # Share-warn (15h SKHYNIX data justified 0.95 over 0.8 — see
+  # `strategy/lpp_quoter.py` defaults docstring)
+  share_warn_threshold: "0.95"
+  share_warn_widen_bp: "5"
+
+  # Reprice control (24h calibration: 5bp triggered 36% of ticks,
+  # 8bp lands at ~12% — better churn/coverage trade-off)
+  reprice_drift_bp: "8"
+  reprice_min_interval_sec: "60"
+
+  # Tick / snapshot cadence
+  tick_interval_sec: "1"
+  snapshot_interval_sec: "60"
+
+  # diff_quotes tolerance — same as paper trading defaults
+  price_tolerance_bp: "0.5"
+  size_tolerance_pct: "0.05"
+
+  # Emergency stop
+  emergency_stop_on_consecutive_reject_count: 5
+  emergency_stop_on_ws_disconnect_sec: 300
+
+recovery:
+  # Cancel any orders found resting on the account at startup.
+  cancel_stale_orders: true
+  # Soft-warn threshold: a non-zero position with notional below this
+  # logs a warning but the strategy still starts (treats it as drift).
+  warn_if_existing_position_above_usdc: "100"
+  # Hard-abort threshold: at or above this notional we refuse to
+  # start, requiring manual flatten before re-running. Set to "0"
+  # to never abort.
+  abort_if_existing_position_above_usdc: "1000"
+  # How long to wait after sending stale-order cancels before
+  # starting the quoter — gives ws confirmations time to drain.
+  wait_after_cancel_sec: 5
+
+logging:
+  # Console verbosity (overridden by -v / -vv on the CLI).
+  level: INFO
+  # JSONL file pattern relative to --output-dir. ``{date}`` is
+  # interpolated to UTC YYYYMMDD at startup.
+  jsonl_filename: "strategy_{date}.jsonl"

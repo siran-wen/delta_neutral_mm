@@ -1,0 +1,707 @@
+"""Phase 1.1 batch 3 part 3 — strategy runner entry point.
+
+Two modes:
+
+* ``--paper`` (default): delegates to ``scripts/run_lighter_paper.py``'s
+  ``PaperRun`` so the same simulator + tracker pipeline that's been
+  shaken out for hours of read-only mainnet runs is what we use here.
+  No ``.env`` required.
+
+* ``--live --i-understand-this-is-real``: connects the real signer,
+  optionally cancels every stale order on the account
+  (``recover_initial_state``), starts ``LppQuoter`` against the live
+  ``LighterOrderManager``, and lets it quote until the duration
+  elapses or SIGINT arrives.
+
+Two safety locks on the live path:
+
+1. ``--live`` without ``--i-understand-this-is-real`` exits 2 before
+   any network connection.
+2. On a TTY, the runner blocks on ``YES I AGREE`` after summarising
+   the run (market, account index, duration, output). On a
+   non-interactive shell (systemd / pipe / CI) the prompt is
+   skipped — but ``--i-understand-this-is-real`` is still required.
+
+Recovery (live only)
+--------------------
+Before the quoter starts we pull the account's open orders on the
+target market and cancel each one through the SDK. We also pull the
+live position and:
+
+* Below ``recovery.warn_if_existing_position_above_usdc`` → log a
+  WARN and start the quoter from a 0-base inventory (treats the
+  residual as background drift).
+* At or above ``recovery.abort_if_existing_position_above_usdc`` →
+  log ERROR and abort. ``LighterOrderManager`` has no public
+  ``set_initial_inventory`` interface today, so we deliberately
+  don't try to inject a position the OM doesn't natively account
+  for — that would silently desynchronise the planner's skew/cap
+  logic. Set ``abort_if_existing_position_above_usdc: "0"`` in the
+  yaml to disable the abort if you accept the drift.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+# Project root + scripts dir on sys.path so we can import siblings
+# (run_lighter_paper.PaperRun) and project packages alike.
+_THIS = Path(__file__).resolve()
+_PROJECT_ROOT = _THIS.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+import yaml  # noqa: E402
+
+from execution.lighter.lighter_order_manager import LighterOrderManager  # noqa: E402
+from gateways.lighter_gateway import LighterGateway, LighterGatewayError  # noqa: E402
+from gateways.lighter_ws import LighterWebSocket  # noqa: E402
+from strategy.lpp_quoter import LppQuoter  # noqa: E402
+from strategy.lpp_state_tracker import LppStateTracker  # noqa: E402
+
+logger = logging.getLogger("strategy_run")
+
+
+# ----- argparse + confirmation -------------------------------------------
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description=(
+            "Lighter LPP strategy runner. Defaults to --paper mode "
+            "(no orders sent). --live requires --i-understand-this-is-real "
+            "and a TTY confirmation."
+        ),
+    )
+    p.add_argument(
+        "--market",
+        default=None,
+        help="Market symbol (e.g. SKHYNIXUSD). Falls back to config 'strategy.market'.",
+    )
+    p.add_argument(
+        "--duration",
+        type=float,
+        default=240.0,
+        help="Run duration in minutes. 0 = run forever (until SIGINT).",
+    )
+    p.add_argument(
+        "--config",
+        default="config/lighter_strategy.yaml",
+        help="Path to strategy yaml (default: config/lighter_strategy.yaml).",
+    )
+    p.add_argument(
+        "--output-dir",
+        default="logs/strategy",
+        help="Where to write JSONL output (default: logs/strategy).",
+    )
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--paper",
+        action="store_true",
+        help="Paper mode (default). Reuses the paper trading runner — no orders sent.",
+    )
+    mode.add_argument(
+        "--live",
+        action="store_true",
+        help="Live mode. Real orders against real collateral. Requires confirmation.",
+    )
+    p.add_argument(
+        "--i-understand-this-is-real",
+        dest="i_understand_this_is_real",
+        action="store_true",
+        help="Required with --live. Acknowledges real-money risk.",
+    )
+    p.add_argument(
+        "--no-recover",
+        action="store_true",
+        help="Skip startup inventory sync (cancel stale orders / position warn).",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for paper fill simulator (paper mode only).",
+    )
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="-v=INFO, -vv=DEBUG.",
+    )
+    return p
+
+
+def _confirm_live_mode(args: argparse.Namespace, account_index: Optional[str]) -> None:
+    """Block until the user types ``YES I AGREE`` on a TTY.
+
+    On non-TTY (systemd, piped stdin) the prompt is skipped — the
+    ``--i-understand-this-is-real`` flag is the only confirmation
+    available there. We've already validated that flag in the caller.
+    """
+    sys.stderr.write("\n=== LIVE TRADING MODE ===\n")
+    sys.stderr.write(f"market:        {args.market}\n")
+    sys.stderr.write(f"account_index: {account_index}\n")
+    duration_label = "forever (Ctrl-C to stop)" if args.duration == 0 else f"{args.duration} min"
+    sys.stderr.write(f"duration:      {duration_label}\n")
+    sys.stderr.write(f"output:        {args.output_dir}\n")
+    sys.stderr.write(f"recover:       {'NO' if args.no_recover else 'yes'}\n")
+    sys.stderr.write("\nThis will place REAL orders against REAL collateral.\n")
+    sys.stderr.flush()
+
+    if sys.stdin.isatty():
+        try:
+            response = input("Type 'YES I AGREE' to proceed: ").strip()
+        except EOFError:
+            response = ""
+        if response != "YES I AGREE":
+            sys.stderr.write("Aborted.\n")
+            sys.exit(2)
+    else:
+        sys.stderr.write(
+            "Non-interactive shell — proceeding without prompt.\n"
+        )
+
+
+def parse_and_confirm_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse argv, fail fast on invalid combos, run the live confirmation.
+
+    Pure-ish: everything that touches stdin/stderr happens through
+    ``_confirm_live_mode`` so unit tests can patch it.
+    """
+    args = _build_arg_parser().parse_args(argv)
+
+    # Default to paper if neither --paper nor --live is set.
+    if not args.live and not args.paper:
+        args.paper = True
+
+    if args.live and not args.i_understand_this_is_real:
+        sys.stderr.write(
+            "--live requires --i-understand-this-is-real to acknowledge real-money risk\n"
+        )
+        sys.exit(2)
+
+    if args.live:
+        # Surface the account_index from env so the prompt is concrete.
+        account_index = os.environ.get("LIGHTER_ACCOUNT_INDEX") or "<unset>"
+        _confirm_live_mode(args, account_index)
+
+    return args
+
+
+# ----- yaml + env loading ------------------------------------------------
+
+
+def _setup_logging(verbosity: int, jsonl_path: Path) -> logging.Logger:
+    level = logging.WARNING
+    if verbosity == 1:
+        level = logging.INFO
+    elif verbosity >= 2:
+        level = logging.DEBUG
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    return logging.getLogger("strategy_run")
+
+
+def _load_strategy_yaml(path: str) -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"strategy config not found: {path}")
+    with open(p, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    return raw
+
+
+def _coerce_decimal_fields(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert known Decimal-typed strategy fields from yaml str → Decimal.
+
+    Yaml stores numbers as float by default and strings as str; we
+    quote the numeric values in the yaml so they parse as str, then
+    coerce here. This avoids accidental Decimal/float type mismatches
+    in plan_quotes (which is strict about Decimal arithmetic).
+    """
+    decimal_keys = {
+        "target_max_delta_usdc", "skew_max_offset_bp", "hard_position_cap_usdc",
+        "min_market_spread_bp", "max_market_spread_bp",
+        "share_warn_threshold", "share_warn_widen_bp",
+        "reprice_drift_bp", "reprice_min_interval_sec",
+        "tick_interval_sec", "snapshot_interval_sec",
+        "price_tolerance_bp", "size_tolerance_pct",
+    }
+    out: Dict[str, Any] = dict(cfg)
+    for k in decimal_keys:
+        if k in out and not isinstance(out[k], Decimal):
+            out[k] = Decimal(str(out[k]))
+    return out
+
+
+def _load_lpp_pool_yaml() -> Dict[str, Any]:
+    pool_path = _PROJECT_ROOT / "config" / "lpp_pool.yaml"
+    if not pool_path.exists():
+        return {"lpp_pool": {}, "tier_weights": {}}
+    with open(pool_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+# ----- recover_initial_state --------------------------------------------
+
+
+async def recover_initial_state(
+    gateway: LighterGateway,
+    market_index: int,
+    symbol: str,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Cancel stale open orders on the target market + diagnose position.
+
+    Returns ``{
+        "cancelled_orders": list[int],
+        "cancel_failures": list[dict],
+        "existing_position": dict | None,
+        "abort": bool,
+        "abort_reason": str | None,
+    }``.
+
+    ``abort`` is set when the existing position notional ≥
+    ``recovery.abort_if_existing_position_above_usdc`` so the caller
+    can refuse to start the quoter. The OM has no public
+    set_initial_inventory hook, so a non-trivial residual position
+    has to be flattened manually before the strategy can start.
+    """
+    result: Dict[str, Any] = {
+        "cancelled_orders": [],
+        "cancel_failures": [],
+        "existing_position": None,
+        "abort": False,
+        "abort_reason": None,
+    }
+
+    # 1. Existing position diagnosis ----------------------------------
+    try:
+        positions = await gateway.get_account_positions()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("recover: get_account_positions failed: %s", exc)
+        positions = []
+
+    pos_for_market: Optional[Dict[str, Any]] = None
+    for p in positions:
+        if p.get("symbol") == symbol or p.get("market_index") == market_index:
+            pos_for_market = p
+            break
+    if pos_for_market is not None:
+        base = pos_for_market.get("base") or Decimal(0)
+        notional = pos_for_market.get("position_value_usdc") or Decimal(0)
+        if notional is None:
+            notional = Decimal(0)
+        notional_abs = abs(Decimal(str(notional)))
+        result["existing_position"] = pos_for_market
+
+        warn_threshold = Decimal(
+            str(config.get("warn_if_existing_position_above_usdc", "100"))
+        )
+        abort_threshold = Decimal(
+            str(config.get("abort_if_existing_position_above_usdc", "1000"))
+        )
+        if base != 0:
+            if abort_threshold > 0 and notional_abs >= abort_threshold:
+                result["abort"] = True
+                result["abort_reason"] = (
+                    f"existing position notional {notional_abs} USDC ≥ abort threshold "
+                    f"{abort_threshold} USDC; flatten manually before starting"
+                )
+                logger.error("RECOVER ABORT: %s", result["abort_reason"])
+            elif notional_abs >= warn_threshold:
+                logger.warning(
+                    "RECOVER WARN: existing position base=%s notional=%s USDC "
+                    "(quoter will start from 0-base inventory; "
+                    "expect skew/cap drift until naturally flattened)",
+                    base,
+                    notional_abs,
+                )
+            else:
+                logger.info(
+                    "RECOVER: small residual position base=%s notional=%s; ignoring",
+                    base,
+                    notional_abs,
+                )
+
+    # If we already decided to abort, skip the cancel pass.
+    if result["abort"]:
+        return result
+
+    if not config.get("cancel_stale_orders", True):
+        logger.info("RECOVER: cancel_stale_orders=false; leaving any open orders alone")
+        return result
+
+    # 2. Cancel stale orders -----------------------------------------
+    try:
+        open_orders = await gateway.get_open_orders(market_index)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("recover: get_open_orders failed: %s", exc)
+        open_orders = []
+
+    if open_orders:
+        logger.warning(
+            "RECOVER: found %d stale orders on %s, cancelling all",
+            len(open_orders),
+            symbol,
+        )
+    for o in open_orders:
+        order_index = o.get("order_index")
+        market_idx = o.get("market_index", market_index)
+        if not order_index:
+            continue
+        try:
+            cancel_result = await gateway.cancel_order_by_index(market_idx, order_index)
+        except Exception as exc:  # noqa: BLE001
+            cancel_result = {"ok": False, "error": str(exc)}
+        if cancel_result.get("ok"):
+            result["cancelled_orders"].append(order_index)
+        else:
+            result["cancel_failures"].append({
+                "order_index": order_index,
+                "error": cancel_result.get("error", "unknown"),
+            })
+            logger.error(
+                "RECOVER: cancel_order_by_index(%s) failed: %s",
+                order_index,
+                cancel_result.get("error"),
+            )
+
+    # 3. Wait for ws-side cancellations to confirm -------------------
+    if result["cancelled_orders"]:
+        wait_sec = float(config.get("wait_after_cancel_sec", 5))
+        logger.info("RECOVER: waiting %.1fs for cancellations to confirm", wait_sec)
+        await asyncio.sleep(wait_sec)
+
+    return result
+
+
+# ----- JSONL writer ------------------------------------------------------
+
+
+class _JsonlWriter:
+    """Append-only JSONL log shared with all callers in this run."""
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(path, "a", encoding="utf-8")
+        self.path = path
+
+    def write(self, payload: Dict[str, Any]) -> None:
+        try:
+            self._fh.write(
+                json.dumps(_jsonable(payload), ensure_ascii=False) + "\n"
+            )
+            self._fh.flush()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("jsonl write failed: %s", exc)
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _jsonable(obj: Any) -> Any:
+    if isinstance(obj, Decimal):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if is_dataclass(obj):
+        return _jsonable(asdict(obj))
+    return obj
+
+
+# ----- live mode runner --------------------------------------------------
+
+
+async def run_live_mode(
+    args: argparse.Namespace,
+    yaml_cfg: Dict[str, Any],
+    jsonl: _JsonlWriter,
+) -> int:
+    """Connect signer + ws, recover state, drive LppQuoter."""
+    strategy_cfg_raw = yaml_cfg.get("strategy", {}) or {}
+    strategy_cfg = _coerce_decimal_fields(strategy_cfg_raw)
+    market = args.market or strategy_cfg.get("market", "SKHYNIXUSD")
+    market_index = int(strategy_cfg.get("market_index", 0))
+    price_decimals = int(strategy_cfg.get("price_decimals", 4))
+    size_decimals = int(strategy_cfg.get("size_decimals", 4))
+
+    # Build gateway from env-backed default config (LIGHTER_API_PRIVATE_KEY etc).
+    gw_cfg_path = _PROJECT_ROOT / "config" / "lighter_config.yaml"
+    if not gw_cfg_path.exists():
+        logger.error("missing %s — cannot connect signer", gw_cfg_path)
+        return 3
+    gateway = LighterGateway.from_config_file(str(gw_cfg_path))
+    try:
+        await gateway.initialize()
+    except LighterGatewayError as exc:
+        logger.error("gateway init failed: %s", exc)
+        jsonl.write({"event": "init_error", "error": str(exc)})
+        return 3
+
+    if gateway.account_index is None or gateway.signer_client is None:
+        logger.error("--live requires LIGHTER_API_PRIVATE_KEY + LIGHTER_ACCOUNT_INDEX in env")
+        await gateway.close()
+        return 3
+
+    # Re-derive market_index from gateway if config didn't set it.
+    if market_index == 0:
+        idx = gateway.get_market_index(market)
+        if idx is None:
+            logger.error("market %r not found on Lighter", market)
+            await gateway.close()
+            return 2
+        market_index = idx
+
+    ws = LighterWebSocket(testnet=False)
+
+    # 1. Recovery (before quoter starts)
+    recovery_summary: Dict[str, Any] = {}
+    if not args.no_recover:
+        recovery_cfg = yaml_cfg.get("recovery", {}) or {}
+        recovery_summary = await recover_initial_state(
+            gateway, market_index, market, recovery_cfg
+        )
+        jsonl.write({"event": "recover_done", **_jsonable(recovery_summary)})
+        if recovery_summary.get("abort"):
+            logger.error("aborting startup due to recovery: %s",
+                         recovery_summary.get("abort_reason"))
+            await gateway.close()
+            return 4
+
+    # 2. WS connect (subscribes market_stats + trade automatically)
+    try:
+        await ws.connect([market_index])
+    except Exception as exc:  # noqa: BLE001
+        logger.error("ws connect failed: %s", exc)
+        jsonl.write({"event": "ws_connect_error", "error": str(exc)})
+        await gateway.close()
+        return 5
+
+    # 3. OM + tracker + quoter
+    om = LighterOrderManager(
+        gateway=gateway,
+        ws=ws,
+        account_index=int(gateway.account_index),
+    )
+    pool_yaml = _load_lpp_pool_yaml()
+    weekly_pool = {
+        sym: Decimal(str(v))
+        for sym, v in (pool_yaml.get("lpp_pool") or {}).items()
+    }
+    tier_weights = {
+        tag: Decimal(str(v))
+        for tag, v in (pool_yaml.get("tier_weights") or {}).items()
+    }
+    tracker = LppStateTracker(
+        weekly_pool_usdc=weekly_pool,
+        tier_weights=tier_weights,
+        output_dir=Path(args.output_dir) / "lpp_state",
+        snapshot_window_sec=Decimal(str(strategy_cfg.get("snapshot_interval_sec", 60))),
+    )
+    quoter = LppQuoter(
+        gateway=gateway,
+        ws=ws,
+        order_manager=om,
+        tracker=tracker,
+        symbol=market,
+        market_index=market_index,
+        price_decimals=price_decimals,
+        size_decimals=size_decimals,
+        account_index=int(gateway.account_index),
+        config=strategy_cfg,
+    )
+
+    jsonl.write({
+        "event": "strategy_start",
+        "ts_ms": int(time.time() * 1000),
+        "mode": "live",
+        "market": market,
+        "market_index": market_index,
+        "duration_min": args.duration,
+        "config": _jsonable(strategy_cfg),
+        "recovery": _jsonable(recovery_summary),
+    })
+    logger.info(
+        "STRATEGY START mode=live market=%s market_index=%d duration_min=%.1f",
+        market, market_index, args.duration,
+    )
+
+    # 4. SIGINT / SIGTERM → request stop
+    stop_event = asyncio.Event()
+    install_signal_handlers(stop_event)
+
+    await quoter.start()
+
+    try:
+        # Permanent run if duration==0; clamp to 365d as the
+        # actual deadline so run_until's bookkeeping is finite.
+        deadline = (
+            time.time() + args.duration * 60
+            if args.duration > 0
+            else time.time() + 365 * 86400
+        )
+        run_task = asyncio.create_task(quoter.run_until(deadline))
+        stop_task = asyncio.create_task(stop_event.wait())
+        done, pending = await asyncio.wait(
+            [run_task, stop_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    finally:
+        logger.info("STRATEGY SHUTDOWN starting")
+        try:
+            await quoter.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("quoter.shutdown raised: %s", exc)
+        summary = quoter.get_summary()
+        jsonl.write({
+            "event": "strategy_end",
+            "ts_ms": int(time.time() * 1000),
+            "summary": _jsonable(summary),
+        })
+        logger.info("STRATEGY SHUTDOWN done summary=%s", summary)
+        try:
+            await ws.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("ws disconnect raised: %s", exc)
+        try:
+            await gateway.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("gateway close raised: %s", exc)
+
+    return 0
+
+
+# ----- paper mode runner -------------------------------------------------
+
+
+async def run_paper_mode(
+    args: argparse.Namespace,
+    jsonl: _JsonlWriter,
+) -> int:
+    """Delegate to scripts/run_lighter_paper.py's PaperRun.
+
+    Reuses the simulator + tracker pipeline that's been shaken out
+    on hours of read-only mainnet runs. Args translate 1:1 (the
+    paper runner's CLI is a strict subset of ours).
+    """
+    from scripts.run_lighter_paper import PaperRun
+
+    paper_args = argparse.Namespace(
+        market=args.market or "SKHYNIXUSD",
+        duration=args.duration if args.duration > 0 else 24 * 60.0,
+        seed=args.seed,
+        output_dir=str(Path(args.output_dir) / "paper"),
+        initial_collateral="2000",
+        verbose=args.verbose,
+    )
+    jsonl.write({
+        "event": "strategy_start",
+        "ts_ms": int(time.time() * 1000),
+        "mode": "paper",
+        "market": paper_args.market,
+        "duration_min": paper_args.duration,
+        "seed": paper_args.seed,
+    })
+    logger.info(
+        "STRATEGY START mode=paper market=%s duration_min=%.1f",
+        paper_args.market,
+        paper_args.duration,
+    )
+    runner = PaperRun(paper_args)
+    code = await runner.run()
+    jsonl.write({
+        "event": "strategy_end",
+        "ts_ms": int(time.time() * 1000),
+        "mode": "paper",
+        "exit_code": code,
+    })
+    logger.info("STRATEGY SHUTDOWN done (paper exit=%d)", code)
+    return code
+
+
+# ----- signal handling ---------------------------------------------------
+
+
+def install_signal_handlers(stop_event: asyncio.Event) -> None:
+    """Best-effort SIGINT/SIGTERM → ``stop_event.set``.
+
+    Windows ProactorEventLoop doesn't support ``add_signal_handler``;
+    on that platform the process still exits via KeyboardInterrupt
+    and the outer ``main`` catches it.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(signal.SIGINT, stop_event.set)
+        try:
+            loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+        except (AttributeError, NotImplementedError):
+            pass
+    except (NotImplementedError, RuntimeError):
+        logger.info(
+            "Signal handlers unavailable on this platform; "
+            "Ctrl-C still aborts via KeyboardInterrupt"
+        )
+
+
+# ----- main --------------------------------------------------------------
+
+
+async def _async_main(args: argparse.Namespace) -> int:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    date_tag = datetime.now(tz=timezone.utc).strftime("%Y%m%d")
+    yaml_cfg = _load_strategy_yaml(args.config)
+    log_section = yaml_cfg.get("logging", {}) or {}
+    jsonl_filename = log_section.get("jsonl_filename", "strategy_{date}.jsonl").format(
+        date=date_tag
+    )
+    jsonl_path = output_dir / jsonl_filename
+    _setup_logging(args.verbose, jsonl_path)
+    jsonl = _JsonlWriter(jsonl_path)
+    logger.info("strategy log → %s", jsonl_path)
+
+    try:
+        if args.live:
+            return await run_live_mode(args, yaml_cfg, jsonl)
+        return await run_paper_mode(args, jsonl)
+    finally:
+        jsonl.close()
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_and_confirm_args(argv)
+    try:
+        return asyncio.run(_async_main(args))
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

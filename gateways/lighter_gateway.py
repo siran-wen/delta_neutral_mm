@@ -510,6 +510,129 @@ class LighterGateway:
             "total": collateral,
         }
 
+    async def get_account_positions(self) -> List[Dict[str, Any]]:
+        """List active perp positions across all markets for the configured account.
+
+        Wraps ``AccountApi.account(by="index", value=str(account_index))``
+        and pulls the ``positions`` field from the returned
+        ``DetailedAccount``. Each entry is normalised to a dict with
+        ``market_index`` / ``symbol`` / ``sign`` (1=long, -1=short,
+        0=flat) / ``base`` (Decimal, signed) / ``avg_entry_price``
+        (Decimal) / ``position_value_usdc`` / ``unrealized_pnl``.
+        Empty list when the account is not configured or no positions
+        exist.
+        """
+        if self.account_index is None or self.account_api is None:
+            return []
+        response = await self.account_api.account(
+            by="index", value=str(self.account_index)
+        )
+        accounts = getattr(response, "accounts", None) or []
+        if not accounts:
+            return []
+        acct = accounts[0]
+        positions_raw = getattr(acct, "positions", None) or []
+        out: List[Dict[str, Any]] = []
+        for p in positions_raw:
+            sign = int(getattr(p, "sign", 0) or 0)
+            size_str = getattr(p, "position", "0") or "0"
+            try:
+                size = Decimal(str(size_str))
+            except (ValueError, ArithmeticError):
+                size = Decimal(0)
+            # Lighter reports magnitude in ``position`` and direction
+            # in ``sign``. Combine into a signed base amount so callers
+            # can sum across markets without re-parsing.
+            signed_base = size if sign >= 0 else -size
+            out.append({
+                "market_index": int(getattr(p, "market_id", 0) or 0),
+                "symbol": getattr(p, "symbol", "") or "",
+                "sign": sign,
+                "base": signed_base,
+                "avg_entry_price": _safe_decimal(getattr(p, "avg_entry_price", None)),
+                "position_value_usdc": _safe_decimal(getattr(p, "position_value", None)),
+                "unrealized_pnl": _safe_decimal(getattr(p, "unrealized_pnl", None)),
+                "open_order_count": int(getattr(p, "open_order_count", 0) or 0),
+            })
+        return out
+
+    async def get_open_orders(
+        self,
+        market_index: int,
+        auth_deadline_sec: int = 600,
+    ) -> List[Dict[str, Any]]:
+        """List open orders for the configured account on one market.
+
+        Wraps ``OrderApi.account_active_orders``, which is an
+        authenticated endpoint — we mint a short-lived auth token via
+        ``SignerClient.create_auth_token_with_expiry`` and pass it as
+        the ``auth`` query parameter. Empty list when the signer or
+        account is unconfigured.
+
+        Returned dict shape mirrors a subset of ``lighter.models.Order``:
+        ``market_index`` / ``order_index`` / ``client_order_index`` /
+        ``side`` ("buy"/"sell") / ``price`` / ``initial_base_amount`` /
+        ``filled_base_amount`` / ``remaining_base_amount`` / ``status``.
+        """
+        if (
+            self._signer_client is None
+            or self.account_index is None
+            or self.order_api is None
+        ):
+            return []
+        # create_auth_token_with_expiry returns (token, error) — sync helper.
+        auth_token, err = self._signer_client.create_auth_token_with_expiry(
+            deadline=int(auth_deadline_sec)
+        )
+        if err is not None or not auth_token:
+            raise LighterGatewayError(f"create_auth_token failed: {err}")
+        response = await self.order_api.account_active_orders(
+            account_index=int(self.account_index),
+            market_id=int(market_index),
+            auth=auth_token,
+        )
+        orders_raw = getattr(response, "orders", None) or []
+        out: List[Dict[str, Any]] = []
+        for o in orders_raw:
+            out.append({
+                "market_index": int(getattr(o, "market_index", market_index) or market_index),
+                "order_index": int(getattr(o, "order_index", 0) or 0),
+                "client_order_index": int(getattr(o, "client_order_index", 0) or 0),
+                "side": getattr(o, "side", None) or (
+                    "sell" if bool(getattr(o, "is_ask", False)) else "buy"
+                ),
+                "price": _safe_decimal(getattr(o, "price", None)),
+                "initial_base_amount": _safe_decimal(getattr(o, "initial_base_amount", None)),
+                "filled_base_amount": _safe_decimal(getattr(o, "filled_base_amount", None)),
+                "remaining_base_amount": _safe_decimal(getattr(o, "remaining_base_amount", None)),
+                "status": getattr(o, "status", None),
+            })
+        return out
+
+    async def cancel_order_by_index(
+        self,
+        market_index: int,
+        order_index: int,
+    ) -> Dict[str, Any]:
+        """Cancel a single resting order by its on-chain order_index.
+
+        Thin wrapper around ``SignerClient.cancel_order``. Returns
+        ``{"ok": True, "tx": ...}`` on success or
+        ``{"ok": False, "error": ...}`` on failure. We *don't* raise
+        on the SDK's (None, None, error) tuple here — recovery code
+        wants to attempt every order in a list and surface partial
+        failure rather than abort on the first one.
+        """
+        if self._signer_client is None:
+            return {"ok": False, "error": "signer not configured"}
+        result = await self._signer_client.cancel_order(
+            market_index=int(market_index),
+            order_index=int(order_index),
+        )
+        if isinstance(result, tuple) and len(result) >= 3 and result[2] is not None:
+            return {"ok": False, "error": str(result[2])}
+        return {"ok": True, "tx": result}
+
     # --------------------------------------------------------------
     # config loading helpers
     # --------------------------------------------------------------
