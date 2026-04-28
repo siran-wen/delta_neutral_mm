@@ -7,7 +7,7 @@ spread blow-outs in the first hour, then a slow overnight grind, then
 the long Fri 09:00 → Sun 22:30 weekend (RWA continuous mode with much
 wider tier thresholds).
 
-This module returns a ``SessionState`` describing what the planner
+This module returns a ``SessionPolicy`` describing what the planner
 should do at any UTC instant. It is a pure function: no I/O, no global
 state, no time.now() calls.
 """
@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, Optional
 
-from .types import SessionState
+from .types import SessionPolicy
 
 
 _KR_TIER_THRESHOLDS = (Decimal("15"), Decimal("25"), Decimal("50"))
@@ -127,8 +127,8 @@ def _weekday_session_name(now_utc: datetime) -> str:
 def get_kr_equity_session(
     now: datetime,
     config: Optional[dict] = None,
-) -> SessionState:
-    """Return the SessionState for the given UTC instant.
+) -> SessionPolicy:
+    """Return the SessionPolicy for the given UTC instant.
 
     config schema (all keys optional):
         {
@@ -164,7 +164,7 @@ def get_kr_equity_session(
         if "tier_thresholds_bp" in override:
             thresholds = override["tier_thresholds_bp"]
 
-    return SessionState(
+    return SessionPolicy(
         name=session_name,
         action=spec["action"],
         default_distance_bp=distance,

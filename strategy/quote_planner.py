@@ -30,7 +30,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import List, Tuple
 
 from .inventory_skew import compute_skew_offsets, is_position_capped
-from .types import InventoryState, MarketSnapshot, Quote, SessionState
+from .types import InventoryState, MarketSnapshot, Quote, SessionPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ def _coerce_depth(depth_dict: dict, key: str) -> Decimal:
 
 def plan_quotes(
     market: MarketSnapshot,
-    session: SessionState,
+    session: SessionPolicy,
     inventory: InventoryState,
     config: dict,
 ) -> List[Quote]:

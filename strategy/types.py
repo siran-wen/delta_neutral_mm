@@ -57,8 +57,14 @@ class InventoryState:
 
 
 @dataclass(frozen=True)
-class SessionState:
-    """A session-aware quoting policy slice."""
+class SessionPolicy:
+    """A session-aware quoting policy slice.
+
+    Distinct from ``observe.session_clock.SessionState`` (an enum
+    describing *which* session phase we're in). This dataclass
+    carries the planner-facing knobs ("how to quote in this
+    session") — distance, size, tier thresholds, action.
+    """
 
     name: str                          # e.g. "KR_MARKET_HOURS_AM"
     action: str                        # "quote" / "withdraw"
@@ -66,3 +72,11 @@ class SessionState:
     default_size_usdc: Decimal         # one-sided notional
     tier_thresholds_bp: Tuple[Decimal, Decimal, Decimal]  # (L1, L2, L3)
     reason: str                        # diagnostic / log message
+
+
+# Backwards alias — remove in next major. Lets any not-yet-rewritten
+# entry script keep importing the old name. All new code (incl.
+# Phase 1.1 batch 1 already on disk) MUST use ``SessionPolicy``
+# directly so a `grep SessionState strategy/` flags only genuine
+# enum vs. policy collisions.
+SessionState = SessionPolicy

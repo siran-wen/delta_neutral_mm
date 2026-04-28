@@ -32,7 +32,7 @@ from strategy.session_aware import get_kr_equity_session  # noqa: E402
 from strategy.types import (  # noqa: E402
     InventoryState,
     MarketSnapshot,
-    SessionState,
+    SessionPolicy,
 )
 
 
@@ -114,7 +114,7 @@ def kr_weekend_session():
 # ---- 1. withdraw ------------------------------------------------------
 
 def test_withdraw_session_returns_empty():
-    session = SessionState(
+    session = SessionPolicy(
         name="KR_PRE_OPEN_WITHDRAW",
         action="withdraw",
         default_distance_bp=Decimal("0"),
@@ -344,7 +344,7 @@ def test_other_symbol_price_decimals_2_quantization():
 
 def test_bbo_aware_target_at_best_bid_is_passive():
     """mid=100.00, distance=5bp lands target_bid exactly at best_bid=99.95."""
-    session = SessionState(
+    session = SessionPolicy(
         name="KR_MARKET_HOURS_AM", action="quote",
         default_distance_bp=Decimal("5"),
         default_size_usdc=Decimal("1000"),
@@ -405,7 +405,7 @@ def test_cross_self_defense_keeps_at_least_one_tick():
     Both classify as 'improving' (between BBO), then cross-self defense
     splits them across the tick grid so the final spread is >= 1 tick.
     """
-    session = SessionState(
+    session = SessionPolicy(
         name="ZERO", action="quote",
         default_distance_bp=Decimal("0"),
         default_size_usdc=Decimal("1000"),
@@ -434,7 +434,7 @@ def test_cross_self_defense_keeps_at_least_one_tick():
 
 def test_tier_judgment_l1_after_quantization_drift():
     """distance=6bp + small price-grid drift still resolves to L1 (≤15)."""
-    session = SessionState(
+    session = SessionPolicy(
         name="TEST", action="quote",
         default_distance_bp=Decimal("6"),
         default_size_usdc=Decimal("1000"),
@@ -481,7 +481,7 @@ def test_notes_includes_share_warn_and_skew_when_active():
 # ---- bonus: tier OUT when distance escapes L3 --------------------
 
 def test_tier_target_out_when_distance_above_l3():
-    session = SessionState(
+    session = SessionPolicy(
         name="TEST", action="quote",
         default_distance_bp=Decimal("60"),                 # past L3=50
         default_size_usdc=Decimal("1000"),
