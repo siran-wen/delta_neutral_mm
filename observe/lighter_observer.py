@@ -532,6 +532,18 @@ class LighterObserver:
                 "trade_subscription_failed": stats.get(
                     "trade_subscription_failed", []
                 ),
+                # Phase 1.0.3 stability fields. Present whenever the
+                # WS supports them; LighterWebSocket always populates
+                # these so this branch is informational only.
+                "last_msg_ts_ms_global": stats.get("last_msg_ts_ms_global"),
+                "max_uptime_sec": stats.get("max_uptime_sec"),
+                "connection_uptime_sec_current": stats.get(
+                    "connection_uptime_sec_current"
+                ),
+                "last_disconnect_reason": stats.get("last_disconnect_reason"),
+                "keepalive_fail_count": stats.get("keepalive_fail_count"),
+                "ping_sent": stats.get("ping_sent"),
+                "pong_received": stats.get("pong_received"),
             },
         }
         latency_stats = self.ws.get_recent_latency_stats()

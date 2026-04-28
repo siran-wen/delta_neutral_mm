@@ -232,3 +232,147 @@ def test_trade_subscription_error_is_isolated():
         },
     }))
     assert client.get_latest_mid(162) == _D("150")
+
+
+# -------------------------------------------------------------
+# Phase 1.0.3 wire-format coverage. The previous parser silently
+# dropped every trade because it split the channel on ``/`` while
+# Lighter actually uses ``trade:N`` (colon). The two tests below
+# pin down the real wire shape and the malformed-payload path.
+# -------------------------------------------------------------
+
+
+def test_real_trade_msg_format_parsing():
+    """Real BTC trade frame captured from mainnet (Apr 2026).
+
+    Verifies:
+    - colon-separated channel (``trade:1``) resolves to mi=1
+    - top-level ``market_id`` is intentionally absent
+    - both ``trades`` and ``liquidation_trades`` are ingested
+    - ms-epoch ``timestamp`` survives without being scaled to µs
+    - ``is_maker_ask`` produces correct taker side (buy/sell)
+
+    Timestamps are relative to "now" so the 5-minute retention prune
+    in ``_on_trade`` doesn't strip the fixture on later test runs.
+    """
+    import time
+
+    client = _make_ws_client()
+    NOW_MS = int(time.time() * 1000)
+    LIQ_TS = NOW_MS - 1000
+    SELL_TS = NOW_MS - 500
+    BUY_TS = NOW_MS - 200
+    payload = {
+        "channel": "trade:1",
+        "type": "update/trade",
+        "nonce": 10915488097,
+        "liquidation_trades": [
+            {
+                "trade_id": 18749146443,
+                "type": "liquidation",
+                "market_id": 1,
+                "size": "0.00840",
+                "price": "76645.3",
+                "usd_amount": "643.820520",
+                "is_maker_ask": False,  # taker sold (hit bid)
+                "timestamp": LIQ_TS,
+                "transaction_time": LIQ_TS * 1000,  # µs (must NOT win)
+            }
+        ],
+        "trades": [
+            {
+                "trade_id": 18751577224,
+                "type": "trade",
+                "market_id": 1,
+                "size": "0.09743",
+                "price": "76775.1",
+                "usd_amount": "7480.197993",
+                "is_maker_ask": False,
+                "timestamp": SELL_TS,
+                "transaction_time": SELL_TS * 1000,
+            },
+            {
+                "trade_id": 18751577770,
+                "type": "trade",
+                "market_id": 1,
+                "size": "0.01847",
+                "price": "76769.1",
+                "usd_amount": "1417.925277",
+                "is_maker_ask": True,  # taker bought (lifted ask)
+                "timestamp": BUY_TS,
+            },
+        ],
+    }
+    asyncio.run(client._handle_message(payload))
+    tape = client.get_recent_trades(1)
+    # Both regular trades AND the liquidation entry should be tape'd.
+    assert len(tape) == 3, f"expected 3 records (1 liq + 2 trades), got {len(tape)}"
+    # Recover by trade_id since insertion order = liq first, then trades.
+    by_id = {t["trade_id"]: t for t in tape}
+
+    liq = by_id[18749146443]
+    assert liq["type"] == "liquidation"
+    assert liq["side"] == "sell"
+    assert liq["price"] == _D("76645.3")
+    assert liq["size"] == _D("0.00840")
+    # ts must remain in ms (13 digits) — NOT µs.
+    assert liq["ts_ms"] == LIQ_TS
+
+    sell_trade = by_id[18751577224]
+    assert sell_trade["type"] == "trade"
+    assert sell_trade["side"] == "sell"
+    assert sell_trade["ts_ms"] == SELL_TS
+
+    buy_trade = by_id[18751577770]
+    assert buy_trade["type"] == "trade"
+    assert buy_trade["side"] == "buy"
+    assert buy_trade["price"] == _D("76769.1")
+    assert buy_trade["ts_ms"] == BUY_TS
+
+    # Stats register the message-type counter so observability is wired.
+    stats = client.get_message_stats()
+    assert stats["msg_count_by_type"].get("update/trade") == 1
+
+
+def test_invalid_trade_msg_logged_not_raised():
+    """Malformed payloads should never crash the parser. Three flavors:
+    - missing required price/size on a per-trade item
+    - non-list ``trades`` value
+    - completely missing market identifier (no channel, no top-level)
+    Each must return cleanly; the resulting tape is empty.
+    """
+    client = _make_ws_client()
+
+    # 1. Per-trade item missing price; must not raise.
+    asyncio.run(client._handle_message({
+        "channel": "trade:7",
+        "type": "update/trade",
+        "trades": [
+            {"trade_id": 1, "size": "1.0", "is_maker_ask": True, "timestamp": 1},
+            # Second item has price=0 → also rejected by _normalize_trade
+            {"trade_id": 2, "price": "0", "size": "1.0", "timestamp": 2},
+        ],
+    }))
+    assert client.get_recent_trades(7) == []
+
+    # 2. trades is not a list — silently ignored.
+    asyncio.run(client._handle_message({
+        "channel": "trade:7",
+        "type": "update/trade",
+        "trades": "not-a-list",
+    }))
+    assert client.get_recent_trades(7) == []
+
+    # 3. No channel and no top-level market_id → cannot resolve mi.
+    #    Must still not raise; nothing tape'd.
+    asyncio.run(client._handle_message({
+        "type": "update/trade",
+        "trades": [
+            {"trade_id": 9, "price": "100", "size": "1", "timestamp": 1_700_000_000_000}
+        ],
+    }))
+    # Tape across all known markets stays empty.
+    assert client.get_recent_trades(7) == []
+    # And the parser increments the message counter — proves no early raise.
+    stats = client.get_message_stats()
+    assert stats["msg_count_by_type"].get("update/trade") == 3

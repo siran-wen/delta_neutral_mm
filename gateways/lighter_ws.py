@@ -102,6 +102,24 @@ _TRADE_RETENTION_MS = 5 * 60 * 1000
 # Max samples for the rolling latency window (server_ts → local_ts).
 _LATENCY_SAMPLES_MAXLEN = 200
 
+# Active health-probe knobs (Phase 1.0.3 stability work). 15h runs
+# observed 7 reconnects with non-linear cadence even though every
+# ping/pong was paired — symptoms point at zombie sockets / CDN-side
+# half-closes that only surface when we try to read. Defence in depth:
+#
+#   - stale-msg detector: if we go silent for too long, assume the
+#     socket is dead and force-reconnect rather than waiting for the
+#     server to drop us.
+#   - lifetime cap: even on healthy connections, refresh after an
+#     hour to prevent long-lived corruption (CDN sticky-session
+#     drift, accumulated buffer state).
+#   - keepalive failure budget: tolerate a few transient send errors
+#     before forcing reconnect (one transient hiccup ≠ dead socket).
+_STALE_CHECK_INTERVAL_SEC = 10.0
+_MAX_MSG_GAP_SEC = 60.0
+_MAX_CONNECTION_LIFETIME_SEC = 3600.0
+_MAX_KEEPALIVE_FAIL_COUNT = 3
+
 
 def _safe_decimal(value: Any, default: Optional[Decimal] = None) -> Optional[Decimal]:
     if value is None or value == "":
@@ -185,6 +203,18 @@ class LighterWebSocket:
         self._last_ping_ts_ms: Optional[int] = None
         self._last_pong_ts_ms: Optional[int] = None
 
+        # Active health-probe state (Phase 1.0.3). The stale_check
+        # task watches msg-gap, connection lifetime, and keepalive
+        # failure budget — closing the socket force-triggers the
+        # reconnect path in _run_loop instead of waiting for a
+        # server-side drop.
+        self._stale_check_task: Optional[asyncio.Task] = None
+        self._last_msg_ts_ms: Optional[int] = None
+        self._connection_started_ts_ms: Optional[int] = None
+        self._max_uptime_sec: float = 0.0
+        self._last_disconnect_reason: Optional[str] = None
+        self._keepalive_fail_count: int = 0
+
     # --------------------------------------------------------------
     # lifecycle
     # --------------------------------------------------------------
@@ -222,6 +252,7 @@ class LighterWebSocket:
         """Stop the background task and close the connection."""
         self._running = False
         await self._stop_keepalive_task()
+        await self._stop_stale_check_task()
         ws = self._direct_ws
         self._direct_ws = None
         if ws is not None:
@@ -253,13 +284,29 @@ class LighterWebSocket:
         except Exception as exc:  # noqa: BLE001
             logger.debug("keep-alive task raised on cancel: %s", exc)
 
+    async def _stop_stale_check_task(self) -> None:
+        """Idempotently cancel the stale-check task if it is running."""
+        task = self._stale_check_task
+        self._stale_check_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("stale-check task raised on cancel: %s", exc)
+
     async def _keepalive_loop(self) -> None:
         """Send ``{"type":"ping"}`` every ~30s to prevent server timeout.
 
-        Runs until cancelled. Send failures are silent — if the WS
-        connection has closed, ``_run_loop`` will detect it through
-        its ``async for message`` iterator and reconnect. We don't
-        want this task to raise and fight the reconnect path.
+        Runs until cancelled. A single transient ``ws.send`` failure no
+        longer terminates the task — Phase 1.0.3 long runs showed
+        connections going zombie without throwing on send right away,
+        so we keep trying and let ``_stale_check_loop`` decide when
+        the failure budget is exhausted (or when message-gap or
+        lifetime triggers fire).
         """
         try:
             while True:
@@ -272,12 +319,92 @@ class LighterWebSocket:
                     await ws.send(json.dumps({"type": "ping"}))
                     self._ping_sent += 1
                     self._last_ping_ts_ms = int(time.time() * 1000)
+                    self._keepalive_fail_count = 0  # reset budget on success
                     logger.debug("keep-alive ping sent (total=%d)", self._ping_sent)
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        "keep-alive ping send failed (will be handled by reconnect): %s",
+                    self._keepalive_fail_count += 1
+                    logger.warning(
+                        "keep-alive ping send failed (count=%d/%d): %s",
+                        self._keepalive_fail_count,
+                        _MAX_KEEPALIVE_FAIL_COUNT,
                         exc,
                     )
+                    # Bail only when the budget is exhausted; the
+                    # stale-check task will close the socket shortly
+                    # after and trigger the reconnect path.
+                    if self._keepalive_fail_count >= _MAX_KEEPALIVE_FAIL_COUNT:
+                        return
+        except asyncio.CancelledError:
+            raise
+
+    async def _stale_check_loop(self) -> None:
+        """Force a reconnect when the connection looks unhealthy.
+
+        Three triggers, all of which set ``_last_disconnect_reason``
+        and call ``ws.close()``. The clean local close lets the main
+        ``async for message in ws`` exit without an exception, so
+        ``_run_loop`` reconnects immediately (no exponential backoff
+        applied to a planned refresh).
+
+        1. **stale**: no inbound message for ``_MAX_MSG_GAP_SEC`` —
+           the socket is probably dead even if the OS hasn't told us
+           yet. market_stats normally pushes ~13 msgs/sec per
+           subscribed market, so a 60s gap is unambiguously bad.
+        2. **lifetime**: connection has been alive for
+           ``_MAX_CONNECTION_LIFETIME_SEC``. Forces periodic refresh
+           so accumulated buffer/CDN-state corruption can't compound.
+        3. **keepalive_fail**: the ping task burned through its
+           failure budget. Caps how long we tolerate a half-open
+           socket that's silently dropping our sends.
+        """
+        try:
+            while True:
+                await asyncio.sleep(_STALE_CHECK_INTERVAL_SEC)
+                ws = self._direct_ws
+                if ws is None:
+                    return
+                now_ms = int(time.time() * 1000)
+
+                if self._last_msg_ts_ms is not None:
+                    gap_sec = (now_ms - self._last_msg_ts_ms) / 1000.0
+                    if gap_sec > _MAX_MSG_GAP_SEC:
+                        logger.warning(
+                            "WS stale: %.1fs since last msg (>%.0fs); forcing reconnect",
+                            gap_sec,
+                            _MAX_MSG_GAP_SEC,
+                        )
+                        self._last_disconnect_reason = "stale"
+                        try:
+                            await ws.close()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("ws.close() raised during stale refresh: %s", exc)
+                        return
+
+                if self._connection_started_ts_ms is not None:
+                    uptime_sec = (now_ms - self._connection_started_ts_ms) / 1000.0
+                    if uptime_sec > _MAX_CONNECTION_LIFETIME_SEC:
+                        logger.info(
+                            "WS connection lifetime %.0fs reached (>%.0fs); scheduled refresh",
+                            uptime_sec,
+                            _MAX_CONNECTION_LIFETIME_SEC,
+                        )
+                        self._last_disconnect_reason = "lifetime"
+                        try:
+                            await ws.close()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("ws.close() raised during lifetime refresh: %s", exc)
+                        return
+
+                if self._keepalive_fail_count >= _MAX_KEEPALIVE_FAIL_COUNT:
+                    logger.warning(
+                        "WS keep-alive failed %d times; forcing reconnect",
+                        self._keepalive_fail_count,
+                    )
+                    self._last_disconnect_reason = "keepalive_fail"
+                    try:
+                        await ws.close()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("ws.close() raised during keepalive_fail refresh: %s", exc)
                     return
         except asyncio.CancelledError:
             raise
@@ -364,6 +491,12 @@ class LighterWebSocket:
         }
 
     def get_message_stats(self) -> Dict[str, Any]:
+        if self._connection_started_ts_ms is not None:
+            uptime_now_sec = (
+                int(time.time() * 1000) - self._connection_started_ts_ms
+            ) / 1000.0
+        else:
+            uptime_now_sec = 0.0
         return {
             "msg_count_by_type": dict(self._msg_count_by_type),
             "last_msg_ts_ms_by_channel": dict(self._last_msg_ts_ms_by_channel),
@@ -376,6 +509,11 @@ class LighterWebSocket:
             "last_ping_ts_ms": self._last_ping_ts_ms,
             "last_pong_ts_ms": self._last_pong_ts_ms,
             "trade_subscription_failed": sorted(self._trade_subscription_failed),
+            "last_msg_ts_ms_global": self._last_msg_ts_ms,
+            "max_uptime_sec": self._max_uptime_sec,
+            "connection_uptime_sec_current": uptime_now_sec,
+            "last_disconnect_reason": self._last_disconnect_reason,
+            "keepalive_fail_count": self._keepalive_fail_count,
         }
 
     def is_connected(self) -> bool:
@@ -397,7 +535,15 @@ class LighterWebSocket:
                 ) as ws:
                     self._direct_ws = ws
                     self._connect_count += 1
-                    self._last_connect_ts_ms = int(time.time() * 1000)
+                    now_ms = int(time.time() * 1000)
+                    self._last_connect_ts_ms = now_ms
+                    self._connection_started_ts_ms = now_ms
+                    # Seed the stale-check baseline so the first 60s of
+                    # silence after a fresh connect doesn't trip the
+                    # detector (it normally takes <1s to get the first
+                    # market_stats subscribed snapshot).
+                    self._last_msg_ts_ms = now_ms
+                    self._keepalive_fail_count = 0
                     logger.info(
                         "Lighter WS connected (attempt %d, url=%s)",
                         self._connect_count,
@@ -411,8 +557,12 @@ class LighterWebSocket:
                     # Any previous task from an earlier connection should
                     # already be done at this point, but stop defensively.
                     await self._stop_keepalive_task()
+                    await self._stop_stale_check_task()
                     self._keepalive_task = asyncio.create_task(
                         self._keepalive_loop(), name="lighter-ws-keepalive"
+                    )
+                    self._stale_check_task = asyncio.create_task(
+                        self._stale_check_loop(), name="lighter-ws-stale-check"
                     )
 
                     # mark connected so connect() can return
@@ -440,6 +590,7 @@ class LighterWebSocket:
             except ConnectionClosed as exc:
                 retry_count += 1
                 delay = min(retry_count, _RECONNECT_BACKOFF_CAP_SEC)
+                self._last_disconnect_reason = "exception"
                 logger.warning(
                     "Lighter WS closed (%s); reconnecting in %.1fs (attempt %d)",
                     exc,
@@ -448,10 +599,12 @@ class LighterWebSocket:
                 )
                 self._direct_ws = None
                 await self._stop_keepalive_task()
+                await self._stop_stale_check_task()
                 await asyncio.sleep(delay)
             except Exception as exc:  # noqa: BLE001
                 retry_count += 1
                 delay = min(retry_count, _RECONNECT_BACKOFF_CAP_SEC)
+                self._last_disconnect_reason = "exception"
                 logger.error(
                     "Lighter WS error: %s; reconnecting in %.1fs (attempt %d)",
                     exc,
@@ -461,13 +614,24 @@ class LighterWebSocket:
                 )
                 self._direct_ws = None
                 await self._stop_keepalive_task()
+                await self._stop_stale_check_task()
                 await asyncio.sleep(delay)
             finally:
+                # Capture max-uptime BEFORE clearing the start timestamp
+                # so each connection contributes once to the running max.
+                if self._connection_started_ts_ms is not None:
+                    uptime_sec = (
+                        int(time.time() * 1000) - self._connection_started_ts_ms
+                    ) / 1000.0
+                    if uptime_sec > self._max_uptime_sec:
+                        self._max_uptime_sec = uptime_sec
+                self._connection_started_ts_ms = None
                 self._direct_ws = None
                 # Defensive: if the async-with exited cleanly (server
                 # closed the iterator), the except blocks above don't
                 # fire, so stop the keep-alive here too.
                 await self._stop_keepalive_task()
+                await self._stop_stale_check_task()
 
         logger.info("Lighter WS background loop exited cleanly")
 
@@ -544,6 +708,10 @@ class LighterWebSocket:
         self._msg_count_by_type[msg_type] = self._msg_count_by_type.get(msg_type, 0) + 1
         channel = data.get("channel", "")
         local_ts_ms = int(time.time() * 1000)
+        # Tracks ANY inbound msg (even ping/pong/error) so the
+        # stale detector measures liveness, not just data-channel
+        # activity. Update before any return paths below.
+        self._last_msg_ts_ms = local_ts_ms
         if channel:
             self._last_msg_ts_ms_by_channel[channel] = local_ts_ms
 
@@ -585,9 +753,10 @@ class LighterWebSocket:
             return
 
         # trade channel: both subscribed/trade (initial backfill, may be
-        # an empty list) and update/trade (live ticks) carry an array
-        # of trades under the "trades" key. The subscribed/ form
-        # confirms the channel exists; the update/ form delivers data.
+        # an empty list) and update/trade (live ticks) carry trades
+        # under "trades" and/or "liquidation_trades". The subscribed/
+        # form confirms the channel exists; the update/ form delivers
+        # data. See _on_trade for wire-format details.
         if msg_type in ("subscribed/trade", "update/trade"):
             self._subscription_confirmations.add(channel or msg_type)
             await self._on_trade(data, channel)
@@ -679,30 +848,46 @@ class LighterWebSocket:
         data: Dict[str, Any],
         channel: str,
     ) -> None:
-        """Parse a ``trade/{mi}`` payload into per-market tape.
+        """Parse a trade-channel payload into the per-market tape.
 
-        Lighter's WS protocol delivers trades as a list under the
-        ``trades`` key (subscribed-snapshot has the same shape as a
-        live update — both go through this parser). Expected per-
-        trade keys (from the SDK ``Trade`` model):
+        Wire format (observed live, Apr 2026)::
 
-        * ``market_id`` — int (also recoverable from the channel name)
-        * ``size`` — string base-asset amount
-        * ``price`` — string
-        * ``usd_amount`` — string USDC notional
-        * ``timestamp`` — int ms (or sec — we normalize)
-        * ``is_maker_ask`` — bool. ``True`` ⇒ maker was the ask, so the
-          taker bought (a "buy" trade for tape direction). ``False`` ⇒
-          maker was the bid, so the taker sold.
-        * ``type`` — "trade" / "liquidation" / "deleverage" /
-          "market-settlement". Non-trade types are kept for adverse-
-          selection analysis but tagged.
+            {
+              "channel": "trade:1",            # NOTE colon, not slash
+              "type": "update/trade",
+              "nonce": ...,
+              "trades": [{...trade...}, ...],          # may be missing
+              "liquidation_trades": [{...trade...}, ...]  # may be missing/null
+            }
+
+        Two important shape facts the previous parser got wrong:
+
+        1. Lighter's *trade* channel string uses a colon
+           (``trade:1``) where market_stats uses a slash
+           (``market_stats/1``). Splitting on ``/`` only left
+           ``mi=None`` and silently dropped every message.
+        2. The top-level frame has no ``market_id`` field — only the
+           channel string carries it. Each trade *item* has its own
+           ``market_id``, but we cannot rely on the array being
+           non-empty.
+        3. The frame may carry ``trades``, ``liquidation_trades``, or
+           both. We process whichever are present so liquidations
+           don't get dropped from the tape.
+
+        Per-trade keys (from the SDK ``Trade`` model — confirmed live):
+
+        * ``size`` / ``price`` / ``usd_amount`` — string Decimal-safe
+        * ``timestamp`` — int ms (13 digits)
+        * ``is_maker_ask`` — bool. ``True`` ⇒ taker bought (lifted
+          ask). ``False`` ⇒ taker sold (hit bid).
+        * ``type`` — "trade" / "liquidation" / "deleverage"
 
         Defensive: if the payload shape diverges from expectations we
         skip individual entries rather than failing the message.
         """
-        # Resolve market_index — prefer payload, fall back to channel
-        # tail for partial messages.
+        # Resolve market_index. The trade frame's only consistent
+        # carrier is the channel string; top-level market_id is not
+        # populated. Fall back to a per-trade item if needed.
         mi: Optional[int] = None
         for key in ("market_id", "market_index"):
             if key in data:
@@ -712,13 +897,24 @@ class LighterWebSocket:
                 except (TypeError, ValueError):
                     pass
         if mi is None and channel:
+            # Lighter uses ":" for trade channels and "/" for
+            # market_stats. Normalize both before splitting on the
+            # final separator.
+            tail = channel.replace(":", "/").rsplit("/", 1)[-1]
             try:
-                mi = int(channel.rsplit("/", 1)[-1])
-            except (ValueError, IndexError):
+                mi = int(tail)
+            except (ValueError, TypeError):
                 mi = None
 
         trades_raw = data.get("trades")
+        liq_trades_raw = data.get("liquidation_trades")
         if not isinstance(trades_raw, list):
+            trades_raw = []
+        if not isinstance(liq_trades_raw, list):
+            liq_trades_raw = []
+        # Empty subscribed-snapshot or genuine no-data frame — nothing
+        # to do, but not an error.
+        if not trades_raw and not liq_trades_raw:
             return
         if mi is None:
             return
@@ -728,6 +924,11 @@ class LighterWebSocket:
 
         new_records: List[Dict[str, Any]] = []
         for t in trades_raw:
+            rec = _normalize_trade(t, mi)
+            if rec is None:
+                continue
+            new_records.append(rec)
+        for t in liq_trades_raw:
             rec = _normalize_trade(t, mi)
             if rec is None:
                 continue
@@ -875,7 +1076,11 @@ def _normalize_trade(
     if usd is None:
         usd = price * size
 
-    # ts_ms — Lighter mostly returns ms-epoch ints. Coerce sec → ms.
+    # ts_ms — Lighter inconsistencies observed in live frames:
+    #   * ``timestamp`` is ms (13 digits, e.g. 1777347267381)
+    #   * ``transaction_time`` is µs (16 digits, e.g. 1777347267401066)
+    # Prefer ``timestamp``; if we end up with anything looking like
+    # µs or ns, scale down to ms.
     ts_raw: Any = (
         raw.get("timestamp")
         or raw.get("transaction_time")
@@ -886,7 +1091,14 @@ def _normalize_trade(
     except (TypeError, ValueError):
         ts = int(time.time() * 1000)
     if 0 < ts < 1_000_000_000_000:
+        # Looks like seconds → scale to ms.
         ts *= 1000
+    elif ts >= 1_000_000_000_000_000:
+        # ≥ 1e15: at least microseconds. Drop precision down to ms.
+        ts //= 1000
+        if ts >= 1_000_000_000_000_000:
+            # Was originally nanoseconds; one more /1000.
+            ts //= 1000
 
     # Side: True ⇒ taker bought (lifted the ask).
     side: Optional[str] = None
