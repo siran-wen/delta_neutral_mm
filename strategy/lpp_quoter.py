@@ -96,6 +96,11 @@ QUOTER_DEFAULTS: Dict[str, Any] = {
     # Emergency stop
     "emergency_stop_on_consecutive_reject_count": 5,
     "emergency_stop_on_ws_disconnect_sec": 300,
+    # Cancel-failure trigger: detects the case where the OM cancel path
+    # is silently broken (e.g. order_index never propagated). Without
+    # this guard, a stuck cancel can let stale orders accumulate on the
+    # book — exactly how the -1.132 SKHYNIXUSD short was created.
+    "emergency_stop_on_consecutive_cancel_fail_count": 3,
 }
 
 
@@ -192,6 +197,10 @@ class LppQuoter:
             "last_reprice_reason": None,
             "last_reprice_ts_ms": None,
             "consecutive_rejects": 0,
+            # Cancel failures across consecutive reprices. A reprice
+            # whose cancel batch all succeeds resets the counter; any
+            # failure increments by the count of failures observed.
+            "consecutive_cancel_failures": 0,
             "emergency_stops": 0,
             "snapshots_taken": 0,
             "session_start_ts_ms": None,
@@ -252,25 +261,47 @@ class LppQuoter:
             return
         self._stopping = True
         self._stats["session_end_ts_ms"] = int(time.time() * 1000)
+        logger.info("shutdown: stop flag set, no new reprices accepted")
 
         try:
+            active_before = len(self._om.get_active_orders())
+            logger.info(
+                "shutdown: calling om.cancel_all (active=%d)", active_before
+            )
             await self._om.cancel_all()
+            logger.info(
+                "shutdown: om.cancel_all returned (active=%d after)",
+                len(self._om.get_active_orders()),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("om.cancel_all during shutdown raised: %s", exc)
 
         # Wait for ws confirmations to drain _active. 10s is generous —
         # under normal conditions the cancellation push lands sub-second.
+        logger.info("shutdown: waiting for ws cancellations (deadline=10s)")
         deadline = time.time() + 10.0
         while time.time() < deadline:
             if not self._om.get_active_orders():
                 break
             await asyncio.sleep(0.5)
         leftover = len(self._om.get_active_orders())
+        logger.info("shutdown: polling done, active=%d", leftover)
         if leftover > 0:
             logger.warning(
                 "Shutdown: %d orders never confirmed cancelled within deadline",
                 leftover,
             )
+
+        # Belt-and-braces: ask the gateway directly. Catches any order
+        # whose order_index never propagated to the OM (a class of bug
+        # we've seen in production), and verifies the book is clean
+        # before we declare shutdown done. Wrapped in try/except so a
+        # REST hiccup at shutdown can't strand the close path.
+        logger.info("shutdown: calling backup_cancel_via_gateway")
+        try:
+            await self._backup_cancel_via_gateway()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("shutdown: backup cancel failed: %s", exc)
 
         # Final summary.
         try:
@@ -283,6 +314,7 @@ class LppQuoter:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Final tracker summary failed: %s", exc)
 
+        logger.info("shutdown: closing om + ws")
         try:
             await self._om.close()
         except Exception as exc:  # noqa: BLE001
@@ -290,6 +322,7 @@ class LppQuoter:
 
         self._closed = True
         self._started = False
+        logger.info("shutdown: complete")
 
     # ------------------------------------------------------------
     # main loop
@@ -319,11 +352,44 @@ class LppQuoter:
                 # piles on more failures.
                 if self._should_emergency_stop():
                     self._stats["emergency_stops"] += 1
+                    # Snapshot the full context — every threshold
+                    # involved + the live state we're about to drop.
+                    # Inventory uses ``None`` as the mark since we may
+                    # not have a fresh market snapshot at this point;
+                    # the OM falls back to avg-entry pricing for the
+                    # net_delta_usdc field.
+                    inv_snap = self._om.get_inventory()
                     logger.error(
-                        "Emergency stop: consecutive_rejects=%d ws_silent=%s",
+                        "EMERGENCY STOP: rejects=%d (cap=%d) cancel_fails=%d (cap=%d) "
+                        "ws_silent=%.1fs (cap=%ds) inv=%s active_orders=%d",
                         self._stats["consecutive_rejects"],
-                        self._ws_silence_sec(),
+                        int(self.config["emergency_stop_on_consecutive_reject_count"]),
+                        self._stats["consecutive_cancel_failures"],
+                        int(self.config.get(
+                            "emergency_stop_on_consecutive_cancel_fail_count", 3
+                        )),
+                        self._ws_silence_sec() or 0,
+                        int(self.config["emergency_stop_on_ws_disconnect_sec"]),
+                        inv_snap.net_delta_usdc,
+                        len(self._om.get_active_orders()),
                     )
+                    # Two-stage cleanup so a half-broken OM can't strand
+                    # orders on the book:
+                    # 1. Try the OM path (fast, uses cached order_index).
+                    # 2. Fall back to REST direct via gateway — picks up
+                    #    any order whose order_index never propagated.
+                    try:
+                        await self._om.cancel_all()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "emergency: om.cancel_all failed: %s", exc
+                        )
+                    try:
+                        await self._backup_cancel_via_gateway()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "emergency: backup cancel failed: %s", exc
+                        )
                     break
 
                 market = await self._build_market_snapshot()
@@ -350,6 +416,33 @@ class LppQuoter:
                 )
 
                 if reason is not None:
+                    # Drift in bp for diagnostics — only meaningful when
+                    # last_mid is set (initial / first-tick reprice has
+                    # no drift to report).
+                    drift_bp_log = 0.0
+                    if last_mid_for_drift is not None and last_mid_for_drift > 0:
+                        drift_bp_log = float(
+                            abs(market.mid - last_mid_for_drift)
+                            / last_mid_for_drift
+                            * Decimal(10000)
+                        )
+                    last_age_sec = (
+                        (tick_start - last_reprice_ts)
+                        if last_reprice_ts > 0
+                        else -1.0
+                    )
+                    logger.info(
+                        "reprice trigger: reason=%s last_mid=%s new_mid=%s "
+                        "drift_bp=%.2f session_changed=%s pending_fill=%s "
+                        "last_reprice_age=%.1fs",
+                        reason,
+                        last_mid_for_drift,
+                        market.mid,
+                        drift_bp_log,
+                        session_changed,
+                        pending_fill,
+                        last_age_sec,
+                    )
                     await self._execute_reprice(market, session, reason)
                     last_reprice_ts = tick_start
                     last_mid_for_drift = market.mid
@@ -482,6 +575,25 @@ class LppQuoter:
             )
 
         success_cancels = sum(1 for r in cancel_results if r is True)
+        fail_cancels = len(cancel_results) - success_cancels
+
+        # Track consecutive cancel failures for emergency-stop. A
+        # cancel batch where every cancel succeeded resets; any
+        # failure (False return or raised exception) accumulates.
+        # We only update the counter when there were cancels to send —
+        # a reprice with empty cancel set must not reset a counter
+        # that's tracking a real cancel-path problem.
+        if len(cancel_results) > 0:
+            if fail_cancels > 0:
+                self._stats["consecutive_cancel_failures"] += fail_cancels
+                logger.warning(
+                    "cancel failures: %d this reprice (cumulative %d)",
+                    fail_cancels,
+                    self._stats["consecutive_cancel_failures"],
+                )
+            else:
+                self._stats["consecutive_cancel_failures"] = 0
+
         # ``om.submit_order`` records SDK errors on the ManagedOrder
         # (status="rejected") rather than raising — so a returned
         # ``client_order_index`` doesn't on its own prove the place
@@ -503,19 +615,33 @@ class LppQuoter:
         else:
             self._stats["consecutive_rejects"] = 0
 
+        # Per-failure detail. Keeps the volume small (only on failure)
+        # and gives post-hoc forensics the actual error / result.
+        for r in cancel_results:
+            if r is not True:
+                logger.warning("cancel failed: result=%r", r)
+        for r in place_results:
+            if isinstance(r, BaseException):
+                logger.warning("place failed: %r", r)
+
         self._stats["reprice_count"] += 1
         self._stats["last_reprice_reason"] = reason
         self._stats["last_reprice_ts_ms"] = int(time.time() * 1000)
 
         logger.info(
-            "reprice: reason=%s desired=%d cancels=%d/%d places=%d/%d (fail=%d)",
+            "reprice exec: reason=%s desired=%d active=%d → cancels=%d places=%d "
+            "(success: cancels=%d/%d places=%d/%d) inv=%s session=%s",
             reason,
             len(desired),
+            len(active),
+            len(cancels),
+            len(places),
             success_cancels,
             len(cancels),
             success_places,
             len(places),
-            fail_places,
+            inventory.net_delta_usdc,
+            session.name,
         )
 
     # ------------------------------------------------------------
@@ -528,11 +654,29 @@ class LppQuoter:
         Conditions:
         1. Consecutive place rejects ≥ ``emergency_stop_on_consecutive_reject_count``
         2. WS msg gap (any channel) > ``emergency_stop_on_ws_disconnect_sec``
+        3. Consecutive cancel failures ≥
+           ``emergency_stop_on_consecutive_cancel_fail_count`` — guards the
+           regression that produced the -1.132 SKHYNIXUSD short: when the
+           OM cancel path silently fails, stale orders accumulate on the
+           book until something fills against them.
         """
         threshold_rejects = int(
             self.config["emergency_stop_on_consecutive_reject_count"]
         )
         if self._stats["consecutive_rejects"] >= threshold_rejects:
+            return True
+
+        threshold_cancel_fails = int(
+            self.config.get("emergency_stop_on_consecutive_cancel_fail_count", 3)
+        )
+        if (
+            self._stats["consecutive_cancel_failures"] >= threshold_cancel_fails
+        ):
+            logger.error(
+                "Emergency: %d consecutive cancel failures (threshold=%d)",
+                self._stats["consecutive_cancel_failures"],
+                threshold_cancel_fails,
+            )
             return True
 
         gap = self._ws_silence_sec()
@@ -544,6 +688,53 @@ class LppQuoter:
                 return True
 
         return False
+
+    async def _backup_cancel_via_gateway(self) -> None:
+        """REST-direct cancel of every resting order on our market.
+
+        Belt-and-braces cancel path. Called on shutdown / emergency-stop
+        after ``om.cancel_all()`` has had its chance. The OM may have
+        failed to cancel orders whose ``order_index`` is still missing
+        locally (the architectural gap that produced the -1.132
+        SKHYNIXUSD short); pulling the live book via
+        ``OrderApi.account_active_orders`` and cancelling by on-chain id
+        sidesteps that.
+
+        Idempotent — if the book is already clean, this is a single REST
+        call returning ``[]`` and we just log "verified clean ✓". Each
+        cancel is wrapped so one failure can't block the others.
+        """
+        try:
+            open_orders = await self._gateway.get_open_orders(self._market_index)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("backup cancel: get_open_orders failed: %s", exc)
+            return
+        if not open_orders:
+            logger.info("backup cancel: account verified clean ✓ (0 orders)")
+            return
+        logger.warning(
+            "backup cancel: %d orders still on book after om.cancel_all",
+            len(open_orders),
+        )
+        for o in open_orders:
+            oi = o.get("order_index")
+            if not oi:
+                continue
+            try:
+                res = await self._gateway.cancel_order_by_index(
+                    self._market_index, int(oi)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "backup cancel: order_index=%s raised: %s", oi, exc
+                )
+                continue
+            if isinstance(res, dict) and not res.get("ok"):
+                logger.error(
+                    "backup cancel: order_index=%s failed: %s",
+                    oi,
+                    res.get("error"),
+                )
 
     def _ws_silence_sec(self) -> Optional[float]:
         """Seconds since the last inbound ws msg, or None if unknown."""
@@ -633,30 +824,113 @@ class LppQuoter:
     ) -> None:
         """Push one snapshot to the LPP state tracker.
 
-        We re-plan to populate ``my_quotes`` with the current desired
-        set rather than reading the OM's active set directly. The
-        tracker cares about *what we wanted* at this instant, which
-        is what the share computation should reflect — even if some
-        orders are still in flight on the SDK side.
+        Source-of-truth for ``my_quotes`` is the OM's currently-active
+        order set, **not** ``plan_quotes`` output. Reasoning: a 7-min
+        live trace observed a session in which ``plan_quotes`` returned
+        ``[]`` (market spread momentarily under ``min_market_spread_bp``)
+        while the book still carried our two resting orders for ~235s
+        before the next reprice cancelled them. Recording desired in
+        that window logs ``my_quotes=[]`` and zeroes the LPP share
+        estimate, but the orders are real and absorbing depth — the
+        snapshot lied about reward exposure.
+
+        Tier and market_position are re-derived from the live snapshot
+        (the planner's at-submission-time values are stale by now).
         """
         inventory = self._om.get_inventory(mark_price=market.mid)
-        desired = plan_quotes(
-            market=market,
-            session=session,
-            inventory=inventory,
-            config=self.config,
-        )
+        active = self._om.get_active_orders()
+        actual_quotes: List[Quote] = [
+            self._managed_to_quote(o, market, session) for o in active
+        ]
         try:
             await self._tracker.record_snapshot(
                 ts_ms=market.ts_ms,
                 market=market,
-                my_quotes=desired,
+                my_quotes=actual_quotes,
                 inventory=inventory,
                 session=session,
             )
             self._stats["snapshots_taken"] += 1
         except Exception as exc:  # noqa: BLE001
             logger.warning("tracker.record_snapshot raised: %s", exc)
+
+    def _managed_to_quote(
+        self,
+        mo: ManagedOrder,
+        market: MarketSnapshot,
+        session: SessionPolicy,
+    ) -> Quote:
+        """Translate ``ManagedOrder`` → ``Quote`` for the tracker.
+
+        ``ManagedOrder`` carries side / price / size_base directly;
+        ``tier_target`` and ``market_position`` need re-derivation
+        against the live ``market`` snapshot because the planner's
+        original values were computed at submission time and the BBO
+        / mid have since drifted.
+
+        The synthetic ``notes`` tuple flags this Quote as actual-book
+        rather than planner-desired so post-hoc analysis can tell the
+        two sources apart in a tracker JSONL.
+        """
+        size_usdc = mo.size_base * mo.price
+        # Distance is unsigned bp away from the live mid.
+        distance_bp = (
+            abs(mo.price - market.mid) / market.mid * Decimal(10000)
+            if market.mid > 0
+            else Decimal(0)
+        )
+        tier = self._tier_from_distance(distance_bp, session)
+
+        # Market_position relative to live BBO. We don't emit
+        # ``would_cross_market`` here — a live resting order by
+        # definition isn't crossing right now (or it would have
+        # filled). ``passive_below`` / ``passive_above`` distinguish
+        # bids below best_bid / asks above best_ask from the
+        # standard ``passive`` (sitting AT the BBO).
+        if mo.side == "buy":
+            if mo.price > market.best_bid:
+                position = "improving"
+            elif mo.price == market.best_bid:
+                position = "passive"
+            else:
+                position = "passive_below"
+        else:  # sell
+            if mo.price < market.best_ask:
+                position = "improving"
+            elif mo.price == market.best_ask:
+                position = "passive"
+            else:
+                position = "passive_above"
+
+        return Quote(
+            side=mo.side,
+            price=mo.price,
+            size_base=mo.size_base,
+            size_usdc=size_usdc,
+            distance_from_mid_bp=distance_bp,
+            tier_target=tier,
+            market_position=position,
+            notes=(f"actual_book({mo.status})",),
+        )
+
+    @staticmethod
+    def _tier_from_distance(
+        distance_bp: Decimal,
+        session: SessionPolicy,
+    ) -> str:
+        """Map distance-to-mid bp → ``L1`` / ``L2`` / ``L3`` / ``OUT``.
+
+        Boundaries are inclusive (``<=``) so the L1 ceiling is L1 (not
+        L2). Matches ``strategy.quote_planner._determine_tier``.
+        """
+        l1, l2, l3 = session.tier_thresholds_bp
+        if distance_bp <= l1:
+            return "L1"
+        if distance_bp <= l2:
+            return "L2"
+        if distance_bp <= l3:
+            return "L3"
+        return "OUT"
 
     # ------------------------------------------------------------
     # public introspection
@@ -681,6 +955,7 @@ class LppQuoter:
             "last_reprice_reason": self._stats["last_reprice_reason"],
             "last_reprice_ts_ms": self._stats["last_reprice_ts_ms"],
             "consecutive_rejects": self._stats["consecutive_rejects"],
+            "consecutive_cancel_failures": self._stats["consecutive_cancel_failures"],
             "emergency_stops": self._stats["emergency_stops"],
             "snapshots_taken": self._stats["snapshots_taken"],
             "session_start_ts_ms": self._stats["session_start_ts_ms"],

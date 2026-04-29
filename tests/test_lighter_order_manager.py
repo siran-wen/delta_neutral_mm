@@ -106,10 +106,25 @@ class FakeSigner:
 class FakeGateway:
     def __init__(self) -> None:
         self._signer = FakeSigner()
+        # REST stub. Default: empty active-orders list. Tests can
+        # override ``open_orders_response`` (a list) or replace
+        # ``get_open_orders`` outright with a custom coroutine.
+        self.open_orders_response: List[Dict[str, Any]] = []
+        self.get_open_orders_calls: List[int] = []
+        self.get_open_orders_delay_sec: float = 0.0
+        self.get_open_orders_raises: Optional[BaseException] = None
 
     @property
     def signer_client(self) -> FakeSigner:
         return self._signer
+
+    async def get_open_orders(self, market_index: int) -> List[Dict[str, Any]]:
+        self.get_open_orders_calls.append(int(market_index))
+        if self.get_open_orders_delay_sec > 0:
+            await asyncio.sleep(self.get_open_orders_delay_sec)
+        if self.get_open_orders_raises is not None:
+            raise self.get_open_orders_raises
+        return list(self.open_orders_response)
 
 
 class FakeWs:
@@ -128,6 +143,9 @@ def _make_manager(
     request_timeout_sec: float = 1.0,
     retry_max_attempts: int = 3,
     retry_backoff_sec: float = 0.0,
+    periodic_sync_interval_sec: float = 3600.0,
+    market_index_filter: Optional[int] = None,
+    sync_missing_grace_sec: float = 10.0,
 ) -> Tuple[LighterOrderManager, FakeGateway, FakeWs]:
     gw = FakeGateway()
     ws = FakeWs()
@@ -140,6 +158,11 @@ def _make_manager(
         retry_max_attempts=retry_max_attempts,
         # 0 backoff so retry tests don't hang on real time.sleep.
         retry_backoff_sec=retry_backoff_sec,
+        # Default to a long interval so the periodic loop never fires
+        # during a normal test (each test asyncio.run()s for << 1s).
+        periodic_sync_interval_sec=periodic_sync_interval_sec,
+        market_index_filter=market_index_filter,
+        sync_missing_grace_sec=sync_missing_grace_sec,
     )
     return om, gw, ws
 
@@ -258,6 +281,38 @@ def test_submit_order_returns_unique_client_indices():
 
     ids = asyncio.run(_go())
     assert len(set(ids)) == 10
+    # Every coid must fit Lighter's 48-bit ClientOrderIndex limit.
+    assert all(coid < (1 << 48) for coid in ids)
+
+
+def test_client_order_index_below_lighter_48bit_limit():
+    """1000-coid burst must all sit under Lighter's 281474976710655 cap.
+
+    Regression: an earlier implementation seeded the counter with
+    ``ms_epoch << 16`` (~57 bits), which the SDK rejected with
+    "ClientOrderIndex should not be larger than 281474976710655".
+    """
+    om, _, _ = _make_manager()
+
+    async def _go() -> List[int]:
+        await om.start()
+        return [
+            await om.submit_order(
+                side="buy",
+                market_index=161,
+                price=_D("100"),
+                size_base=_D("1"),
+                price_decimals=3,
+                size_decimals=3,
+            )
+            for _ in range(1000)
+        ]
+
+    coids = asyncio.run(_go())
+    assert len(coids) == 1000
+    assert max(coids) < 281474976710655
+    # All coids unique across the burst.
+    assert len(set(coids)) == 1000
 
 
 def test_submit_order_quantizes_price_and_size_to_int():
@@ -943,3 +998,246 @@ def test_pop_fill_signal_set_on_fill_and_consumed_on_read():
     assert om.pop_fill_signal() is True
     # Consumed — second pop returns False
     assert om.pop_fill_signal() is False
+
+
+# ----- I. REST-sync architecture (real Lighter wire format) --------------
+
+
+def test_sync_from_rest_fills_order_index():
+    """REST sync primes ``order_index`` and advances pending_ack → live.
+
+    The real Lighter ``account_all`` ws frame doesn't carry per-order
+    detail. After a submit, ``order_index`` stays None until the OM
+    pulls it from REST. This test drives that path explicitly.
+    """
+    om, gw, _ = _make_manager()
+
+    async def _go() -> int:
+        await om.start()
+        coid = await om.submit_order(
+            side="buy",
+            market_index=161,
+            price=_D("100"),
+            size_base=_D("1"),
+            price_decimals=3,
+            size_decimals=3,
+        )
+        # Pre-condition: order_index is unset, status pending_ack.
+        assert om.get_order_state(coid).order_index is None
+        assert om.get_order_state(coid).status == "pending_ack"
+        # Stage REST response.
+        gw.open_orders_response = [
+            {
+                "client_order_index": coid,
+                "order_index": 12345,
+                "status": "open",
+                "filled_base_amount": _D("0"),
+                "remaining_base_amount": _D("1000"),
+                "market_index": 161,
+            }
+        ]
+        await om._sync_orders_from_rest()
+        return coid
+
+    coid = asyncio.run(_go())
+    state = om.get_order_state(coid)
+    assert state is not None
+    assert state.order_index == 12345
+    assert state.status == "live"
+    # Fan-out fired the live event.
+    # (the test fixture uses no callback so we just check stats /
+    # state; the event-emission contract is covered by the legacy ws
+    # path test above.)
+    stats = om.get_stats()
+    assert stats["rest_syncs_total"] >= 1
+    assert stats["last_sync_ts_ms"] is not None
+
+
+def test_sync_from_rest_marks_missing_as_cancelled():
+    """An active order missing from REST after the grace window → cancelled.
+
+    The OM has no fills feed, so it cannot tell ``cancelled`` apart
+    from ``filled``. ``cancelled`` is the safer default for the
+    planner's reprice loop, which will then re-quote.
+    """
+    # Tight grace so the test doesn't sit on time.sleep.
+    om, gw, _ = _make_manager(sync_missing_grace_sec=0.0)
+
+    async def _go() -> int:
+        await om.start()
+        coid = await om.submit_order(
+            side="buy",
+            market_index=161,
+            price=_D("100"),
+            size_base=_D("1"),
+            price_decimals=3,
+            size_decimals=3,
+        )
+        # Pretend we're well past the grace window. Backdate sent_ts
+        # by 30s so the sync's age check fires.
+        order = om.get_order_state(coid)
+        order.status = "live"
+        order.order_index = 999
+        order.sent_ts_ms -= 30_000
+        # REST returns no orders → local must be marked cancelled.
+        gw.open_orders_response = []
+        await om._sync_orders_from_rest()
+        return coid
+
+    coid = asyncio.run(_go())
+    state = om.get_order_state(coid)
+    assert state is not None
+    assert state.status == "cancelled"
+    # Moved to historical, no longer in active.
+    assert om.get_active_orders() == []
+    assert any("rest_sync_missing" in n for n in state.notes)
+    assert om.get_stats()["lifetime_cancelled"] == 1
+
+
+def test_position_change_triggers_sync():
+    """``open_order_count`` delta in a ws position fires a REST sync.
+
+    Same count twice in a row should NOT trigger a second sync.
+    """
+    om, gw, _ = _make_manager(market_index_filter=161)
+
+    pos_msg_with_count = lambda n: {
+        "channel": "account_all:42",
+        "type": "update/account_all",
+        "positions": {
+            "161": {
+                "market_id": 161,
+                "symbol": "SKHYNIXUSD",
+                "open_order_count": n,
+                "position": "0.000",
+                "sign": 1,
+                "avg_entry_price": "0.000",
+            }
+        },
+    }
+
+    async def _go() -> Tuple[int, int, int]:
+        await om.start()
+        # start() does an initial sync → 1 call (filter=161 means
+        # markets={161} even with no active orders).
+        baseline_calls = len(gw.get_open_orders_calls)
+
+        # First position change: 0 → 2. First-seen for market 161
+        # already fired during start()'s initial sync; this one is
+        # a real delta.
+        om.on_account_event(pos_msg_with_count(2))
+        # Yield so the create_task() task runs to completion.
+        await asyncio.sleep(0.05)
+        after_change = len(gw.get_open_orders_calls)
+
+        # Same count again — no delta, no new sync.
+        om.on_account_event(pos_msg_with_count(2))
+        await asyncio.sleep(0.05)
+        after_no_change = len(gw.get_open_orders_calls)
+
+        return baseline_calls, after_change, after_no_change
+
+    baseline, after_change, after_no_change = asyncio.run(_go())
+    assert after_change > baseline, "open_order_count change should trigger sync"
+    assert after_no_change == after_change, "same count should not trigger sync"
+
+
+def test_periodic_sync_runs_every_30s():
+    """Periodic-sync background loop fires every ``periodic_sync_interval_sec``."""
+    # Tight interval so the test wraps in well under a second.
+    om, gw, _ = _make_manager(
+        periodic_sync_interval_sec=0.05,
+        market_index_filter=161,
+    )
+
+    async def _go() -> int:
+        await om.start()
+        # start() did one initial sync. Wait for the periodic loop to
+        # fire several more times.
+        await asyncio.sleep(0.25)
+        await om.close()
+        return len(gw.get_open_orders_calls)
+
+    call_count = asyncio.run(_go())
+    # 0.25s / 0.05s ≈ 5 ticks + 1 from start(), so ≥ 3 is a comfortable
+    # lower bound that survives scheduling jitter on slow CI.
+    assert call_count >= 3, f"expected ≥3 REST calls, got {call_count}"
+
+
+# ----- J. inventory authority (Fix B) ------------------------------------
+
+
+def test_inventory_uses_ws_position_authoritatively():
+    """A ws ``positions`` push overrides whatever local fill accumulation produced.
+
+    Regression: production observed a path where REST sync mis-accumulated
+    fills (or missed one), and the planner's ``hard_position_cap_usdc``
+    gate trusted the drift. The ws ledger is the source of truth — when
+    a fresh push arrives, it must overwrite the local cache.
+    """
+    om, _, _ = _make_manager()
+
+    # Seed local inventory via the fill path: long 1.0 base @ 100.
+    om._apply_fill_to_inventory("buy", _D("1.0"), _D("100"))
+    assert om.get_inventory().net_delta_base == _D("1.0")
+
+    # Now a ws push lands with a different (and authoritative) state:
+    # short 0.5 base, avg entry 200. This is what the server says we
+    # actually hold; OM must honour it over its own cache.
+    msg = {
+        "channel": "account_all:42",
+        "type": "update/account_all",
+        "positions": {
+            "161": {
+                "market_id": 161,
+                "symbol": "SKHYNIXUSD",
+                "open_order_count": 0,
+                "position": "0.5",
+                "sign": -1,
+                "avg_entry_price": "200",
+            }
+        },
+    }
+    om.on_account_event(msg)
+
+    inv = om.get_inventory(mark_price=_D("200"))
+    # Authoritative: short 0.5 (not long 1.0 from the local fill).
+    assert inv.net_delta_base == _D("-0.5")
+    assert inv.avg_entry_price == _D("200")
+
+
+def test_periodic_sync_does_not_overwrite_ws_position():
+    """A REST sync that yields no order changes must not touch inventory.
+
+    Inventory is a position-level concept; REST returns *active orders*,
+    not positions. The sync has no business overwriting a value that
+    came from the authoritative ws ``positions`` push.
+    """
+    om, gw, _ = _make_manager(market_index_filter=161)
+
+    async def _go() -> Tuple[Decimal, Decimal]:
+        # Put inventory in a known state via a ws position push.
+        msg = {
+            "channel": "account_all:42",
+            "type": "update/account_all",
+            "positions": {
+                "161": {
+                    "market_id": 161,
+                    "open_order_count": 0,
+                    "position": "0.7",
+                    "sign": 1,
+                    "avg_entry_price": "100",
+                }
+            },
+        }
+        om.on_account_event(msg)
+        before = om._inventory_base
+        # Run a REST sync (no orders, no fills) — must not perturb base.
+        await om._sync_orders_from_rest_safe()
+        after = om._inventory_base
+        return before, after
+
+    before, after = asyncio.run(_go())
+    assert before == _D("0.7")
+    assert after == _D("0.7"), f"REST sync changed inventory: {before} → {after}"
+

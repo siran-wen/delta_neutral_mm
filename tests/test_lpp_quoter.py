@@ -52,6 +52,7 @@ class FakeSigner:
         self.create_calls: List[Dict[str, Any]] = []
         self.cancel_calls: List[Dict[str, Any]] = []
         self.create_always_fails = False
+        self.cancel_always_fails = False
 
     async def create_order(self, **kwargs: Any) -> Tuple[Any, Any, Optional[str]]:
         self.create_calls.append(kwargs)
@@ -61,6 +62,8 @@ class FakeSigner:
 
     async def cancel_order(self, **kwargs: Any) -> Tuple[Any, Any, Optional[str]]:
         self.cancel_calls.append(kwargs)
+        if self.cancel_always_fails:
+            return (None, None, "fake cancel fail")
         return ("ok", "ok", None)
 
 
@@ -68,6 +71,14 @@ class FakeGateway:
     def __init__(self) -> None:
         self._signer = FakeSigner()
         self.book: Optional[Dict[str, Any]] = None
+        # REST stubs for OM REST-sync and quoter backup-cancel paths.
+        # Tests can preload ``open_orders_response`` and inspect the
+        # call lists / cancel results.
+        self.open_orders_response: List[Dict[str, Any]] = []
+        self.get_open_orders_calls: List[int] = []
+        self.cancel_by_index_calls: List[Tuple[int, int]] = []
+        self.cancel_by_index_result: Dict[str, Any] = {"ok": True, "tx": "fake"}
+        self.cancel_by_index_raises: Optional[BaseException] = None
 
     @property
     def signer_client(self) -> FakeSigner:
@@ -75,6 +86,20 @@ class FakeGateway:
 
     async def get_orderbook(self, symbol: str, limit: int = 20) -> Optional[Dict[str, Any]]:
         return self.book
+
+    async def get_open_orders(self, market_index: int) -> List[Dict[str, Any]]:
+        self.get_open_orders_calls.append(int(market_index))
+        return list(self.open_orders_response)
+
+    async def cancel_order_by_index(
+        self,
+        market_index: int,
+        order_index: int,
+    ) -> Dict[str, Any]:
+        self.cancel_by_index_calls.append((int(market_index), int(order_index)))
+        if self.cancel_by_index_raises is not None:
+            raise self.cancel_by_index_raises
+        return dict(self.cancel_by_index_result)
 
 
 class FakeWs:
@@ -654,10 +679,25 @@ def test_buy_then_sell_inventory_close():
 
 
 def test_record_snapshot_calls_tracker_with_full_args():
-    q, _, _, _, tracker = _make_quoter()
+    """Snapshot reflects the OM's actual active orders, not plan_quotes desired.
+
+    The 7-min live regression: plan_quotes returns [] for a tick when
+    spread momentarily under-shoots min, but the book still carries
+    our resting orders. We must record what's really on the book.
+    """
+    q, _, _, om, tracker = _make_quoter()
 
     async def _go() -> None:
         await q.start()
+        # Pre-load 2 active orders. These ARE the my_quotes the
+        # tracker should see — even if plan_quotes might return
+        # something else for this market state.
+        for side, price in (("buy", _D("99.95")), ("sell", _D("100.05"))):
+            coid = await om.submit_order(
+                side=side, market_index=161, price=price,
+                size_base=_D("1"), price_decimals=3, size_decimals=3,
+            )
+            om.on_account_event(_ws_order_msg(coid, "open", order_index=1))
         market = await q._build_market_snapshot()
         await q._record_snapshot(market, get_kr_overnight_session())
 
@@ -665,8 +705,167 @@ def test_record_snapshot_calls_tracker_with_full_args():
     assert len(tracker.snapshots) == 1
     rec = tracker.snapshots[0]
     assert rec["session"] == "KR_OVERNIGHT"
-    # Two desired quotes (bid+ask) for default config + open spread
+    # 2 active orders → 2 quotes, regardless of what plan_quotes thinks.
     assert rec["n_quotes"] == 2
+
+
+def test_record_snapshot_uses_actual_book_when_plan_quotes_returns_empty():
+    """The regression case: plan_quotes returns [] but book has live orders.
+
+    With ``min_market_spread_bp`` set to 999 the planner refuses to
+    quote any market we have, so plan_quotes is guaranteed to return
+    []. The tracker still has to see the 2 orders that are really on
+    the book.
+    """
+    q, _, _, om, tracker = _make_quoter(
+        config_overrides={"min_market_spread_bp": Decimal("999")},
+    )
+
+    async def _go() -> None:
+        await q.start()
+        for side, price in (("buy", _D("99.95")), ("sell", _D("100.05"))):
+            coid = await om.submit_order(
+                side=side, market_index=161, price=price,
+                size_base=_D("1"), price_decimals=3, size_decimals=3,
+            )
+            om.on_account_event(_ws_order_msg(coid, "open", order_index=1))
+        market = await q._build_market_snapshot()
+        # Sanity: with the 999bp min, plan_quotes is empty.
+        from strategy.quote_planner import plan_quotes
+        assert plan_quotes(
+            market=market,
+            session=get_kr_overnight_session(),
+            inventory=om.get_inventory(mark_price=market.mid),
+            config=q.config,
+        ) == []
+        await q._record_snapshot(market, get_kr_overnight_session())
+
+    asyncio.run(_go())
+    assert len(tracker.snapshots) == 1
+    # 2 actual orders on the book, despite plan_quotes returning [].
+    assert tracker.snapshots[0]["n_quotes"] == 2
+
+
+def test_managed_to_quote_derives_tier_from_distance():
+    """Tier comes from current-mid distance, not the planner's submit-time value.
+
+    Sanity-checks the ``<=`` boundary semantics: L1 ceiling lands in
+    L1, the next bp slips to L2.
+    """
+    from execution.lighter.lighter_order_manager import ManagedOrder
+    q, _, _, _, _ = _make_quoter()
+    session = SessionPolicy(
+        name="KR_OVERNIGHT", action="quote",
+        default_distance_bp=_D("8"), default_size_usdc=_D("500"),
+        tier_thresholds_bp=(_D("15"), _D("25"), _D("50")), reason="test",
+    )
+
+    def _make_order(price: str) -> ManagedOrder:
+        return ManagedOrder(
+            client_order_index=1,
+            side="buy",
+            market_index=161,
+            price=_D(price),
+            size_base=_D("1"),
+            price_decimals=3,
+            size_decimals=3,
+            order_type="limit",
+            time_in_force="post_only",
+            reduce_only=False,
+            sent_ts_ms=0,
+        )
+
+    market = _make_market_with_mid(_D("100"))
+    cases = [
+        ("99.99", "L1"),   # 1bp distance
+        ("99.97", "L1"),   # 3bp
+        ("99.85", "L1"),   # 15bp — boundary, L1
+        ("99.84", "L2"),   # 16bp — slips to L2
+        ("99.75", "L2"),   # 25bp — boundary, L2
+        ("99.50", "L3"),   # 50bp — boundary, L3
+        ("99.49", "OUT"),  # 51bp
+    ]
+    for price_str, expected_tier in cases:
+        quote = q._managed_to_quote(_make_order(price_str), market, session)
+        assert quote.tier_target == expected_tier, (
+            f"price={price_str} expected={expected_tier} got={quote.tier_target}"
+        )
+
+
+def test_managed_to_quote_position_from_bbo():
+    """Market position is re-derived from the live BBO at snapshot time."""
+    from execution.lighter.lighter_order_manager import ManagedOrder
+    q, _, _, _, _ = _make_quoter()
+    session = SessionPolicy(
+        name="KR_OVERNIGHT", action="quote",
+        default_distance_bp=_D("8"), default_size_usdc=_D("500"),
+        tier_thresholds_bp=(_D("15"), _D("25"), _D("50")), reason="test",
+    )
+    # mid=100, best_bid=99.95, best_ask=100.05
+    market = _make_market_with_mid(_D("100"), best_bid=_D("99.95"), best_ask=_D("100.05"))
+
+    def _make_order(side: str, price: str) -> ManagedOrder:
+        return ManagedOrder(
+            client_order_index=1, side=side, market_index=161,
+            price=_D(price), size_base=_D("1"),
+            price_decimals=3, size_decimals=3,
+            order_type="limit", time_in_force="post_only",
+            reduce_only=False, sent_ts_ms=0,
+        )
+
+    # Buy improving (above best_bid)
+    assert q._managed_to_quote(
+        _make_order("buy", "99.96"), market, session
+    ).market_position == "improving"
+    # Buy passive at best_bid
+    assert q._managed_to_quote(
+        _make_order("buy", "99.95"), market, session
+    ).market_position == "passive"
+    # Buy below best_bid
+    assert q._managed_to_quote(
+        _make_order("buy", "99.90"), market, session
+    ).market_position == "passive_below"
+    # Sell improving (below best_ask)
+    assert q._managed_to_quote(
+        _make_order("sell", "100.04"), market, session
+    ).market_position == "improving"
+    # Sell passive at best_ask
+    assert q._managed_to_quote(
+        _make_order("sell", "100.05"), market, session
+    ).market_position == "passive"
+    # Sell above best_ask
+    assert q._managed_to_quote(
+        _make_order("sell", "100.10"), market, session
+    ).market_position == "passive_above"
+
+
+def _make_market_with_mid(
+    mid: Decimal,
+    *,
+    best_bid: Optional[Decimal] = None,
+    best_ask: Optional[Decimal] = None,
+) -> MarketSnapshot:
+    """Helper: build a minimal MarketSnapshot for snapshot/managed-quote tests."""
+    bb = best_bid if best_bid is not None else mid - Decimal("0.05")
+    ba = best_ask if best_ask is not None else mid + Decimal("0.05")
+    return MarketSnapshot(
+        symbol="SKHYNIXUSD",
+        market_index=161,
+        mid=mid,
+        mark_price=mid,
+        index_price=mid,
+        best_bid=bb,
+        best_ask=ba,
+        spread_bp=(ba - bb) / mid * Decimal(10000),
+        depth_by_spread_bp={
+            15: {"bid_usdc": Decimal(0), "ask_usdc": Decimal(0), "total_usdc": Decimal(0)},
+            25: {"bid_usdc": Decimal(0), "ask_usdc": Decimal(0), "total_usdc": Decimal(0)},
+            50: {"bid_usdc": Decimal(0), "ask_usdc": Decimal(0), "total_usdc": Decimal(0)},
+        },
+        price_decimals=3,
+        size_decimals=3,
+        ts_ms=int(time.time() * 1000),
+    )
 
 
 def test_run_until_takes_periodic_snapshots():
@@ -812,3 +1011,186 @@ def test_adapt_managed_order_translates_field_names():
     assert d["side"] == "buy"
     assert d["price"] == _D("100")
     assert d["size_base"] == _D("1")
+
+
+# ----- G2. log diagnostics ------------------------------------------------
+
+
+def test_lpp_quoter_logs_reprice_trigger(caplog):
+    """``run_until`` must log a ``reprice trigger:`` line when reprice fires.
+
+    Forensic value: when reprice cadence looks wrong post-hoc, the
+    trigger log carries last_mid/new_mid/drift_bp so the cause is
+    obvious without having to re-run with -vv.
+    """
+    import logging
+    caplog.set_level(logging.INFO, logger="strategy.lpp_quoter")
+    q, _, _, _, _ = _make_quoter(
+        config_overrides={"tick_interval_sec": Decimal("0.01")},
+    )
+
+    async def _go() -> None:
+        await q.start()
+        # 0.05s budget — far past one tick at 0.01s interval; the
+        # initial "reason=initial" reprice should have fired.
+        await q.run_until(time.time() + 0.05)
+        await q.shutdown()
+
+    asyncio.run(_go())
+    assert "reprice trigger" in caplog.text
+
+
+# ----- H. consecutive cancel-failure trigger (Fix A) ---------------------
+
+
+def test_emergency_stop_consecutive_cancel_failures():
+    """N reprices with cancel failures → counter ≥ threshold → emergency stop.
+
+    Configures threshold=2, runs two reprices each with 2 cancel attempts
+    that fail at the SDK layer. Counter should reach ≥2 and the
+    emergency-stop predicate should fire.
+    """
+    q, gw, _, om, _ = _make_quoter(
+        config_overrides={
+            "emergency_stop_on_consecutive_cancel_fail_count": 2,
+            # Disable other triggers so this test isolates the cancel path.
+            "emergency_stop_on_consecutive_reject_count": 999,
+        },
+    )
+    # Make the SDK fail every cancel — OM.cancel_order returns False
+    # after the retry loop exhausts.
+    gw.signer_client.cancel_always_fails = True
+
+    async def _go() -> None:
+        await q.start()
+        # Pre-load 2 active orders far from the desired set so the
+        # next reprice produces 2 cancels.
+        for side, price in (("buy", _D("90")), ("sell", _D("110"))):
+            coid = await om.submit_order(
+                side=side, market_index=161, price=price,
+                size_base=_D("1"), price_decimals=3, size_decimals=3,
+            )
+            om.on_account_event(_ws_order_msg(coid, "open"))
+
+        market = await q._build_market_snapshot()
+        session = get_kr_overnight_session()
+        # First reprice: 2 cancels, all fail → counter should be 2.
+        await q._execute_reprice(market, session, "mid_drift(20bp)")
+        # Second reprice: orders are still active (cancel didn't change
+        # state), so we'll attempt to cancel them again → 4 cumulative.
+        await q._execute_reprice(market, session, "mid_drift(20bp)")
+
+    asyncio.run(_go())
+    assert q.get_summary()["consecutive_cancel_failures"] >= 2
+    assert q._should_emergency_stop() is True
+
+
+def test_consecutive_cancel_failures_resets_on_success():
+    """A reprice where every cancel succeeds resets the counter to 0."""
+    q, gw, _, om, _ = _make_quoter(
+        config_overrides={
+            "emergency_stop_on_consecutive_cancel_fail_count": 5,
+        },
+    )
+
+    async def _go() -> Tuple[int, int]:
+        await q.start()
+        # Pre-load 2 active orders.
+        for side, price in (("buy", _D("90")), ("sell", _D("110"))):
+            coid = await om.submit_order(
+                side=side, market_index=161, price=price,
+                size_base=_D("1"), price_decimals=3, size_decimals=3,
+            )
+            om.on_account_event(_ws_order_msg(coid, "open"))
+
+        market = await q._build_market_snapshot()
+        session = get_kr_overnight_session()
+
+        # First reprice: cancels fail.
+        gw.signer_client.cancel_always_fails = True
+        await q._execute_reprice(market, session, "mid_drift(20bp)")
+        after_fail = q._stats["consecutive_cancel_failures"]
+
+        # Re-prime active orders (the OM still has them since cancel
+        # didn't move them out, but we want a fresh batch with new
+        # coids so order_index lookup still works on the now-passing
+        # cancel path).
+        # Second reprice with cancels succeeding: counter resets to 0.
+        gw.signer_client.cancel_always_fails = False
+        await q._execute_reprice(market, session, "mid_drift(20bp)")
+        after_success = q._stats["consecutive_cancel_failures"]
+
+        return after_fail, after_success
+
+    after_fail, after_success = asyncio.run(_go())
+    assert after_fail >= 2, f"first reprice should accumulate failures, got {after_fail}"
+    assert after_success == 0, f"successful cancel batch must reset, got {after_success}"
+
+
+# ----- I. backup cancel via gateway (shutdown hardening) -----------------
+
+
+def test_shutdown_calls_backup_cancel_after_om_cancel_all():
+    """Shutdown's polling loop is followed by a REST-direct backup cancel.
+
+    Even if the OM thinks everything is cancelled, the gateway view of
+    the book is what counts. ``_backup_cancel_via_gateway`` should fire
+    and (when REST reports stale orders) issue a per-order cancel.
+    """
+    q, gw, _, om, _ = _make_quoter()
+    # Simulate a stale order on the book that the OM was unaware of —
+    # exactly the regression that produced the -1.132 short. After OM
+    # cancel_all completes, REST still reports this.
+    gw.open_orders_response = [
+        {
+            "client_order_index": 9999,
+            "order_index": 7777777,
+            "market_index": 161,
+            "side": "buy",
+            "price": _D("100"),
+            "status": "open",
+        }
+    ]
+
+    async def _go() -> None:
+        await q.start()
+        await q.shutdown()
+
+    asyncio.run(_go())
+    # Backup pulled the book.
+    assert 161 in gw.get_open_orders_calls
+    # And cancelled the stale order via REST.
+    assert (161, 7777777) in gw.cancel_by_index_calls
+
+
+def test_emergency_stop_calls_backup_cancel():
+    """Emergency-stop path also drives the REST backup cancel."""
+    q, gw, _, om, _ = _make_quoter(
+        config_overrides={
+            "emergency_stop_on_consecutive_cancel_fail_count": 1,
+            "tick_interval_sec": Decimal("0.01"),
+        },
+    )
+    # REST will report a stale order during the emergency cleanup.
+    gw.open_orders_response = [
+        {
+            "client_order_index": 8888,
+            "order_index": 5555555,
+            "market_index": 161,
+            "side": "sell",
+            "price": _D("105"),
+            "status": "open",
+        }
+    ]
+
+    async def _go() -> None:
+        await q.start()
+        # Pre-set the cancel-failure counter past threshold so the
+        # first tick trips emergency stop.
+        q._stats["consecutive_cancel_failures"] = 5
+        await q.run_until(time.time() + 5)
+
+    asyncio.run(_go())
+    assert q.get_summary()["emergency_stops"] == 1
+    # Emergency path must have driven the backup cancel.
+    assert (161, 5555555) in gw.cancel_by_index_calls

@@ -510,3 +510,26 @@ def test_quote_size_base_always_positive():
     for q in quotes:
         assert q.size_base > 0
         assert q.size_usdc > 0
+
+
+# ---- log diagnostics — guard against future refactors stripping them ----
+
+
+def test_plan_quotes_logs_empty_reason_when_spread_too_tight(caplog):
+    """``plan_quotes`` must log the reason whenever it returns ``[]``.
+
+    Forensic value: a 4-min live run that produces zero quotes is
+    unrecoverable from the JSONL alone if the planner returned silently.
+    The log line ties the empty result to the actual gating condition.
+    """
+    import logging  # local: avoid touching module-level imports
+    caplog.set_level(logging.INFO, logger="strategy.quote_planner")
+    session = kr_market_hours_session()
+    # Spread 1bp << min (3bp by default) → empty result + log line
+    market = market_kr_lunch_lite(
+        spread_bp="1", l1_bid="5000", l1_ask="5000",
+    )
+    quotes = plan_quotes(market, session, EMPTY_INVENTORY, DEFAULT_CONFIG)
+    assert quotes == []
+    assert "market_spread" in caplog.text
+    assert "min" in caplog.text

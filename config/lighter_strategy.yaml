@@ -20,9 +20,9 @@ strategy:
   size_decimals: 3
 
   # Inventory management
-  target_max_delta_usdc: "500"
+  target_max_delta_usdc: "50"
   skew_max_offset_bp: "5"
-  hard_position_cap_usdc: "1000"
+  hard_position_cap_usdc: "100"
 
   # Market-state guards
   min_market_spread_bp: "3"
@@ -49,17 +49,23 @@ strategy:
   # Emergency stop
   emergency_stop_on_consecutive_reject_count: 5
   emergency_stop_on_ws_disconnect_sec: 300
+  # Triggers when the cancel path silently fails N times in a row —
+  # protects against the regression that produced a -1.132 SKHYNIXUSD
+  # short on the first live test (cancels would no-op while new orders
+  # accumulated). On trip, the quoter calls om.cancel_all + a REST
+  # backup cancel via the gateway and breaks out of the run loop.
+  emergency_stop_on_consecutive_cancel_fail_count: 3
 
 recovery:
   # Cancel any orders found resting on the account at startup.
   cancel_stale_orders: true
   # Soft-warn threshold: a non-zero position with notional below this
   # logs a warning but the strategy still starts (treats it as drift).
-  warn_if_existing_position_above_usdc: "100"
+  warn_if_existing_position_above_usdc: "50"
   # Hard-abort threshold: at or above this notional we refuse to
   # start, requiring manual flatten before re-running. Set to "0"
   # to never abort.
-  abort_if_existing_position_above_usdc: "1000"
+  abort_if_existing_position_above_usdc: "200"
   # How long to wait after sending stale-order cancels before
   # starting the quoter — gives ws confirmations time to drain.
   wait_after_cancel_sec: 5

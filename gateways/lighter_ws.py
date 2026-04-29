@@ -568,6 +568,18 @@ class LighterWebSocket:
     async def _run_loop(self) -> None:
         retry_count = 0
         while self._running:
+            # Reconnect-attempt diagnostic. Skipped on the very first
+            # attempt (no prior session yet); from the second connect
+            # onwards we log the *reason* the previous one ended and
+            # the prior uptime so a tail can correlate stalls / drops.
+            if self._connect_count > 0:
+                logger.info(
+                    "ws reconnecting: attempt=%d last_disconnect_reason=%s "
+                    "prev_uptime=%.1fs",
+                    self._connect_count + 1,
+                    self._last_disconnect_reason,
+                    self._max_uptime_sec,
+                )
             try:
                 async with websockets.connect(
                     self.ws_url,

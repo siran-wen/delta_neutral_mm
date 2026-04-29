@@ -205,6 +205,10 @@ def parse_and_confirm_args(argv: Optional[List[str]] = None) -> argparse.Namespa
 
 
 def _setup_logging(verbosity: int, jsonl_path: Path) -> logging.Logger:
+    # Logging levels:
+    #   default (no -v): WARNING+ for libraries, INFO for strategy
+    #   -v:              INFO for everything
+    #   -vv (future):    DEBUG for everything (heavy disk IO, only for replay)
     level = logging.WARNING
     if verbosity == 1:
         level = logging.INFO
@@ -449,7 +453,7 @@ async def run_live_mode(
     price_decimals = int(strategy_cfg.get("price_decimals", 4))
     size_decimals = int(strategy_cfg.get("size_decimals", 4))
 
-    # Build gateway from env-backed default config (LIGHTER_API_PRIVATE_KEY etc).
+    # Build gateway from env-backed default config (API_KEY_PRIVATE_KEY etc).
     gw_cfg_path = _PROJECT_ROOT / "config" / "lighter_config.yaml"
     if not gw_cfg_path.exists():
         logger.error("missing %s — cannot connect signer", gw_cfg_path)
@@ -463,7 +467,7 @@ async def run_live_mode(
         return 3
 
     if gateway.account_index is None or gateway.signer_client is None:
-        logger.error("--live requires LIGHTER_API_PRIVATE_KEY + LIGHTER_ACCOUNT_INDEX in env")
+        logger.error("--live requires API_KEY_PRIVATE_KEY + LIGHTER_ACCOUNT_INDEX in env")
         await gateway.close()
         return 3
 
@@ -550,6 +554,46 @@ async def run_live_mode(
         market, market_index, args.duration,
     )
 
+    # Echo the *effective* config so a tailing log makes it obvious
+    # what knobs the run is using (yaml + defaults merged). Mirrors
+    # the JSONL strategy_start event we just wrote, but in a
+    # tail-friendly format. Keys come from ``strategy_cfg`` (already
+    # decimal-coerced via ``_coerce_decimal_fields``).
+    cfg = strategy_cfg
+    logger.info("=== STRATEGY CONFIG (effective) ===")
+    logger.info(
+        "  market: %s (idx=%d, price_dec=%d, size_dec=%d)",
+        market, market_index, price_decimals, size_decimals,
+    )
+    logger.info(
+        "  size: target_max=%s hard_cap=%s skew_max=%sbp",
+        cfg.get("target_max_delta_usdc"),
+        cfg.get("hard_position_cap_usdc"),
+        cfg.get("skew_max_offset_bp"),
+    )
+    logger.info(
+        "  market filters: spread_min=%sbp max=%sbp",
+        cfg.get("min_market_spread_bp"),
+        cfg.get("max_market_spread_bp"),
+    )
+    logger.info(
+        "  share: warn_threshold=%s widen_bp=%s",
+        cfg.get("share_warn_threshold"),
+        cfg.get("share_warn_widen_bp"),
+    )
+    logger.info(
+        "  reprice: drift=%sbp min_interval=%ss",
+        cfg.get("reprice_drift_bp"),
+        cfg.get("reprice_min_interval_sec"),
+    )
+    logger.info(
+        "  emergency: rejects=%s cancel_fails=%s ws_silent=%ss",
+        cfg.get("emergency_stop_on_consecutive_reject_count"),
+        cfg.get("emergency_stop_on_consecutive_cancel_fail_count"),
+        cfg.get("emergency_stop_on_ws_disconnect_sec"),
+    )
+    logger.info("=== END CONFIG ===")
+
     # 4. SIGINT / SIGTERM → request stop
     stop_event = asyncio.Event()
     install_signal_handlers(stop_event)
@@ -585,7 +629,89 @@ async def run_live_mode(
             "ts_ms": int(time.time() * 1000),
             "summary": _jsonable(summary),
         })
-        logger.info("STRATEGY SHUTDOWN done summary=%s", summary)
+        # Tail-friendly final summary. JSONL still has the canonical
+        # record above; this is for the operator reading the console.
+        try:
+            om_stats = summary.get("om", {}) or {}
+            session_start_ms = summary.get("session_start_ts_ms") or 0
+            session_end_ms = summary.get("session_end_ts_ms") or int(time.time() * 1000)
+            actual_duration_min = (
+                (session_end_ms - session_start_ms) / 60_000.0
+                if session_start_ms and session_end_ms
+                else 0.0
+            )
+            try:
+                ws_stats = ws.get_message_stats() or {}
+            except Exception:  # noqa: BLE001
+                ws_stats = {}
+            try:
+                inv = quoter.get_inventory()
+            except Exception:  # noqa: BLE001
+                inv = None
+            try:
+                tracker_summary = quoter._tracker.get_session_summary(
+                    session_start_ms=session_start_ms,
+                    session_end_ms=session_end_ms,
+                    symbol=market,
+                ) or {}
+            except Exception:  # noqa: BLE001
+                tracker_summary = {}
+
+            logger.info("=== STRATEGY FINAL SUMMARY ===")
+            logger.info(
+                "  duration: %.1fmin (%d ticks, %d skipped)",
+                actual_duration_min,
+                summary.get("tick_count", 0),
+                summary.get("skipped_tick_count", 0),
+            )
+            logger.info(
+                "  reprice: count=%d (last_reason=%s)",
+                summary.get("reprice_count", 0),
+                summary.get("last_reprice_reason") or "-",
+            )
+            logger.info(
+                "  emergency: stops=%d rejects=%d cancel_fails=%d",
+                summary.get("emergency_stops", 0),
+                summary.get("consecutive_rejects", 0),
+                summary.get("consecutive_cancel_failures", 0),
+            )
+            logger.info(
+                "  om: submitted=%d filled=%d cancelled=%d rejected=%d active=%d",
+                om_stats.get("lifetime_submitted", 0),
+                om_stats.get("lifetime_filled", 0),
+                om_stats.get("lifetime_cancelled", 0),
+                om_stats.get("lifetime_rejected", 0),
+                om_stats.get("active_count", 0),
+            )
+            logger.info(
+                "  rest_syncs: total=%d", om_stats.get("rest_syncs_total", 0)
+            )
+            logger.info(
+                "  ws: connect_count=%d max_uptime=%.0fs last_reason=%s",
+                ws_stats.get("connect_count", 0),
+                ws_stats.get("max_uptime_sec", 0) or 0,
+                ws_stats.get("last_disconnect_reason"),
+            )
+            if inv is not None:
+                logger.info(
+                    "  inventory: %s base @ %s avg, %s USDC mark-to-market",
+                    inv.net_delta_base,
+                    inv.avg_entry_price if inv.avg_entry_price is not None else "-",
+                    inv.net_delta_usdc,
+                )
+            logger.info(
+                "  lpp: snapshots=%d est_reward=%s share_p50=%s",
+                tracker_summary.get("snapshots_count", 0),
+                tracker_summary.get("estimated_reward_usdc"),
+                tracker_summary.get("share_p50"),
+            )
+            logger.info("=== END SUMMARY ===")
+        except Exception as exc:  # noqa: BLE001
+            # Keep the original concise log as a fallback so a buggy
+            # summary block can't swallow the run-end notice.
+            logger.warning("final summary formatting failed: %s", exc)
+            logger.info("STRATEGY SHUTDOWN done summary=%s", summary)
+
         try:
             await ws.disconnect()
         except Exception as exc:  # noqa: BLE001

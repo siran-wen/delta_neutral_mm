@@ -82,11 +82,25 @@ def plan_quotes(
         raise ValueError(f"invalid mid price: {market.mid}")
 
     if session.action == "withdraw":
+        logger.info(
+            "plan_quotes: empty (session=%s action=withdraw)",
+            session.name,
+        )
         return []
 
     if market.spread_bp < config["min_market_spread_bp"]:
+        logger.info(
+            "plan_quotes: empty (market_spread=%.2fbp < min=%.2fbp)",
+            float(market.spread_bp),
+            float(config["min_market_spread_bp"]),
+        )
         return []
     if market.spread_bp > config["max_market_spread_bp"]:
+        logger.info(
+            "plan_quotes: empty (market_spread=%.2fbp > max=%.2fbp; market unstable)",
+            float(market.spread_bp),
+            float(config["max_market_spread_bp"]),
+        )
         return []
 
     base_distance = session.default_distance_bp
@@ -191,7 +205,13 @@ def plan_quotes(
 
     quotes: List[Quote] = []
 
-    if not skip_bid:
+    if skip_bid:
+        logger.info(
+            "plan_quotes: bid skipped (long inventory %s > hard_cap %s)",
+            inventory.net_delta_usdc,
+            config["hard_position_cap_usdc"],
+        )
+    else:
         if bid_size_base > 0:
             quotes.append(Quote(
                 side="buy",
@@ -209,7 +229,13 @@ def plan_quotes(
                 market.symbol, base_size, actual_bid,
             )
 
-    if not skip_ask:
+    if skip_ask:
+        logger.info(
+            "plan_quotes: ask skipped (short inventory %s < -%s)",
+            inventory.net_delta_usdc,
+            config["hard_position_cap_usdc"],
+        )
+    else:
         if ask_size_base > 0:
             quotes.append(Quote(
                 side="sell",
@@ -226,5 +252,33 @@ def plan_quotes(
                 "ask size quantized to 0 for %s: base_size=%s, price=%s — skipping",
                 market.symbol, base_size, actual_ask,
             )
+
+    # Decision summary — debug level so production -v prints it but
+    # default (WARNING+) stays quiet. Lazy formatting via %s; the
+    # float() casts on bp values are cheap and only evaluated when
+    # the handler emits.
+    logger.debug(
+        "plan_quotes: %d quotes session=%s mid=%s spread=%.2fbp inv=%s "
+        "skew_offset=(%s,%s) share_warn=(%s,%s)",
+        len(quotes),
+        session.name,
+        market.mid,
+        float(market.spread_bp),
+        inventory.net_delta_usdc,
+        bid_offset,
+        ask_offset,
+        share_warn_bid,
+        share_warn_ask,
+    )
+    for q in quotes:
+        logger.debug(
+            "plan_quotes: %s @%s size=%s tier=%s pos=%s notes=%s",
+            q.side,
+            q.price,
+            q.size_base,
+            q.tier_target,
+            q.market_position,
+            q.notes,
+        )
 
     return quotes
