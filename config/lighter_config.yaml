@@ -3,7 +3,7 @@
 # Env-var placeholders are expanded at load time. Export these shell
 # variables before running the observer:
 #
-#     export LIGHTER_API_PRIVATE_KEY=0x...
+#     export API_KEY_PRIVATE_KEY=0x...
 #     export LIGHTER_ACCOUNT_INDEX=12345
 #     export LIGHTER_API_KEY_INDEX=0
 
@@ -16,7 +16,7 @@ lighter:
   auth:
     # 40-byte hex string registered with Lighter; never commit this file
     # with the literal key in place.
-    api_key_private_key: ${LIGHTER_API_PRIVATE_KEY}
+    api_key_private_key: ${API_KEY_PRIVATE_KEY}
     # Your Lighter account_index (integer). Required for account queries;
     # leave ${LIGHTER_ACCOUNT_INDEX} unset or pass --no-account to skip.
     account_index: ${LIGHTER_ACCOUNT_INDEX}

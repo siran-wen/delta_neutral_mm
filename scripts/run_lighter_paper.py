@@ -13,7 +13,7 @@ Run with::
 
 The script never touches ``SignerClient``. It does need outbound
 network access (REST + WSS) to pull real depth / mark prices, but no
-``.env`` / ``LIGHTER_API_PRIVATE_KEY`` is read.
+``.env`` / ``API_KEY_PRIVATE_KEY`` is read.
 
 What runs each tick (1s default)
 --------------------------------

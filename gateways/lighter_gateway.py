@@ -152,22 +152,17 @@ class LighterGateway:
             self.order_api = OrderApi(self.api_client)
 
             if self.api_key_private_key:
-                # lighter-sdk 1.0.9 reshaped SignerClient.__init__:
-                #   old (0.x): SignerClient(url=, private_key=, account_index=, api_key_index=)
-                #   new (1.0.9): SignerClient(url, account_index, api_private_keys: Dict[int, str])
-                # The api_key_index is now encoded as the dict key in
-                # api_private_keys, not as a dedicated parameter. A single-key
-                # dict matches our config (one hot key per account).
                 self._signer_client = SignerClient(
                     url=self.base_url,
+                    private_key=self.api_key_private_key,
+                    api_key_index=self.api_key_index,
                     account_index=self.account_index or 0,
-                    api_private_keys={self.api_key_index: self.api_key_private_key},
                 )
                 err = self._signer_client.check_client()
                 if err is not None:
                     raise LighterGatewayError(
                         f"SignerClient.check_client() failed: {err}. "
-                        "Verify LIGHTER_API_PRIVATE_KEY / LIGHTER_ACCOUNT_INDEX / "
+                        "Verify API_KEY_PRIVATE_KEY / LIGHTER_ACCOUNT_INDEX / "
                         "LIGHTER_API_KEY_INDEX match the keys registered on Lighter."
                     )
                 self._signer_checked = True
