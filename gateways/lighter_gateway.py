@@ -154,9 +154,8 @@ class LighterGateway:
             if self.api_key_private_key:
                 self._signer_client = SignerClient(
                     url=self.base_url,
-                    private_key=self.api_key_private_key,
-                    api_key_index=self.api_key_index,
                     account_index=self.account_index or 0,
+                    api_private_keys={self.api_key_index: self.api_key_private_key},
                 )
                 err = self._signer_client.check_client()
                 if err is not None:
