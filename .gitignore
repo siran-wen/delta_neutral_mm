@@ -17,3 +17,4 @@ logs/
 # Claude Code 本地设置
 .claude/
 .env
+.DS_Store
