@@ -251,6 +251,23 @@ def _coerce_decimal_fields(cfg: Dict[str, Any]) -> Dict[str, Any]:
     for k in decimal_keys:
         if k in out and not isinstance(out[k], Decimal):
             out[k] = Decimal(str(out[k]))
+
+    # Coerce nested session_overrides: each session's numeric fields → Decimal.
+    # The override dict shape is `{SESSION_NAME: {default_size_usdc: ..., ...}}`
+    # — yaml's auto-typing doesn't reach into the inner dict, so plan_quotes
+    # would otherwise see strings and break Decimal arithmetic.
+    if "session_overrides" in out and isinstance(out["session_overrides"], dict):
+        session_decimal_keys = {"default_size_usdc", "default_distance_bp"}
+        coerced_overrides: Dict[str, Any] = {}
+        for sess_name, sess_cfg in out["session_overrides"].items():
+            if not isinstance(sess_cfg, dict):
+                continue
+            sess_out = dict(sess_cfg)
+            for k in session_decimal_keys:
+                if k in sess_out and not isinstance(sess_out[k], Decimal):
+                    sess_out[k] = Decimal(str(sess_out[k]))
+            coerced_overrides[str(sess_name)] = sess_out
+        out["session_overrides"] = coerced_overrides
     return out
 
 
@@ -592,6 +609,17 @@ async def run_live_mode(
         cfg.get("emergency_stop_on_consecutive_cancel_fail_count"),
         cfg.get("emergency_stop_on_ws_disconnect_sec"),
     )
+    overrides = cfg.get("session_overrides") or {}
+    if overrides:
+        logger.info("  session_overrides:")
+        for sess_name, sess_cfg in sorted(overrides.items()):
+            size = sess_cfg.get("default_size_usdc", "(default)")
+            dist = sess_cfg.get("default_distance_bp", "(default)")
+            logger.info("    %s: size=%s dist=%s", sess_name, size, dist)
+    else:
+        logger.warning(
+            "  session_overrides: NONE — using hard-coded $500-$1000 defaults"
+        )
     logger.info("=== END CONFIG ===")
 
     # 4. SIGINT / SIGTERM → request stop

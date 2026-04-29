@@ -293,6 +293,30 @@ def test_coerce_decimal_fields_converts_known_keys():
     assert out["market"] == "SKHYNIXUSD"  # untouched
 
 
+def test_coerce_decimal_handles_session_overrides_nested():
+    """Nested session_overrides → each session's numeric fields → Decimal.
+
+    Yaml's auto-typing doesn't reach into the inner dict, so without the
+    nested coercion plan_quotes would break Decimal arithmetic on string
+    values when the yaml carries quoted numbers.
+    """
+    raw = {
+        "target_max_delta_usdc": "50",
+        "session_overrides": {
+            "KR_OVERNIGHT": {"default_size_usdc": "50"},
+            "KR_MARKET_HOURS_AM": {
+                "default_size_usdc": "100",
+                "default_distance_bp": "5",
+            },
+        },
+    }
+    out = _coerce_decimal_fields(raw)
+    assert out["target_max_delta_usdc"] == _D("50")
+    assert out["session_overrides"]["KR_OVERNIGHT"]["default_size_usdc"] == _D("50")
+    assert out["session_overrides"]["KR_MARKET_HOURS_AM"]["default_size_usdc"] == _D("100")
+    assert out["session_overrides"]["KR_MARKET_HOURS_AM"]["default_distance_bp"] == _D("5")
+
+
 def test_jsonl_writer_appends_lines(tmp_path):
     p = tmp_path / "nested" / "out.jsonl"
     writer = _JsonlWriter(p)

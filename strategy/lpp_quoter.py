@@ -207,6 +207,32 @@ class LppQuoter:
             "session_end_ts_ms": None,
         }
 
+        # Session overrides from yaml: passed as config["session_overrides"]
+        # (a dict of session_name -> {default_size_usdc, default_distance_bp,
+        # tier_thresholds_bp}). If absent, get_kr_equity_session falls back
+        # to hard-coded defaults in strategy/session_aware.py (which are
+        # $500-$1000 nominal size). See 04-29 root-cause analysis: those
+        # hard-coded defaults caused single fills 5x larger than
+        # hard_position_cap_usdc on a small-size run.
+        raw_overrides = self.config.get("session_overrides") or {}
+        self._session_overrides: Dict[str, Dict[str, Any]] = {}
+        if isinstance(raw_overrides, dict):
+            for sess_name, sess_cfg in raw_overrides.items():
+                if isinstance(sess_cfg, dict):
+                    self._session_overrides[str(sess_name)] = dict(sess_cfg)
+        if not self._session_overrides:
+            logger.warning(
+                "LppQuoter: no session_overrides in config — sessions will "
+                "use hard-coded defaults from strategy/session_aware.py "
+                "($500-$1000 size). Verify intended."
+            )
+        else:
+            logger.info(
+                "LppQuoter: session_overrides loaded for %d sessions: %s",
+                len(self._session_overrides),
+                sorted(self._session_overrides.keys()),
+            )
+
     # ------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------
@@ -398,7 +424,10 @@ class LppQuoter:
                     await self._sleep_to_next_tick(tick_start, tick_interval)
                     continue
 
-                session = get_kr_equity_session(datetime.now(timezone.utc))
+                session = get_kr_equity_session(
+                    datetime.now(timezone.utc),
+                    config=self._session_overrides,
+                )
                 session_changed = (
                     last_session_name is not None
                     and session.name != last_session_name

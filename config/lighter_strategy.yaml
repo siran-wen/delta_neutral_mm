@@ -56,6 +56,31 @@ strategy:
   # backup cancel via the gateway and breaks out of the run loop.
   emergency_stop_on_consecutive_cancel_fail_count: 3
 
+  # Session-level overrides for default_size_usdc / default_distance_bp.
+  # These OVERRIDE the hard-coded defaults in strategy/session_aware.py
+  # (which are tuned for $500-$1000 nominal size). For small-size testing
+  # or risk-controlled live runs, set per-session size_usdc here.
+  #
+  # 04-29 lesson: hard-coded $500-$1000 size with hard_cap_usdc=100
+  # produced a -$199 short on a single 40% partial fill (5x cap),
+  # because hard_cap can't bound a single oversized fill. Use small
+  # size_usdc + matching hard_cap_usdc instead.
+  session_overrides:
+    KR_MARKET_HOURS_AM:
+      default_size_usdc: "50"
+    KR_MARKET_HOURS_PM:
+      default_size_usdc: "50"
+    KR_LUNCH_BREAK:
+      default_size_usdc: "50"
+    KR_AFTER_CLOSE:
+      default_size_usdc: "50"
+    KR_OVERNIGHT:
+      default_size_usdc: "50"
+    KR_BEFORE_OPEN:
+      default_size_usdc: "50"
+    KR_WEEKEND:
+      default_size_usdc: "50"
+
 recovery:
   # Cancel any orders found resting on the account at startup.
   cancel_stale_orders: true

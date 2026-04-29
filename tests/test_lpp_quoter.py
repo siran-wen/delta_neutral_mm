@@ -1163,6 +1163,41 @@ def test_shutdown_calls_backup_cancel_after_om_cancel_all():
     assert (161, 7777777) in gw.cancel_by_index_calls
 
 
+def test_session_overrides_propagate_through_planner():
+    """yaml session_overrides → LppQuoter → get_kr_equity_session.
+
+    Verifies the wiring fix from 04-29 catastrophic-bug analysis:
+    yaml-level per-session size_usdc overrides must reach the planner
+    so a small-size live run can't be silently downgraded to the
+    hard-coded $500-$1000 defaults baked into session_aware._DEFAULTS.
+    """
+    overrides = {
+        "KR_OVERNIGHT": {"default_size_usdc": _D("50")},
+        "KR_MARKET_HOURS_AM": {
+            "default_size_usdc": _D("75"),
+            "default_distance_bp": _D("6"),
+        },
+    }
+    q, _, _, _, _ = _make_quoter(
+        config_overrides={"session_overrides": overrides},
+    )
+    # Loaded onto the quoter
+    assert "KR_OVERNIGHT" in q._session_overrides
+    assert q._session_overrides["KR_OVERNIGHT"]["default_size_usdc"] == _D("50")
+    assert q._session_overrides["KR_MARKET_HOURS_AM"]["default_size_usdc"] == _D("75")
+    assert q._session_overrides["KR_MARKET_HOURS_AM"]["default_distance_bp"] == _D("6")
+    # And the override actually flows into get_kr_equity_session — pick a
+    # Mon 02:00 UTC instant which deterministically lands on KR_MARKET_HOURS_AM,
+    # so we can assert the planner-bound size is the override (75) rather
+    # than the hard-coded default (1000).
+    from strategy.session_aware import get_kr_equity_session
+    moment = datetime(2026, 4, 20, 2, 0, tzinfo=timezone.utc)
+    s = get_kr_equity_session(moment, config=q._session_overrides)
+    assert s.name == "KR_MARKET_HOURS_AM"
+    assert s.default_size_usdc == _D("75")
+    assert s.default_distance_bp == _D("6")
+
+
 def test_emergency_stop_calls_backup_cancel():
     """Emergency-stop path also drives the REST backup cancel."""
     q, gw, _, om, _ = _make_quoter(
