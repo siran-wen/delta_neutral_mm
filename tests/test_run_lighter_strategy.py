@@ -299,6 +299,24 @@ def test_coerce_decimal_fields_converts_known_keys():
     assert out["market"] == "SKHYNIXUSD"  # untouched
 
 
+def test_coerce_decimal_handles_phase21_fields():
+    """Phase 2.1 added 6 new Decimal-typed yaml fields. Verify each gets
+    coerced from yaml string → Decimal so plan_quotes / lpp_quoter
+    arithmetic stays in Decimal-land."""
+    raw = {
+        "hard_position_cap_pct": "0.30",
+        "active_hedge_trigger_pct": "1.0",
+        "active_hedge_target_pct": "0.3",
+        "active_hedge_taker_fee_max_pct": "0.1",
+        "daily_max_drawdown_usdc": "100",
+        "daily_max_drawdown_pct": "0.05",
+    }
+    out = _coerce_decimal_fields(raw)
+    for k, expected in raw.items():
+        assert out[k] == _D(expected), f"{k} not coerced to Decimal({expected})"
+        assert isinstance(out[k], Decimal), f"{k} must be Decimal, got {type(out[k])}"
+
+
 def test_coerce_decimal_handles_session_overrides_nested():
     """Nested session_overrides → each session's numeric fields → Decimal.
 

@@ -46,7 +46,7 @@ import logging
 import time
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Optional, Tuple
 
 from execution.lighter.lighter_order_manager import (
@@ -111,6 +111,29 @@ QUOTER_DEFAULTS: Dict[str, Any] = {
     "send_failure_window_sec": 30,
     "send_failure_threshold": 5,
     "reconcile_pause_sec": 60,
+    # Phase 2.1 P2.1.1: pct-of-collateral cap. None disables the
+    # double-cap; supplied with a Decimal pct, plan_quotes uses
+    # min(hard_position_cap_usdc, pct * collateral). Refresh cadence
+    # below controls how often we pull latest collateral via REST.
+    "hard_position_cap_pct": None,
+    "collateral_refresh_interval_sec": 60,
+    # Phase 2.1 P2.1.2: active hedge. When inv breaches trigger_pct of
+    # the effective cap, send an IOC reduce_only at mid * (1 ± slippage)
+    # to flatten down to target_pct. After firing, reuse the
+    # _reconcile_pause_until_ms gate to suppress reprice for
+    # active_hedge_pause_after_sec while the hedge fills propagate.
+    "active_hedge_enabled": False,
+    "active_hedge_trigger_pct": Decimal("1.0"),
+    "active_hedge_target_pct": Decimal("0.3"),
+    "active_hedge_taker_fee_max_pct": Decimal("0.1"),
+    "active_hedge_pause_after_sec": 30,
+    # Phase 2.1 P2.1.3: daily max drawdown stop loss. start() captures
+    # collateral_start; periodic check fires emergency_stop when
+    # drawdown >= min(daily_max_drawdown_usdc, daily_max_drawdown_pct
+    # * collateral_start).
+    "daily_max_drawdown_usdc": Decimal("100"),
+    "daily_max_drawdown_pct": Decimal("0.05"),
+    "daily_drawdown_check_interval_sec": 300,
 }
 
 
@@ -217,6 +240,11 @@ class LppQuoter:
             "session_end_ts_ms": None,
             # Phase 1.2 P0.4 surge handler.
             "reconcile_count": 0,
+            # Phase 2.1 P2.1.2 active hedge.
+            "active_hedges_total": 0,
+            "active_hedges_failed": 0,
+            # Phase 2.1 P2.1.3 daily drawdown stop.
+            "daily_drawdown_breaches": 0,
         }
 
         # Phase 1.2 P0.4: rolling window of send-failure timestamps
@@ -226,6 +254,26 @@ class LppQuoter:
         # stop pumping more failed sends through the SDK.
         self._send_failure_window: List[int] = []
         self._reconcile_pause_until_ms: int = 0
+
+        # Phase 2.1 P2.1.1: latest known collateral. Refreshed via REST
+        # at ``collateral_refresh_interval_sec`` cadence inside the run
+        # loop. None until the first refresh succeeds; plan_quotes
+        # treats None as "no pct cap, fall back to absolute usdc cap".
+        self._latest_collateral_usdc: Optional[Decimal] = None
+        self._collateral_refresh_interval_sec: int = int(
+            self.config.get("collateral_refresh_interval_sec", 60)
+        )
+        self._last_collateral_refresh_ts_ms: int = 0
+
+        # Phase 2.1 P2.1.2: active hedge.
+        self._active_hedge_enabled: bool = bool(
+            self.config.get("active_hedge_enabled", False)
+        )
+        self._last_active_hedge_ts_ms: int = 0
+
+        # Phase 2.1 P2.1.3: daily drawdown.
+        self._collateral_start_usdc: Optional[Decimal] = None
+        self._last_drawdown_check_ts_ms: int = 0
 
         # Session overrides from yaml: passed as config["session_overrides"]
         # (a dict of session_name -> {default_size_usdc, default_distance_bp,
@@ -284,6 +332,14 @@ class LppQuoter:
         await self._om.start()
         self._started = True
         self._stats["session_start_ts_ms"] = int(time.time() * 1000)
+
+        # Phase 2.1 P2.1.1 + P2.1.3: capture collateral baseline up
+        # front. Used by both the pct-cap path (plan_quotes) and the
+        # daily drawdown stop. Best-effort — a REST hiccup at start
+        # mustn't block the quoter; the periodic refresh will fill in
+        # _latest_collateral_usdc on its own when the network is back.
+        await self._refresh_collateral(force=True, capture_baseline=True)
+
         logger.info(
             "LppQuoter started (symbol=%s, market_index=%d, account_index=%d)",
             self._symbol,
@@ -438,9 +494,49 @@ class LppQuoter:
                         )
                     break
 
+                # Phase 2.1 P2.1.1: refresh collateral on cadence so the
+                # pct cap + drawdown gate see fresh values.
+                await self._refresh_collateral()
+
+                # Phase 2.1 P2.1.3: daily drawdown stop. Same effect as
+                # an emergency stop — cancel everything and exit. Runs
+                # before snapshot so a failing market data path can't
+                # mask a real drawdown breach.
+                now_ms_dd = int(time.time() * 1000)
+                if await self._maybe_check_daily_drawdown(now_ms_dd):
+                    logger.error(
+                        "DAILY DRAWDOWN STOP: cancelling all + breaking run loop"
+                    )
+                    try:
+                        await self._om.cancel_all()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "drawdown stop: om.cancel_all failed: %s", exc
+                        )
+                    try:
+                        await self._backup_cancel_via_gateway()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "drawdown stop: backup cancel failed: %s", exc
+                        )
+                    break
+
                 market = await self._build_market_snapshot()
                 if market is None:
                     self._stats["skipped_tick_count"] += 1
+                    await self._sleep_to_next_tick(tick_start, tick_interval)
+                    continue
+
+                # Phase 2.1 P2.1.2: active hedge check, before reprice
+                # decision. If triggered, the helper installs a
+                # _reconcile_pause_until_ms so the next branch skips
+                # repricing for active_hedge_pause_after_sec — giving
+                # the IOC fills time to land in the inventory ledger.
+                inv_for_hedge = self._om.get_inventory(mark_price=market.mid)
+                hedge_fired = await self._maybe_trigger_active_hedge(
+                    market, inv_for_hedge
+                )
+                if hedge_fired:
                     await self._sleep_to_next_tick(tick_start, tick_interval)
                     continue
 
@@ -582,6 +678,245 @@ class LppQuoter:
         return None
 
     # ------------------------------------------------------------
+    # Phase 2.1 helpers — collateral, active hedge, drawdown
+    # ------------------------------------------------------------
+
+    async def _refresh_collateral(
+        self,
+        force: bool = False,
+        capture_baseline: bool = False,
+    ) -> None:
+        """Pull latest collateral via REST, store on ``_latest_collateral_usdc``.
+
+        With ``force=True`` the cadence check is skipped (used by
+        ``start()`` to capture the day-zero baseline) and the previous
+        timestamp is still updated so the periodic loop's next check
+        is offset from the baseline call.
+
+        With ``capture_baseline=True`` (only meaningful at ``start()``),
+        the fetched value is also written to ``_collateral_start_usdc``
+        for the daily-drawdown gate.
+
+        Errors are logged + swallowed — a REST hiccup must not break
+        the run loop. ``_latest_collateral_usdc`` stays at its prior
+        value until the next successful refresh.
+        """
+        now_ms = int(time.time() * 1000)
+        if not force:
+            interval_ms = self._collateral_refresh_interval_sec * 1000
+            if (now_ms - self._last_collateral_refresh_ts_ms) < interval_ms:
+                return
+        try:
+            info = await self._gateway.get_account_info()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("collateral refresh failed: %s", exc)
+            self._last_collateral_refresh_ts_ms = now_ms
+            return
+        if not info or info.get("collateral") is None:
+            self._last_collateral_refresh_ts_ms = now_ms
+            return
+        try:
+            new_collateral = Decimal(str(info["collateral"]))
+        except Exception:  # noqa: BLE001
+            self._last_collateral_refresh_ts_ms = now_ms
+            return
+        if self._latest_collateral_usdc != new_collateral:
+            logger.info(
+                "collateral refresh: %s -> %s",
+                self._latest_collateral_usdc,
+                new_collateral,
+            )
+        self._latest_collateral_usdc = new_collateral
+        if capture_baseline and self._collateral_start_usdc is None:
+            self._collateral_start_usdc = new_collateral
+            logger.info(
+                "daily_drawdown: collateral_start=%s",
+                self._collateral_start_usdc,
+            )
+        self._last_collateral_refresh_ts_ms = now_ms
+
+    def _effective_cap_usdc(self) -> Decimal:
+        """Return the live effective cap = min(absolute, pct*collateral).
+
+        Mirrors the logic inside ``is_position_capped`` so the active
+        hedge sees the same threshold the planner used. When the pct
+        config is unset or collateral hasn't been fetched, returns the
+        absolute cap.
+        """
+        cap_usdc = Decimal(str(self.config["hard_position_cap_usdc"]))
+        pct_raw = self.config.get("hard_position_cap_pct")
+        if (
+            pct_raw is not None
+            and self._latest_collateral_usdc is not None
+            and self._latest_collateral_usdc > 0
+        ):
+            pct_dec = (
+                pct_raw if isinstance(pct_raw, Decimal) else Decimal(str(pct_raw))
+            )
+            pct_cap = pct_dec * self._latest_collateral_usdc
+            if pct_cap < cap_usdc:
+                return pct_cap
+        return cap_usdc
+
+    async def _maybe_trigger_active_hedge(
+        self,
+        market: MarketSnapshot,
+        inventory: InventoryState,
+    ) -> bool:
+        """Check inv against the trigger; if breached, send IOC reduce_only.
+
+        Returns True iff a hedge was submitted (caller should skip the
+        rest of the tick). The hedge:
+          * fires only when ``active_hedge_enabled`` is True;
+          * is sized as ``abs(inv) - target_usdc`` so it leaves the
+            account at ``target_pct * effective_cap`` notional, not flat;
+          * uses ``time_in_force="ioc"`` + ``reduce_only=True`` so a
+            partial fill is acceptable and the hedge can never flip
+            the sign;
+          * pauses repricing for ``active_hedge_pause_after_sec`` via
+            ``_reconcile_pause_until_ms`` so the next reprice doesn't
+            race the hedge fill before ws/REST sync catches up.
+
+        Slippage tolerance is ``active_hedge_taker_fee_max_pct`` in
+        percent (e.g. 0.1 → 0.1%). The price is set at
+        ``mid * (1 ± slippage)`` so the IOC walks at most that far
+        through the book before the unfilled portion auto-cancels.
+        """
+        if not self._active_hedge_enabled:
+            return False
+        if abs(inventory.net_delta_usdc) < Decimal("1"):
+            return False
+
+        cap_usdc = self._effective_cap_usdc()
+        trigger_pct = Decimal(
+            str(self.config.get("active_hedge_trigger_pct", "1.0"))
+        )
+        target_pct = Decimal(
+            str(self.config.get("active_hedge_target_pct", "0.3"))
+        )
+        trigger_usdc = cap_usdc * trigger_pct
+        target_usdc = cap_usdc * target_pct
+
+        if abs(inventory.net_delta_usdc) < trigger_usdc:
+            return False
+
+        hedge_size_usdc = abs(inventory.net_delta_usdc) - target_usdc
+        if hedge_size_usdc <= 0:
+            return False
+
+        size_step = Decimal(10) ** -market.size_decimals
+        hedge_size_base = (hedge_size_usdc / market.mid).quantize(
+            size_step, rounding=ROUND_DOWN
+        )
+        if hedge_size_base <= 0:
+            return False
+
+        hedge_side = "sell" if inventory.net_delta_usdc > 0 else "buy"
+        max_slippage = Decimal(
+            str(self.config.get("active_hedge_taker_fee_max_pct", "0.1"))
+        ) / Decimal(100)
+        tick = Decimal(10) ** -market.price_decimals
+        if hedge_side == "buy":
+            hedge_price = (market.mid * (Decimal(1) + max_slippage)).quantize(
+                tick, rounding=ROUND_DOWN
+            )
+        else:
+            hedge_price = (market.mid * (Decimal(1) - max_slippage)).quantize(
+                tick, rounding=ROUND_DOWN
+            )
+
+        logger.error(
+            "ACTIVE HEDGE: inv=%s breaches trigger=%s, IOC %s %s base @ %s "
+            "(target=%s, max_slip_pct=%s, cap_eff=%s)",
+            inventory.net_delta_usdc,
+            trigger_usdc,
+            hedge_side,
+            hedge_size_base,
+            hedge_price,
+            target_usdc,
+            max_slippage * Decimal(100),
+            cap_usdc,
+        )
+
+        try:
+            coid = await self._om.submit_order(
+                side=hedge_side,
+                market_index=market.market_index,
+                price=hedge_price,
+                size_base=hedge_size_base,
+                price_decimals=market.price_decimals,
+                size_decimals=market.size_decimals,
+                order_type="limit",
+                time_in_force="ioc",
+                reduce_only=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._stats["active_hedges_failed"] += 1
+            logger.error("ACTIVE HEDGE submit failed: %s", exc)
+            return False
+
+        self._stats["active_hedges_total"] += 1
+        self._last_active_hedge_ts_ms = int(time.time() * 1000)
+        pause_sec = int(self.config.get("active_hedge_pause_after_sec", 30))
+        self._reconcile_pause_until_ms = (
+            self._last_active_hedge_ts_ms + pause_sec * 1000
+        )
+        logger.info(
+            "ACTIVE HEDGE: submitted coid=%s, pausing reprice for %ds",
+            coid,
+            pause_sec,
+        )
+        return True
+
+    async def _maybe_check_daily_drawdown(self, now_ms: int) -> bool:
+        """Periodic daily-drawdown gate. Returns True iff breach.
+
+        Caller (run_until) treats True the same way as
+        ``_should_emergency_stop``: cancel_all + REST backup + break.
+        """
+        check_interval_ms = int(
+            self.config.get("daily_drawdown_check_interval_sec", 300)
+        ) * 1000
+        if (now_ms - self._last_drawdown_check_ts_ms) < check_interval_ms:
+            return False
+        self._last_drawdown_check_ts_ms = now_ms
+
+        if (
+            self._collateral_start_usdc is None
+            or self._latest_collateral_usdc is None
+        ):
+            return False
+
+        drawdown = self._collateral_start_usdc - self._latest_collateral_usdc
+        if drawdown <= 0:
+            return False
+        max_dd_usdc = Decimal(
+            str(self.config.get("daily_max_drawdown_usdc", "100"))
+        )
+        max_dd_pct = Decimal(
+            str(self.config.get("daily_max_drawdown_pct", "0.05"))
+        )
+        max_dd_pct_usdc = max_dd_pct * self._collateral_start_usdc
+        effective_max_dd = (
+            max_dd_pct_usdc if max_dd_pct_usdc < max_dd_usdc else max_dd_usdc
+        )
+
+        if drawdown >= effective_max_dd:
+            logger.error(
+                "DAILY DRAWDOWN BREACH: drawdown=%s >= max=%s "
+                "(start=%s, now=%s, abs_cap=%s, pct_cap=%s)",
+                drawdown,
+                effective_max_dd,
+                self._collateral_start_usdc,
+                self._latest_collateral_usdc,
+                max_dd_usdc,
+                max_dd_pct_usdc,
+            )
+            self._stats["daily_drawdown_breaches"] += 1
+            return True
+        return False
+
+    # ------------------------------------------------------------
     # reprice execution
     # ------------------------------------------------------------
 
@@ -599,6 +934,7 @@ class LppQuoter:
             session=session,
             inventory=inventory,
             config=self.config,
+            collateral_usdc=self._latest_collateral_usdc,
         )
 
         active = self._om.get_active_orders()
@@ -1061,6 +1397,15 @@ class LppQuoter:
             "emergency_stops": self._stats["emergency_stops"],
             "snapshots_taken": self._stats["snapshots_taken"],
             "reconcile_count": self._stats["reconcile_count"],
+            "active_hedges_total": self._stats["active_hedges_total"],
+            "active_hedges_failed": self._stats["active_hedges_failed"],
+            "daily_drawdown_breaches": self._stats["daily_drawdown_breaches"],
+            "collateral_start_usdc": str(self._collateral_start_usdc)
+            if self._collateral_start_usdc is not None
+            else None,
+            "collateral_latest_usdc": str(self._latest_collateral_usdc)
+            if self._latest_collateral_usdc is not None
+            else None,
             "session_start_ts_ms": self._stats["session_start_ts_ms"],
             "session_end_ts_ms": self._stats["session_end_ts_ms"],
             "om": om_stats,

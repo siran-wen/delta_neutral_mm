@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from .inventory_skew import compute_skew_offsets, is_position_capped
 from .types import InventoryState, MarketSnapshot, Quote, SessionPolicy
@@ -66,17 +66,27 @@ def plan_quotes(
     session: SessionPolicy,
     inventory: InventoryState,
     config: dict,
+    collateral_usdc: Optional[Decimal] = None,
 ) -> List[Quote]:
     """Produce 0/1/2 ``Quote`` objects for the current snapshot.
 
     ``config`` keys (all required):
         target_max_delta_usdc:   Decimal — skew clamp denominator
         skew_max_offset_bp:      Decimal — max bp added by skew
-        hard_position_cap_usdc:  Decimal — hard skip threshold
+        hard_position_cap_usdc:  Decimal — hard skip threshold (absolute)
         min_market_spread_bp:    Decimal — below = market too tight, return []
         max_market_spread_bp:    Decimal — above = abnormal, return []
         share_warn_threshold:    Decimal — fraction triggering widen
         share_warn_widen_bp:     Decimal — added bp on share warn
+
+    ``config`` optional (Phase 2.1 double cap):
+        hard_position_cap_pct:   Decimal — pct of collateral; effective
+                                 cap = min(hard_cap_usdc, pct*collateral)
+                                 when ``collateral_usdc`` is supplied.
+
+    ``collateral_usdc``: caller may pass the latest account collateral so
+    the pct cap activates. ``None`` (or ``hard_position_cap_pct`` absent)
+    falls back to the absolute cap behaviour from Phase 1.
     """
     if market.mid <= 0:
         raise ValueError(f"invalid mid price: {market.mid}")
@@ -124,9 +134,19 @@ def plan_quotes(
         config["target_max_delta_usdc"],
         config["skew_max_offset_bp"],
     )
+    hard_cap_pct_raw = config.get("hard_position_cap_pct")
+    hard_cap_pct: Optional[Decimal] = None
+    if hard_cap_pct_raw is not None:
+        hard_cap_pct = (
+            hard_cap_pct_raw
+            if isinstance(hard_cap_pct_raw, Decimal)
+            else Decimal(str(hard_cap_pct_raw))
+        )
     skip_bid, skip_ask = is_position_capped(
         inventory,
         config["hard_position_cap_usdc"],
+        collateral_usdc=collateral_usdc,
+        hard_cap_pct=hard_cap_pct,
     )
 
     # share-warn — estimate our share of the top-tier depth bucket

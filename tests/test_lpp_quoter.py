@@ -79,6 +79,12 @@ class FakeGateway:
         self.cancel_by_index_calls: List[Tuple[int, int]] = []
         self.cancel_by_index_result: Dict[str, Any] = {"ok": True, "tx": "fake"}
         self.cancel_by_index_raises: Optional[BaseException] = None
+        # Phase 2.1: collateral source for pct cap + drawdown gate.
+        self.account_info: Optional[Dict[str, Any]] = {
+            "collateral": Decimal("2000"),
+            "available_balance": Decimal("2000"),
+        }
+        self.get_account_info_calls: int = 0
 
     @property
     def signer_client(self) -> FakeSigner:
@@ -100,6 +106,12 @@ class FakeGateway:
         if self.cancel_by_index_raises is not None:
             raise self.cancel_by_index_raises
         return dict(self.cancel_by_index_result)
+
+    async def get_account_info(self) -> Optional[Dict[str, Any]]:
+        self.get_account_info_calls += 1
+        if self.account_info is None:
+            return None
+        return dict(self.account_info)
 
 
 class FakeWs:
@@ -1300,3 +1312,290 @@ def test_reconcile_pause_skips_reprice_in_run_loop():
     assert q.get_summary()["tick_count"] >= 1
     assert q.get_summary()["reprice_count"] == 0
     assert len(gw.signer_client.create_calls) == 0
+
+
+# ----- K. Phase 2.1 P2.1.1: collateral refresh + double cap --------------
+
+
+def test_collateral_refresh_periodic():
+    """``_refresh_collateral`` honours the cadence — multiple ``force=False``
+    calls within the interval are no-ops; a refresh after the interval
+    pulls fresh data."""
+    q, gw, _, _, _ = _make_quoter(
+        config_overrides={"collateral_refresh_interval_sec": 1},
+    )
+    # Pre-set collateral.
+    gw.account_info = {"collateral": Decimal("1500")}
+
+    async def _go() -> Tuple[int, Optional[Decimal]]:
+        await q.start()  # captures baseline + first refresh
+        baseline_calls = gw.get_account_info_calls
+        # Within cadence: should be no-op.
+        await q._refresh_collateral(force=False)
+        within_calls = gw.get_account_info_calls
+        # Pretend cadence elapsed by backdating the timestamp.
+        q._last_collateral_refresh_ts_ms -= 5000
+        gw.account_info = {"collateral": Decimal("1700")}
+        await q._refresh_collateral(force=False)
+        return (
+            baseline_calls,
+            within_calls,
+            gw.get_account_info_calls,
+            q._latest_collateral_usdc,
+        )
+
+    baseline, within, after, latest = asyncio.run(_go())
+    assert baseline >= 1, "start() should have called get_account_info at least once"
+    assert within == baseline, "within-cadence call should be a no-op"
+    assert after > within, "refresh after cadence should call gateway again"
+    assert latest == Decimal("1700")
+
+
+# ----- L. Phase 2.1 P2.1.2: active hedge ---------------------------------
+
+
+def _hedge_market(
+    mid: Decimal = Decimal("100"),
+) -> "MarketSnapshot":
+    """A hand-rolled MarketSnapshot for the hedge unit tests.
+
+    Avoids the gateway+ws plumbing of ``_build_market_snapshot`` so each
+    test can poke at one input without needing a full quoter loop.
+    """
+    return MarketSnapshot(
+        symbol="SKHYNIXUSD",
+        market_index=161,
+        mid=mid,
+        mark_price=mid,
+        index_price=mid,
+        best_bid=mid - Decimal("0.05"),
+        best_ask=mid + Decimal("0.05"),
+        spread_bp=Decimal("10"),
+        depth_by_spread_bp={},
+        price_decimals=3,
+        size_decimals=3,
+        ts_ms=int(time.time() * 1000),
+    )
+
+
+def _inv(usdc: str, base: str = "0", price: str = "100") -> Any:
+    """Build an InventoryState directly. Avoids touching the OM."""
+    from strategy.types import InventoryState as _IS
+    return _IS(
+        net_delta_base=_D(base),
+        net_delta_usdc=_D(usdc),
+        avg_entry_price=_D(price),
+        open_orders_count=0,
+    )
+
+
+def test_active_hedge_does_not_trigger_when_disabled():
+    """active_hedge_enabled=False → helper returns False even when inv
+    breaches the would-be trigger threshold."""
+    q, _, _, _, _ = _make_quoter(
+        config_overrides={
+            "active_hedge_enabled": False,
+            "hard_position_cap_usdc": Decimal("100"),
+            "active_hedge_trigger_pct": Decimal("1.0"),
+        },
+    )
+    market = _hedge_market()
+    inv = _inv("150")  # 1.5x cap
+
+    async def _go() -> bool:
+        await q.start()
+        return await q._maybe_trigger_active_hedge(market, inv)
+
+    assert asyncio.run(_go()) is False
+    assert q.get_summary()["active_hedges_total"] == 0
+
+
+def test_active_hedge_triggers_when_inv_breaches_trigger():
+    q, gw, _, _, _ = _make_quoter(
+        config_overrides={
+            "active_hedge_enabled": True,
+            "hard_position_cap_usdc": Decimal("100"),
+            "active_hedge_trigger_pct": Decimal("1.0"),
+            "active_hedge_target_pct": Decimal("0.3"),
+            "active_hedge_taker_fee_max_pct": Decimal("0.1"),
+            "active_hedge_pause_after_sec": 30,
+            # Disable the pct cap path so the absolute one binds cleanly.
+            "hard_position_cap_pct": None,
+        },
+    )
+    market = _hedge_market(mid=Decimal("100"))
+    # Long $120 against $100 cap, 100*1.0 = trigger 100, 120 >= 100 → fire.
+    inv = _inv("120")
+
+    async def _go() -> Tuple[bool, int]:
+        await q.start()
+        ts_before = q._reconcile_pause_until_ms
+        triggered = await q._maybe_trigger_active_hedge(market, inv)
+        return (triggered, q._reconcile_pause_until_ms - ts_before)
+
+    triggered, pause_advance = asyncio.run(_go())
+    assert triggered is True
+    assert q.get_summary()["active_hedges_total"] == 1
+    # Reduce-only sell at price below mid (slippage 0.1% → 99.9).
+    last_create = gw.signer_client.create_calls[-1]
+    assert last_create["is_ask"] is True  # sell to flatten long
+    assert last_create["reduce_only"] is True
+    # IOC time-in-force.
+    from execution.lighter.lighter_order_manager import _TIME_IN_FORCE_MAP
+    assert last_create["time_in_force"] == _TIME_IN_FORCE_MAP["ioc"]
+    # Pause window is roughly 30s in the future.
+    assert pause_advance >= 25_000
+
+
+def test_active_hedge_size_calculation_correct():
+    """Hedge size = abs(inv) - target_usdc, then convert to base.
+
+    cap=100, target_pct=0.3 → target_usdc=30. Inv=120 → flatten 90 USDC.
+    At mid=100, that's 0.9 base. With size_decimals=3, expect 0.900.
+    """
+    q, gw, _, _, _ = _make_quoter(
+        config_overrides={
+            "active_hedge_enabled": True,
+            "hard_position_cap_usdc": Decimal("100"),
+            "active_hedge_trigger_pct": Decimal("1.0"),
+            "active_hedge_target_pct": Decimal("0.3"),
+            "hard_position_cap_pct": None,
+        },
+    )
+    market = _hedge_market(mid=Decimal("100"))
+    inv = _inv("120")
+
+    async def _go() -> None:
+        await q.start()
+        await q._maybe_trigger_active_hedge(market, inv)
+
+    asyncio.run(_go())
+    last_create = gw.signer_client.create_calls[-1]
+    # base_amount is integer at size_decimals=3 → 0.900 base = 900.
+    assert last_create["base_amount"] == 900
+
+
+def test_active_hedge_pause_blocks_reprice_in_run_loop():
+    """After hedge fires, run_until's reprice path is skipped until the
+    pause window elapses. ``hedge_fired`` itself causes the tick to
+    sleep_to_next_tick + continue."""
+    q, gw, _, _, _ = _make_quoter(
+        config_overrides={
+            "active_hedge_enabled": True,
+            "hard_position_cap_usdc": Decimal("100"),
+            "active_hedge_trigger_pct": Decimal("1.0"),
+            "active_hedge_target_pct": Decimal("0.3"),
+            "active_hedge_pause_after_sec": 60,
+            "tick_interval_sec": Decimal("0.01"),
+            "reprice_min_interval_sec": Decimal("0"),
+            "hard_position_cap_pct": None,
+        },
+    )
+
+    async def _go() -> None:
+        await q.start()
+        # Inject a long position so the next tick fires hedge.
+        q._om.inject_initial_inventory(
+            base=Decimal("1.2"),
+            avg_entry_price=Decimal("100"),
+            sign=1,
+        )
+        await q.run_until(time.time() + 0.10)
+
+    asyncio.run(_go())
+    summary = q.get_summary()
+    assert summary["active_hedges_total"] >= 1
+    # At least the hedge submit; possibly no other reprice creates.
+    # The hedge itself goes through submit_order so create_calls > 0.
+    # Pause should have suppressed any post-hedge reprice creates.
+    # Counting: if active_hedge fires and pause holds, only the hedge
+    # submit is in the list (no reprice creates).
+    assert len(gw.signer_client.create_calls) == summary["active_hedges_total"]
+
+
+def test_active_hedge_failure_logged_not_crash():
+    """submit_order raising → counter increments, return False, no crash."""
+    q, gw, _, _, _ = _make_quoter(
+        config_overrides={
+            "active_hedge_enabled": True,
+            "hard_position_cap_usdc": Decimal("100"),
+            "active_hedge_trigger_pct": Decimal("1.0"),
+            "active_hedge_target_pct": Decimal("0.3"),
+            "hard_position_cap_pct": None,
+        },
+    )
+    # Force submit_order itself to raise (not just SDK fail).
+    async def _raise_submit(*a, **kw):
+        raise RuntimeError("simulated submit_order failure")
+
+    market = _hedge_market(mid=Decimal("100"))
+    inv = _inv("120")
+
+    async def _go() -> bool:
+        await q.start()
+        q._om.submit_order = _raise_submit  # type: ignore[method-assign]
+        return await q._maybe_trigger_active_hedge(market, inv)
+
+    assert asyncio.run(_go()) is False
+    assert q.get_summary()["active_hedges_failed"] == 1
+
+
+# ----- M. Phase 2.1 P2.1.3: daily drawdown stop --------------------------
+
+
+def test_daily_drawdown_breach_triggers_emergency():
+    """Breach detection: drawdown >= effective_max_dd → returns True."""
+    q, _, _, _, _ = _make_quoter(
+        config_overrides={
+            "daily_max_drawdown_usdc": Decimal("100"),
+            "daily_max_drawdown_pct": Decimal("0.05"),
+            "daily_drawdown_check_interval_sec": 0,  # always check
+        },
+    )
+    q._collateral_start_usdc = Decimal("2000")
+    q._latest_collateral_usdc = Decimal("1850")  # -150 drawdown
+    # Effective max = min(100, 0.05*2000=100) = 100. 150 >= 100 → breach.
+
+    async def _go() -> bool:
+        return await q._maybe_check_daily_drawdown(int(time.time() * 1000))
+
+    assert asyncio.run(_go()) is True
+    assert q.get_summary()["daily_drawdown_breaches"] == 1
+
+
+def test_daily_drawdown_pct_vs_usdc_takes_min():
+    """Effective threshold is the tighter of usdc / pct*start."""
+    q, _, _, _, _ = _make_quoter(
+        config_overrides={
+            "daily_max_drawdown_usdc": Decimal("500"),  # loose
+            "daily_max_drawdown_pct": Decimal("0.05"),  # 5% * 2000 = 100 — tight
+            "daily_drawdown_check_interval_sec": 0,
+        },
+    )
+    q._collateral_start_usdc = Decimal("2000")
+    q._latest_collateral_usdc = Decimal("1899")  # -101 drawdown
+
+    async def _go() -> bool:
+        return await q._maybe_check_daily_drawdown(int(time.time() * 1000))
+
+    # 101 > 100 (pct cap) → breach even though 101 << 500 (usdc).
+    assert asyncio.run(_go()) is True
+
+
+def test_daily_drawdown_no_baseline_skips_check():
+    """No collateral_start (e.g. start() couldn't reach REST) → no breach
+    decision; the gate quietly returns False."""
+    q, _, _, _, _ = _make_quoter(
+        config_overrides={
+            "daily_max_drawdown_usdc": Decimal("0.01"),  # absurdly tight
+            "daily_drawdown_check_interval_sec": 0,
+        },
+    )
+    q._collateral_start_usdc = None
+    q._latest_collateral_usdc = None
+
+    async def _go() -> bool:
+        return await q._maybe_check_daily_drawdown(int(time.time() * 1000))
+
+    assert asyncio.run(_go()) is False
+

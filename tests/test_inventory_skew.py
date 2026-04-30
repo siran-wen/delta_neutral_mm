@@ -111,3 +111,57 @@ def test_long_quarter_target_yields_quarter_offset():
     bid_off, ask_off = compute_skew_offsets(inv("125"), TARGET, MAX_OFFSET)
     assert bid_off == Decimal("1.25")
     assert ask_off == Decimal(0)
+
+
+# ---- Phase 2.1 P2.1.1: pct-of-collateral double cap --------------------
+
+
+def test_is_position_capped_pct_cap_tighter_than_usdc_cap():
+    """pct cap binds when pct*collateral < usdc cap.
+
+    Collateral 1000 * 30% = 300 < 600 abs. Inv 400 long → 400 >= 300 →
+    skip_bid (capped on long side); 400 > -300 → no skip_ask.
+    """
+    skip_bid, skip_ask = is_position_capped(
+        inv("400"),
+        hard_cap_usdc=Decimal("600"),
+        collateral_usdc=Decimal("1000"),
+        hard_cap_pct=Decimal("0.30"),
+    )
+    assert skip_bid is True
+    assert skip_ask is False
+
+
+def test_is_position_capped_usdc_cap_tighter_than_pct_cap():
+    """usdc cap binds when collateral pct gives a larger threshold.
+
+    Collateral 5000 * 30% = 1500 > 600 abs. Effective cap stays at 600.
+    Inv 700 long → 700 >= 600 → skip_bid.
+    """
+    skip_bid, skip_ask = is_position_capped(
+        inv("700"),
+        hard_cap_usdc=Decimal("600"),
+        collateral_usdc=Decimal("5000"),
+        hard_cap_pct=Decimal("0.30"),
+    )
+    assert skip_bid is True
+    assert skip_ask is False
+
+
+def test_is_position_capped_no_collateral_falls_back_to_usdc_only():
+    """Missing collateral or missing pct → original Phase 1 behaviour.
+
+    Inv 700, hard_cap=600. No collateral provided, so the pct cap is
+    inert and the absolute cap fires on its own (700 >= 600).
+    """
+    skip_bid, skip_ask = is_position_capped(
+        inv("700"),
+        hard_cap_usdc=Decimal("600"),
+        collateral_usdc=None,
+        hard_cap_pct=Decimal("0.30"),
+    )
+    assert skip_bid is True
+    assert skip_ask is False
+    # And without the pct kwarg at all — also Phase 1 behaviour.
+    skip_bid2, _ = is_position_capped(inv("700"), hard_cap_usdc=Decimal("600"))
+    assert skip_bid2 is True

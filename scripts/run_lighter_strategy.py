@@ -247,6 +247,11 @@ def _coerce_decimal_fields(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "reprice_drift_bp", "reprice_min_interval_sec",
         "tick_interval_sec", "snapshot_interval_sec",
         "price_tolerance_bp", "size_tolerance_pct",
+        # Phase 2.1: double cap + active hedge + daily drawdown.
+        "hard_position_cap_pct",
+        "active_hedge_trigger_pct", "active_hedge_target_pct",
+        "active_hedge_taker_fee_max_pct",
+        "daily_max_drawdown_usdc", "daily_max_drawdown_pct",
     }
     out: Dict[str, Any] = dict(cfg)
     for k in decimal_keys:
@@ -645,6 +650,24 @@ async def run_live_mode(
         cfg.get("target_max_delta_usdc"),
         cfg.get("hard_position_cap_usdc"),
         cfg.get("skew_max_offset_bp"),
+    )
+    logger.info(
+        "  hard_cap_pct: %s (double cap; effective = min(usdc, pct*collateral))",
+        cfg.get("hard_position_cap_pct") or "(disabled)",
+    )
+    logger.info(
+        "  active_hedge: enabled=%s trigger=%s target=%s slip_pct=%s pause=%ss",
+        cfg.get("active_hedge_enabled", False),
+        cfg.get("active_hedge_trigger_pct"),
+        cfg.get("active_hedge_target_pct"),
+        cfg.get("active_hedge_taker_fee_max_pct"),
+        cfg.get("active_hedge_pause_after_sec"),
+    )
+    logger.info(
+        "  daily_drawdown: max_usdc=%s max_pct=%s interval=%ss",
+        cfg.get("daily_max_drawdown_usdc"),
+        cfg.get("daily_max_drawdown_pct"),
+        cfg.get("daily_drawdown_check_interval_sec"),
     )
     logger.info(
         "  market filters: spread_min=%sbp max=%sbp",
