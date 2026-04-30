@@ -90,16 +90,28 @@ def plan_quotes(
 
     if market.spread_bp < config["min_market_spread_bp"]:
         logger.info(
-            "plan_quotes: empty (market_spread=%.2fbp < min=%.2fbp)",
+            "plan_quotes: empty (market_spread=%.2fbp < min=%.2fbp) "
+            "best_bid=%s best_ask=%s mid=%s mark_price=%s index_price=%s",
             float(market.spread_bp),
             float(config["min_market_spread_bp"]),
+            market.best_bid,
+            market.best_ask,
+            market.mid,
+            market.mark_price,
+            market.index_price,
         )
         return []
     if market.spread_bp > config["max_market_spread_bp"]:
         logger.info(
-            "plan_quotes: empty (market_spread=%.2fbp > max=%.2fbp; market unstable)",
+            "plan_quotes: empty (market_spread=%.2fbp > max=%.2fbp; market unstable) "
+            "best_bid=%s best_ask=%s mid=%s mark_price=%s index_price=%s",
             float(market.spread_bp),
             float(config["max_market_spread_bp"]),
+            market.best_bid,
+            market.best_ask,
+            market.mid,
+            market.mark_price,
+            market.index_price,
         )
         return []
 

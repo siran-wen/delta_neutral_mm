@@ -25,7 +25,7 @@ strategy:
   hard_position_cap_usdc: "100"
 
   # Market-state guards
-  min_market_spread_bp: "3"
+  min_market_spread_bp: "0"
   max_market_spread_bp: "100"
 
   # Share-warn (15h SKHYNIX data justified 0.95 over 0.8 — see
