@@ -101,6 +101,16 @@ QUOTER_DEFAULTS: Dict[str, Any] = {
     # this guard, a stuck cancel can let stale orders accumulate on the
     # book — exactly how the -1.132 SKHYNIXUSD short was created.
     "emergency_stop_on_consecutive_cancel_fail_count": 3,
+    # Phase 1.2 P0.4: send-failure surge detection. A 429 burst (rate
+    # limit) or signer-side outage that produces many SDK errors in a
+    # short window is a signal to (a) re-sync state via REST so we
+    # haven't accumulated orphans the OM can't see, and (b) pause
+    # repricing so we stop pumping more failed sends through. Without
+    # this, the 4-30 q=0/limit-window storm let orphan orders sit on
+    # the book while OM thought it had no active orders.
+    "send_failure_window_sec": 30,
+    "send_failure_threshold": 5,
+    "reconcile_pause_sec": 60,
 }
 
 
@@ -205,7 +215,17 @@ class LppQuoter:
             "snapshots_taken": 0,
             "session_start_ts_ms": None,
             "session_end_ts_ms": None,
+            # Phase 1.2 P0.4 surge handler.
+            "reconcile_count": 0,
         }
+
+        # Phase 1.2 P0.4: rolling window of send-failure timestamps
+        # (ms). When N failures land inside W seconds, the next
+        # ``_execute_reprice`` forces a REST reconcile + backup cancel
+        # and freezes repricing for ``reconcile_pause_sec`` so we
+        # stop pumping more failed sends through the SDK.
+        self._send_failure_window: List[int] = []
+        self._reconcile_pause_until_ms: int = 0
 
         # Session overrides from yaml: passed as config["session_overrides"]
         # (a dict of session_name -> {default_size_usdc, default_distance_bp,
@@ -421,6 +441,21 @@ class LppQuoter:
                 market = await self._build_market_snapshot()
                 if market is None:
                     self._stats["skipped_tick_count"] += 1
+                    await self._sleep_to_next_tick(tick_start, tick_interval)
+                    continue
+
+                # Phase 1.2 P0.4: respect any active reconcile-pause.
+                # We still build the snapshot above (cheap) so the
+                # tick counter advances and tracker recordings can run,
+                # but we skip the reprice path entirely. The pause is
+                # released once the wall clock passes the deadline.
+                now_ms_pause = int(time.time() * 1000)
+                if now_ms_pause < self._reconcile_pause_until_ms:
+                    remaining = (self._reconcile_pause_until_ms - now_ms_pause) / 1000.0
+                    logger.debug(
+                        "reprice paused (reconcile cooldown %.1fs remaining)",
+                        remaining,
+                    )
                     await self._sleep_to_next_tick(tick_start, tick_interval)
                     continue
 
@@ -672,6 +707,44 @@ class LppQuoter:
             inventory.net_delta_usdc,
             session.name,
         )
+
+        # Phase 1.2 P0.4: surge detection.
+        # Any failure (cancel or place) feeds the rolling window. When
+        # the count crosses the threshold, force a REST reconcile so any
+        # orphan that built up during the surge is cancelled, then pause
+        # repricing for the cooldown window so we stop pumping more
+        # failed sends through.
+        total_failures = fail_cancels + fail_places
+        if total_failures > 0:
+            now_ms = int(time.time() * 1000)
+            window_sec = int(self.config.get("send_failure_window_sec", 30))
+            threshold = int(self.config.get("send_failure_threshold", 5))
+            cutoff = now_ms - window_sec * 1000
+            self._send_failure_window = [
+                ts for ts in self._send_failure_window if ts > cutoff
+            ]
+            for _ in range(total_failures):
+                self._send_failure_window.append(now_ms)
+
+            if len(self._send_failure_window) >= threshold:
+                pause_sec = int(self.config.get("reconcile_pause_sec", 60))
+                logger.error(
+                    "SEND FAILURE SURGE: %d failures in %ds → forcing reconcile + %ds pause",
+                    len(self._send_failure_window),
+                    window_sec,
+                    pause_sec,
+                )
+                try:
+                    await self._om._sync_orders_from_rest_safe()
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("surge reconcile sync failed: %s", exc)
+                try:
+                    await self._backup_cancel_via_gateway()
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("surge backup cancel failed: %s", exc)
+                self._reconcile_pause_until_ms = now_ms + pause_sec * 1000
+                self._send_failure_window.clear()
+                self._stats["reconcile_count"] += 1
 
     # ------------------------------------------------------------
     # emergency stop
@@ -987,6 +1060,7 @@ class LppQuoter:
             "consecutive_cancel_failures": self._stats["consecutive_cancel_failures"],
             "emergency_stops": self._stats["emergency_stops"],
             "snapshots_taken": self._stats["snapshots_taken"],
+            "reconcile_count": self._stats["reconcile_count"],
             "session_start_ts_ms": self._stats["session_start_ts_ms"],
             "session_end_ts_ms": self._stats["session_end_ts_ms"],
             "om": om_stats,

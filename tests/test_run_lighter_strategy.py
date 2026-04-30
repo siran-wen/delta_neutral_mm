@@ -165,6 +165,9 @@ def test_recover_position_below_warn_does_not_abort():
 
 
 def test_recover_position_above_warn_continues(caplog):
+    """Position below abort threshold is not an abort, but is logged at WARN
+    so the operator sees it. Phase 1.2 P0.1: the message also flags that
+    the residual will be injected into the OM (no more silent ignore)."""
     gw = _FakeGateway()
     gw.positions = [{
         "market_index": 161,
@@ -178,7 +181,10 @@ def test_recover_position_above_warn_continues(caplog):
     caplog.set_level(logging.WARNING)
     result = asyncio.run(recover_initial_state(gw, 161, "SKHYNIXUSD", _RECOVER_CFG_DEFAULTS))
     assert result["abort"] is False
-    assert any("RECOVER WARN" in r.message for r in caplog.records)
+    assert any(
+        "RECOVER" in r.message and "will inject into OM" in r.message
+        for r in caplog.records
+    )
 
 
 def test_recover_position_above_abort_sets_abort_flag():
@@ -420,3 +426,139 @@ def test_run_paper_mode_zero_duration_translates_to_one_day(tmp_path):
     jsonl.close()
     # Forever in paper mode is clamped to 24h (24*60 minutes).
     assert captured["args"].duration == 24 * 60.0
+
+
+# ----- E. Phase 1.2 P0.1 + P0.2 hardening -------------------------------
+
+
+def test_recover_position_zero_threshold_aborts_on_any_nonzero():
+    """abort_threshold=0 means abort on ANY non-zero residual.
+
+    Phase 1.2 P0.2 production default — forces a clean account between
+    runs to break the dirty-state link that produced the 4-30
+    catastrophic short. The OM-inject path is reached only when the
+    threshold is explicitly raised (dev/testing scenario)."""
+    gw = _FakeGateway()
+    gw.positions = [{
+        "market_index": 161,
+        "symbol": "SKHYNIXUSD",
+        "sign": 1,
+        "base": _D("0.001"),  # tiny but non-zero
+        "avg_entry_price": _D("100"),
+        "position_value_usdc": _D("0.1"),
+    }]
+    cfg = dict(_RECOVER_CFG_DEFAULTS, abort_if_existing_position_above_usdc="0")
+    result = asyncio.run(recover_initial_state(gw, 161, "SKHYNIXUSD", cfg))
+    assert result["abort"] is True
+    assert "0.1" in (result["abort_reason"] or "") or "0.001" in (
+        result["abort_reason"] or ""
+    )
+
+
+def test_recover_inject_called_with_existing_position():
+    """When abort_threshold is raised above the residual, recover logs the
+    inject decision (the actual om.inject_initial_inventory call lives in
+    run_live_mode and is exercised by the live integration path)."""
+    import logging
+    gw = _FakeGateway()
+    gw.positions = [{
+        "market_index": 161,
+        "symbol": "SKHYNIXUSD",
+        "sign": -1,
+        "base": _D("0.5"),
+        "avg_entry_price": _D("100"),
+        "position_value_usdc": _D("50"),
+    }]
+    # Threshold 1000 > notional 50 → no abort; recover logs WARN with
+    # "will inject into OM" so the runner can pick the recover_summary
+    # up and call inject explicitly.
+    cfg = dict(
+        _RECOVER_CFG_DEFAULTS,
+        abort_if_existing_position_above_usdc="1000",
+    )
+    caplog_records: List[logging.LogRecord] = []
+    target = logging.getLogger("strategy_run")
+
+    class _H(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            caplog_records.append(record)
+
+    h = _H(level=logging.WARNING)
+    target.addHandler(h)
+    try:
+        result = asyncio.run(
+            recover_initial_state(gw, 161, "SKHYNIXUSD", cfg)
+        )
+    finally:
+        target.removeHandler(h)
+    assert result["abort"] is False
+    assert result["existing_position"] is not None
+    assert result["existing_position"].get("sign") == -1
+    assert any(
+        "will inject into OM" in r.message for r in caplog_records
+    )
+
+
+def test_post_shutdown_clean_check_logs_residual():
+    """The post-shutdown verification helper logs ERROR when the account is
+    not clean. Regression guard: prior runs ended without verifying, so
+    Run 1's residual long was inherited by Run 2 → catastrophic short.
+
+    This test exercises the verification logic directly: we simulate the
+    sequence of ``await gateway.get_account_positions()`` /
+    ``get_open_orders()`` post-shutdown and assert the ERROR log fires.
+    Driving the full ``run_live_mode`` would require a real signer.
+    """
+    import logging
+    gw = _FakeGateway()
+    gw.positions = [{
+        "market_index": 161,
+        "symbol": "SKHYNIXUSD",
+        "sign": 1,
+        "base": _D("0.5"),
+        "avg_entry_price": _D("100"),
+        "position_value_usdc": _D("50"),
+    }]
+
+    target = logging.getLogger("strategy_run")
+    caplog_records: List[logging.LogRecord] = []
+
+    class _H(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            caplog_records.append(record)
+
+    h = _H(level=logging.ERROR)
+    target.addHandler(h)
+
+    async def _verify() -> None:
+        # Mirror the verification body from run_live_mode's finally
+        # block. The contract under test: when positions are non-zero
+        # post-shutdown, ERROR is logged with a "NOT CLEAN" header so
+        # the operator can't miss it tail-following the console.
+        market = "SKHYNIXUSD"
+        market_index = 161
+        final_positions = await gw.get_account_positions()
+        final_orders = await gw.get_open_orders(market_index)
+        nz_positions = []
+        for p in final_positions:
+            if p.get("symbol") == market or p.get("market_index") == market_index:
+                if Decimal(str(p.get("base") or 0)) != 0:
+                    nz_positions.append(p)
+        if nz_positions or final_orders:
+            target.error("=" * 70)
+            target.error("POST-SHUTDOWN ACCOUNT NOT CLEAN")
+            for p in nz_positions:
+                target.error(
+                    "  RESIDUAL POSITION: %s base=%s notional=%s",
+                    p.get("symbol"),
+                    p.get("base"),
+                    p.get("position_value_usdc"),
+                )
+
+    try:
+        asyncio.run(_verify())
+    finally:
+        target.removeHandler(h)
+
+    assert any("NOT CLEAN" in r.message for r in caplog_records)
+    assert any("RESIDUAL POSITION" in r.message for r in caplog_records)

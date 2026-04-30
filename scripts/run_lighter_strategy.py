@@ -28,16 +28,17 @@ Before the quoter starts we pull the account's open orders on the
 target market and cancel each one through the SDK. We also pull the
 live position and:
 
-* Below ``recovery.warn_if_existing_position_above_usdc`` → log a
-  WARN and start the quoter from a 0-base inventory (treats the
-  residual as background drift).
+* Any non-zero residual base → call
+  ``LighterOrderManager.inject_initial_inventory`` so the OM starts
+  with the correct net delta. Without this seed (the original
+  behaviour through 4-30), the planner under-caps risk for the first
+  few seconds before the ws ``account_all`` push lands — long enough
+  for repeated fills to push the account well past the hard cap.
 * At or above ``recovery.abort_if_existing_position_above_usdc`` →
-  log ERROR and abort. ``LighterOrderManager`` has no public
-  ``set_initial_inventory`` interface today, so we deliberately
-  don't try to inject a position the OM doesn't natively account
-  for — that would silently desynchronise the planner's skew/cap
-  logic. Set ``abort_if_existing_position_above_usdc: "0"`` in the
-  yaml to disable the abort if you accept the drift.
+  log ERROR and abort the startup. The default in
+  ``config/lighter_strategy.yaml`` is ``"0"`` (abort on ANY non-zero
+  residual) so a clean shutdown is required between runs; raise the
+  threshold to permit the inject path during dev/testing.
 """
 
 from __future__ import annotations
@@ -339,26 +340,37 @@ async def recover_initial_state(
             str(config.get("abort_if_existing_position_above_usdc", "1000"))
         )
         if base != 0:
-            if abort_threshold > 0 and notional_abs >= abort_threshold:
+            # Phase 1.2 P0.2 semantics:
+            #   abort_threshold == 0  → abort on ANY non-zero residual
+            #     (production default — forces a clean account every run)
+            #   abort_threshold  > 0  → abort if notional_abs >= threshold
+            #     (dev/testing — exercises the OM inject path below)
+            #   abort_threshold  < 0  → never abort (explicit opt-out)
+            should_abort = abort_threshold == 0 or (
+                abort_threshold > 0 and notional_abs >= abort_threshold
+            )
+            if should_abort:
                 result["abort"] = True
                 result["abort_reason"] = (
-                    f"existing position notional {notional_abs} USDC ≥ abort threshold "
-                    f"{abort_threshold} USDC; flatten manually before starting"
+                    f"existing position notional {notional_abs} USDC "
+                    f"(base={base}) ≥ abort threshold {abort_threshold} USDC; "
+                    "flatten manually before starting"
                 )
                 logger.error("RECOVER ABORT: %s", result["abort_reason"])
-            elif notional_abs >= warn_threshold:
-                logger.warning(
-                    "RECOVER WARN: existing position base=%s notional=%s USDC "
-                    "(quoter will start from 0-base inventory; "
-                    "expect skew/cap drift until naturally flattened)",
-                    base,
-                    notional_abs,
-                )
             else:
-                logger.info(
-                    "RECOVER: small residual position base=%s notional=%s; ignoring",
+                # Any non-zero residual is now injected into the OM by
+                # the caller (run_live_mode). The runner logs this WARN
+                # and the inject log line itself together form the audit
+                # trail. Removed the prior "ignoring small residual"
+                # branch — silently dropping a position is what caused
+                # the 4-30 catastrophic OM/server desync.
+                logger.warning(
+                    "RECOVER: existing position base=%s notional=%s USDC; "
+                    "will inject into OM (warn=%s, abort=%s)",
                     base,
                     notional_abs,
+                    warn_threshold,
+                    abort_threshold,
                 )
 
     # If we already decided to abort, skip the cancel pass.
@@ -527,7 +539,53 @@ async def run_live_mode(
         gateway=gateway,
         ws=ws,
         account_index=int(gateway.account_index),
+        market_index_filter=market_index,
     )
+
+    # Phase 1.2 P0.1: seed the OM with the existing position from
+    # recover. Without this, OM starts at inv=0 and ``plan_quotes``
+    # under-caps risk until the ws ``account_all`` push lands (which
+    # may take seconds, may not include positions for some subscription
+    # paths, or may race with the first reprice). The 4-30 Run 2
+    # catastrophic short ($131 against a $100 hard cap) was caused
+    # exactly by this gap.
+    recover_pos = recovery_summary.get("existing_position")
+    if recover_pos is not None and recover_pos.get("base") is not None:
+        try:
+            base_raw = recover_pos.get("base") or "0"
+            base = abs(Decimal(str(base_raw)))
+            sign = int(recover_pos.get("sign", 1))
+            avg_entry = recover_pos.get("avg_entry_price")
+            avg_entry_dec: Optional[Decimal] = None
+            if avg_entry is not None:
+                try:
+                    avg_entry_dec = Decimal(str(avg_entry))
+                    if avg_entry_dec <= 0:
+                        avg_entry_dec = None
+                except Exception:  # noqa: BLE001
+                    avg_entry_dec = None
+            if base > 0:
+                om.inject_initial_inventory(
+                    base=base,
+                    avg_entry_price=avg_entry_dec,
+                    sign=sign,
+                )
+                logger.info(
+                    "RECOVER: injected existing position into OM "
+                    "(base=%s, avg=%s, sign=%s)",
+                    base, avg_entry_dec, sign,
+                )
+                jsonl.write({
+                    "event": "recover_inject",
+                    "base": str(base),
+                    "avg_entry_price": str(avg_entry_dec) if avg_entry_dec else None,
+                    "sign": sign,
+                })
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "RECOVER: failed to inject existing position into OM: %s",
+                exc,
+            )
     pool_yaml = _load_lpp_pool_yaml()
     weekly_pool = {
         sym: Decimal(str(v))
@@ -739,6 +797,58 @@ async def run_live_mode(
             # summary block can't swallow the run-end notice.
             logger.warning("final summary formatting failed: %s", exc)
             logger.info("STRATEGY SHUTDOWN done summary=%s", summary)
+
+        # Phase 1.2 P0.2: verify the account is clean post-shutdown.
+        # We don't auto-close residual positions (taker risk + cross-market
+        # complexity); instead we emit a loud ERROR so the operator knows
+        # the next run will need either a manual flatten or a recovery
+        # threshold bump. Mirrors the recover-side abort gate so the dirty
+        # state can't link from one run to the next unnoticed.
+        try:
+            final_positions = await gateway.get_account_positions()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("post-shutdown position check failed: %s", exc)
+            final_positions = []
+        try:
+            final_orders = await gateway.get_open_orders(market_index)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("post-shutdown order check failed: %s", exc)
+            final_orders = []
+        nz_positions = []
+        for p in final_positions:
+            if p.get("symbol") == market or p.get("market_index") == market_index:
+                try:
+                    if Decimal(str(p.get("base") or 0)) != 0:
+                        nz_positions.append(p)
+                except Exception:  # noqa: BLE001
+                    continue
+        if nz_positions or final_orders:
+            logger.error("=" * 70)
+            logger.error("POST-SHUTDOWN ACCOUNT NOT CLEAN")
+            for p in nz_positions:
+                logger.error(
+                    "  RESIDUAL POSITION: %s base=%s notional=%s",
+                    p.get("symbol"),
+                    p.get("base"),
+                    p.get("position_value_usdc"),
+                )
+            if final_orders:
+                logger.error("  RESIDUAL ORDERS: %d on book", len(final_orders))
+            logger.error(
+                "  -> Manually close on https://app.lighter.xyz before next run"
+            )
+            logger.error(
+                "  -> Next --live run will refuse to start until account is clean"
+            )
+            logger.error("=" * 70)
+            jsonl.write({
+                "event": "post_shutdown_dirty",
+                "residual_positions": _jsonable(nz_positions),
+                "residual_orders_count": len(final_orders),
+            })
+        else:
+            logger.info("POST-SHUTDOWN: account verified clean")
+            jsonl.write({"event": "post_shutdown_clean"})
 
         try:
             await ws.disconnect()

@@ -342,6 +342,7 @@ class LighterOrderManager:
             "last_event_ts_ms": None,
             "rest_syncs_total": 0,
             "last_sync_ts_ms": None,
+            "orphans_cancelled_total": 0,
         }
 
         # Inventory aggregation. Updated by two paths:
@@ -810,6 +811,7 @@ class LighterOrderManager:
             "last_event_ts_ms": self._stats["last_event_ts_ms"],
             "rest_syncs_total": self._stats["rest_syncs_total"],
             "last_sync_ts_ms": self._stats["last_sync_ts_ms"],
+            "orphans_cancelled_total": self._stats["orphans_cancelled_total"],
         }
 
     def get_inventory(
@@ -1141,6 +1143,53 @@ class LighterOrderManager:
             self._update_inventory_from_position(pos)
         return trigger_sync
 
+    def inject_initial_inventory(
+        self,
+        base: Decimal,
+        avg_entry_price: Optional[Decimal],
+        sign: int = 1,
+    ) -> None:
+        """Set initial inventory state from external source (e.g. recover).
+
+        Called once before the strategy main loop starts, to seed the OM
+        with the actual server-side position. After this call, ws
+        position updates remain authoritative and may overwrite. Without
+        this seed, OM starts at inv=0 even if the account already holds
+        a position, causing ``plan_quotes`` to under-estimate risk for
+        the first few seconds before a ws push arrives — or never, if
+        the ``account_all`` initial snapshot for the subscription path
+        doesn't carry positions.
+
+        Args:
+            base: unsigned base amount (always non-negative).
+            avg_entry_price: weighted entry price (None if base == 0).
+            sign: ``+1`` (long) or ``-1`` (short).
+        """
+        if self._inventory_base != 0:
+            logger.warning(
+                "inject_initial_inventory: overwriting existing _inventory_base=%s",
+                self._inventory_base,
+            )
+        if base == 0:
+            self._inventory_base = Decimal(0)
+            self._inventory_avg_price = None
+            logger.info("inject_initial_inventory: cleared (base=0)")
+            return
+        signed = -base if sign < 0 else base
+        self._inventory_base = signed
+        self._inventory_avg_price = (
+            avg_entry_price
+            if (avg_entry_price is not None and avg_entry_price > 0)
+            else None
+        )
+        logger.info(
+            "inject_initial_inventory: base=%s avg=%s sign=%d -> inventory_base=%s",
+            base,
+            avg_entry_price,
+            sign,
+            self._inventory_base,
+        )
+
     def _update_inventory_from_position(self, pos: Dict[str, Any]) -> None:
         """Apply ws position data to the inventory aggregator.
 
@@ -1285,21 +1334,60 @@ class LighterOrderManager:
         )
 
         # Direction 1: REST has it → update local.
+        # Phase 1.2 P0.3: any coid REST reports on our account that we
+        # don't track locally (or that already moved to historical) is
+        # an orphan. Likely causes: a previous failed cancel where the
+        # SDK returned an error but the server actually accepted, a ws
+        # miss during a 429-burst, or a race during reconnect. Cancel
+        # it immediately — letting it sit on the book is exactly what
+        # let the 4-30 catastrophic short build up while OM saw inv=0.
+        local_coids = set(self._active.keys()) | set(self._historical.keys())
         for coid, rest_o in rest_by_coid.items():
             local = self._active.get(coid)
             if local is None:
-                # Could be an order from another process or one that
-                # arrived after we trimmed history. Bumped from debug
-                # to warning: an "orphan" on the book is exactly the
-                # state we want to surface for forensics.
-                logger.warning(
-                    "REST sync: orphan order on book coid=%d order_index=%s "
-                    "(not tracked locally)",
-                    coid,
-                    rest_o.get("order_index"),
-                )
+                if coid in local_coids:
+                    # We've seen this coid before — it lives in
+                    # _historical because we transitioned it terminal
+                    # locally. Server still has it open → orphan.
+                    logger.error(
+                        "ORPHAN: coid=%d in _historical but still on book "
+                        "(order_index=%s) — cancelling",
+                        coid,
+                        rest_o.get("order_index"),
+                    )
+                else:
+                    # Genuinely unknown to us. Could be from a previous
+                    # process; either way, an open order on our account
+                    # we didn't track is an attractive nuisance.
+                    logger.error(
+                        "ORPHAN: coid=%d unknown (not in _active/_historical, "
+                        "order_index=%s) — cancelling",
+                        coid,
+                        rest_o.get("order_index"),
+                    )
+                await self._cancel_orphan(rest_o)
                 continue
             self._apply_rest_order_to_local(local, rest_o)
+
+        # Phase 1.2 P0.3: a REST-reported order with no client_order_index
+        # field at all should never happen (every order we send carries
+        # one). If we see it, it's both unknown to us AND server-side
+        # accepted — cancel it.
+        for rest_o in rest_orders:
+            coid_raw = rest_o.get("client_order_index")
+            if coid_raw is None:
+                coid_raw = rest_o.get("client_order_id")
+            try:
+                coid = int(coid_raw) if coid_raw is not None else None
+            except (TypeError, ValueError):
+                coid = None
+            if coid is None:
+                logger.error(
+                    "ORPHAN (no coid): order_index=%s market=%s — cancelling",
+                    rest_o.get("order_index"),
+                    rest_o.get("market_index"),
+                )
+                await self._cancel_orphan(rest_o)
 
         # Direction 2: local active but not in REST → terminal.
         now_ms = int(time.time() * 1000)
@@ -1339,6 +1427,56 @@ class LighterOrderManager:
                     raw_msg={"reason": "rest_sync_missing"},
                 )
             )
+
+    async def _cancel_orphan(self, rest_o: Dict[str, Any]) -> None:
+        """Issue a REST cancel for an orphan order surfaced during sync.
+
+        Errors are logged and swallowed — the periodic sync will catch
+        the same orphan again on the next pass if this one fails. We
+        bump ``orphans_cancelled_total`` only on a successful cancel
+        send so the stat reflects real ledger writes, not attempts.
+        """
+        order_index = _coerce_int(rest_o.get("order_index"))
+        market_index = _coerce_int(rest_o.get("market_index"))
+        if market_index is None:
+            market_index = self._market_index_filter
+        if order_index is None or market_index is None:
+            logger.error(
+                "orphan cancel: missing order_index/market_index "
+                "(order_index=%s, market_index=%s)",
+                order_index,
+                market_index,
+            )
+            return
+        gw_cancel = getattr(self._gateway, "cancel_order_by_index", None)
+        if gw_cancel is None:
+            logger.error(
+                "orphan cancel: gateway has no cancel_order_by_index method"
+            )
+            return
+        try:
+            res = await gw_cancel(int(market_index), int(order_index))
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "orphan cancel raised for order_index=%d: %s",
+                order_index,
+                exc,
+            )
+            return
+        if isinstance(res, dict) and not res.get("ok"):
+            logger.error(
+                "orphan cancel failed for order_index=%d: %s",
+                order_index,
+                res.get("error"),
+            )
+            return
+        self._stats["orphans_cancelled_total"] += 1
+        logger.info(
+            "orphan cancelled: order_index=%d market=%d total=%d",
+            order_index,
+            market_index,
+            self._stats["orphans_cancelled_total"],
+        )
 
     def _apply_rest_order_to_local(
         self,

@@ -1241,3 +1241,117 @@ def test_periodic_sync_does_not_overwrite_ws_position():
     assert before == _D("0.7")
     assert after == _D("0.7"), f"REST sync changed inventory: {before} → {after}"
 
+
+# ----- K. Phase 1.2 P0.1: inject_initial_inventory ----------------------
+
+
+def test_inject_initial_inventory_long():
+    """Long position: signed inventory_base == +base, avg price preserved."""
+    om, _, _ = _make_manager()
+    om.inject_initial_inventory(
+        base=_D("0.5"), avg_entry_price=_D("100.0"), sign=1
+    )
+    inv = om.get_inventory(mark_price=_D("110"))
+    assert inv.net_delta_base == _D("0.5")
+    assert inv.avg_entry_price == _D("100.0")
+    # Mark-to-market value at 110 → 0.5 * 110 = 55.
+    assert inv.net_delta_usdc == _D("55.0")
+
+
+def test_inject_initial_inventory_short():
+    """Short position: sign=-1 produces negative inventory_base."""
+    om, _, _ = _make_manager()
+    om.inject_initial_inventory(
+        base=_D("0.5"), avg_entry_price=_D("100.0"), sign=-1
+    )
+    inv = om.get_inventory(mark_price=_D("110"))
+    assert inv.net_delta_base == _D("-0.5")
+    assert inv.avg_entry_price == _D("100.0")
+    # Negative base * positive mark → negative usdc value.
+    assert inv.net_delta_usdc == _D("-55.0")
+
+
+def test_inject_initial_inventory_zero_clears():
+    """base=0 zeroes the inventory and clears any prior avg price."""
+    om, _, _ = _make_manager()
+    # Pre-seed with a position via the fill path so inject has to clear it.
+    om._apply_fill_to_inventory("buy", _D("1.0"), _D("100"))
+    assert om.get_inventory().net_delta_base == _D("1.0")
+    om.inject_initial_inventory(base=_D("0"), avg_entry_price=None, sign=1)
+    inv = om.get_inventory()
+    assert inv.net_delta_base == _D("0")
+    assert inv.avg_entry_price is None
+
+
+def test_inject_initial_inventory_warns_when_overwriting_nonzero():
+    """An inject onto an already-non-zero base logs a warning so post-hoc
+    forensics can spot a mis-ordered call sequence."""
+    om, _, _ = _make_manager()
+    om._apply_fill_to_inventory("buy", _D("0.3"), _D("100"))
+    import logging
+    logger_om = logging.getLogger(
+        "execution.lighter.lighter_order_manager"
+    )
+    records: List[logging.LogRecord] = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    h = _Handler(level=logging.WARNING)
+    logger_om.addHandler(h)
+    try:
+        om.inject_initial_inventory(
+            base=_D("0.5"), avg_entry_price=_D("100"), sign=-1
+        )
+    finally:
+        logger_om.removeHandler(h)
+
+    assert any("overwriting existing _inventory_base" in r.message for r in records)
+    # The new value still wins.
+    assert om.get_inventory().net_delta_base == _D("-0.5")
+
+
+# ----- L. Phase 1.2 P0.3: orphan cancellation in REST sync --------------
+
+
+def test_orphan_cancellation_in_rest_sync():
+    """A coid REST reports that we don't track locally is cancelled +
+    the orphans_cancelled_total stat is incremented.
+
+    Regression: 4-30 q=0 / limit-window storm — orphan orders sat on
+    the book while the OM saw inv=0, and their fills accumulated into
+    a -$131 short the planner couldn't cap.
+    """
+    om, gw, _ = _make_manager(market_index_filter=161)
+    # We didn't submit this — but server/REST claims it's on our account.
+    gw.open_orders_response = [
+        {
+            "client_order_index": 9999999,
+            "order_index": 7777,
+            "market_index": 161,
+            "status": "open",
+            "filled_base_amount": "0",
+            "remaining_base_amount": "1000",
+        }
+    ]
+    # Need a cancel_order_by_index method on the gateway for the
+    # orphan path; FakeGateway doesn't have it by default, so attach one.
+    cancel_calls: List[Tuple[int, int]] = []
+
+    async def _cancel(market_index: int, order_index: int) -> Dict[str, Any]:
+        cancel_calls.append((market_index, order_index))
+        return {"ok": True, "tx": "fake-tx"}
+
+    gw.cancel_order_by_index = _cancel  # type: ignore[attr-defined]
+
+    async def _go() -> None:
+        await om.start()
+        # start() already pulls REST once. The orphan should have been
+        # cancelled on that pass.
+
+    asyncio.run(_go())
+    assert (161, 7777) in cancel_calls
+    assert om.get_stats()["orphans_cancelled_total"] == 1
+
+

@@ -84,13 +84,18 @@ strategy:
 recovery:
   # Cancel any orders found resting on the account at startup.
   cancel_stale_orders: true
-  # Soft-warn threshold: a non-zero position with notional below this
-  # logs a warning but the strategy still starts (treats it as drift).
-  warn_if_existing_position_above_usdc: "50"
-  # Hard-abort threshold: at or above this notional we refuse to
-  # start, requiring manual flatten before re-running. Set to "0"
-  # to never abort.
-  abort_if_existing_position_above_usdc: "200"
+  # Soft-warn threshold (forensics only — both paths still inject
+  # into the OM in Phase 1.2+).
+  warn_if_existing_position_above_usdc: "10"
+  # Hard-abort threshold:
+  #   "0"  (default)  → abort on ANY non-zero residual. Phase 1.2 P0.2
+  #                     enforces a clean account between runs to break
+  #                     the dirty-state link that produced the 4-30
+  #                     catastrophic short.
+  #   ">0"            → abort only if notional ≥ threshold (dev/testing
+  #                     mode that exercises the OM inject path).
+  #   "-1"            → never abort (explicit opt-out).
+  abort_if_existing_position_above_usdc: "0"
   # How long to wait after sending stale-order cancels before
   # starting the quoter — gives ws confirmations time to drain.
   wait_after_cancel_sec: 5

@@ -1229,3 +1229,74 @@ def test_emergency_stop_calls_backup_cancel():
     assert q.get_summary()["emergency_stops"] == 1
     # Emergency path must have driven the backup cancel.
     assert (161, 5555555) in gw.cancel_by_index_calls
+
+
+# ----- J. Phase 1.2 P0.4: send-failure surge → reconcile + pause --------
+
+
+def test_send_failure_surge_triggers_reconcile_pause():
+    """A burst of place failures across reprices fires a forced REST
+    reconcile + backup-cancel and stamps a future ``_reconcile_pause_until_ms``
+    deadline so subsequent ticks skip repricing.
+
+    Regression: 4-30 q=0/limit-window storm — the quoter kept hammering
+    the SDK once per second while 429s rolled in, generating orphan
+    orders the OM couldn't see. This guard breaks the cycle.
+    """
+    q, gw, _, om, _ = _make_quoter(
+        config_overrides={
+            # Tight thresholds so a single reprice with two failed
+            # places trips the surge handler without needing many
+            # iterations of the test setup.
+            "send_failure_threshold": 2,
+            "send_failure_window_sec": 30,
+            "reconcile_pause_sec": 60,
+            # Avoid emergency-stop competing with the surge path on
+            # the same condition.
+            "emergency_stop_on_consecutive_reject_count": 999,
+        },
+    )
+    # Make every place fail at the SDK layer.
+    gw.signer_client.create_always_fails = True
+
+    async def _go() -> None:
+        await q.start()
+        market = await q._build_market_snapshot()
+        session = get_kr_overnight_session()
+        # First reprice: 2 places, both fail → fail count = 2 → trip.
+        await q._execute_reprice(market, session, "initial")
+
+    asyncio.run(_go())
+    # Reconcile fired exactly once.
+    assert q.get_summary()["reconcile_count"] == 1
+    # Pause deadline is in the future (well past current ms).
+    now_ms = int(time.time() * 1000)
+    assert q._reconcile_pause_until_ms > now_ms
+    # And the surge handler triggered the backup-cancel REST sweep.
+    assert 161 in gw.get_open_orders_calls
+
+
+def test_reconcile_pause_skips_reprice_in_run_loop():
+    """When ``_reconcile_pause_until_ms`` is set in the future, the run
+    loop ticks through but does not reprice. ``reprice_count`` stays at 0
+    and no SDK create_order calls go out."""
+    q, gw, _, om, _ = _make_quoter(
+        config_overrides={
+            "tick_interval_sec": Decimal("0.01"),
+            # Disable the min-interval floor so any tick *would* reprice
+            # if not for the pause.
+            "reprice_min_interval_sec": Decimal("0"),
+        },
+    )
+
+    async def _go() -> None:
+        await q.start()
+        # Stamp the pause well into the future.
+        q._reconcile_pause_until_ms = int(time.time() * 1000) + 60_000
+        await q.run_until(time.time() + 0.10)  # 100ms of ticks
+
+    asyncio.run(_go())
+    # Ticks ran (loop body executed) but reprice was skipped.
+    assert q.get_summary()["tick_count"] >= 1
+    assert q.get_summary()["reprice_count"] == 0
+    assert len(gw.signer_client.create_calls) == 0
