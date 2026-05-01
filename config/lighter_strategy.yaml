@@ -54,12 +54,24 @@ strategy:
   reprice_drift_bp: "8"
   reprice_min_interval_sec: "60"
 
-  # Tick / snapshot cadence
-  tick_interval_sec: "1"
+  # Tick / snapshot cadence. Phase 3 multi-market: tick stretched
+  # 1s → 10s, collateral refresh halved, OM REST sync halved. Three
+  # processes sharing one IP otherwise tripped Lighter's WAF rate
+  # limit (~100 req/5min observed); these settings keep the combined
+  # REST budget below the threshold. Side effect: reprice latency
+  # is 1-9s instead of <1s — accepted because size $50 doesn't need
+  # sub-second responsiveness.
+  tick_interval_sec: "10"
   snapshot_interval_sec: "60"
   # Phase 2.1: how often to refresh collateral via REST. Used by the
   # pct-cap path and the daily-drawdown gate.
-  collateral_refresh_interval_sec: "60"
+  collateral_refresh_interval_sec: "120"
+  # OrderManager periodic REST sync of open_orders / positions. The
+  # default in ``execution.lighter.lighter_order_manager`` is 30s; we
+  # widen to 60s for the same WAF-budget reason. WS still pushes order
+  # state in real time so the slower REST poll only delays the safety
+  # net, not the primary update path.
+  om_periodic_sync_interval_sec: 60
 
   # diff_quotes tolerance — same as paper trading defaults
   price_tolerance_bp: "0.5"

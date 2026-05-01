@@ -545,6 +545,12 @@ async def run_live_mode(
         ws=ws,
         account_index=int(gateway.account_index),
         market_index_filter=market_index,
+        # Phase 3 multi-market REST budget: stretch the safety-net
+        # poll so 3 concurrent processes don't burn the WAF allowance.
+        # Default 30s in the OM; yaml overrides via this key.
+        periodic_sync_interval_sec=float(
+            strategy_cfg.get("om_periodic_sync_interval_sec", 30)
+        ),
     )
 
     # Phase 1.2 P0.1: seed the OM with the existing position from
@@ -683,6 +689,13 @@ async def run_live_mode(
         "  reprice: drift=%sbp min_interval=%ss",
         cfg.get("reprice_drift_bp"),
         cfg.get("reprice_min_interval_sec"),
+    )
+    logger.info(
+        "  cadence: tick=%ss snapshot=%ss collateral_refresh=%ss om_sync=%ss",
+        cfg.get("tick_interval_sec"),
+        cfg.get("snapshot_interval_sec"),
+        cfg.get("collateral_refresh_interval_sec"),
+        cfg.get("om_periodic_sync_interval_sec", 30),
     )
     logger.info(
         "  emergency: rejects=%s cancel_fails=%s ws_silent=%ss",

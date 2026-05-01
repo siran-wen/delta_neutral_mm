@@ -35,9 +35,11 @@ strategy:
   reprice_drift_bp: "8"
   reprice_min_interval_sec: "60"
 
-  tick_interval_sec: "1"
+  # Phase 3 multi-market REST budget — see SKHYNIX yaml for rationale.
+  tick_interval_sec: "10"
   snapshot_interval_sec: "60"
-  collateral_refresh_interval_sec: "60"
+  collateral_refresh_interval_sec: "120"
+  om_periodic_sync_interval_sec: 60
 
   price_tolerance_bp: "0.5"
   size_tolerance_pct: "0.05"
