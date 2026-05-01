@@ -552,17 +552,30 @@ class LighterOrderManager:
         sdk_order_type = _ORDER_TYPE_MAP[order_type]
         sdk_tif = _TIME_IN_FORCE_MAP[time_in_force]
 
+        sdk_kwargs: Dict[str, Any] = {
+            "market_index": int(market_index),
+            "client_order_index": coid,
+            "base_amount": size_int,
+            "price": price_int,
+            "is_ask": is_ask,
+            "order_type": sdk_order_type,
+            "time_in_force": sdk_tif,
+            "reduce_only": bool(reduce_only),
+        }
+        # IOC orders need a real expiry timestamp — the SDK's default
+        # (``DEFAULT_28_DAY_ORDER_EXPIRY = -1``) is rejected with
+        # "OrderExpiry is invalid" for IOC. Post-only / GTT keep the
+        # default so server-side 28-day rotation continues to apply.
+        # 30s is well beyond the SDK's send-tx round-trip and any
+        # plausible matching latency; an IOC walks the book in ms,
+        # so the only reason this expiry would matter is if the order
+        # never reaches the matching engine, in which case we want it
+        # to vanish quickly rather than linger.
+        if time_in_force == "ioc":
+            sdk_kwargs["order_expiry"] = sent_ts + 30 * 1000
+
         try:
-            await self._send_create_order_with_retry(
-                market_index=int(market_index),
-                client_order_index=coid,
-                base_amount=size_int,
-                price=price_int,
-                is_ask=is_ask,
-                order_type=sdk_order_type,
-                time_in_force=sdk_tif,
-                reduce_only=bool(reduce_only),
-            )
+            await self._send_create_order_with_retry(**sdk_kwargs)
             self._set_status(order, "pending_ack", reason="sdk_send_ok")
         except (LighterSDKError, asyncio.TimeoutError) as exc:
             self._set_status(order, "rejected", reason="sdk_send_failed")

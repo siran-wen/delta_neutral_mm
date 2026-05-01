@@ -1540,6 +1540,64 @@ def test_active_hedge_failure_logged_not_crash():
     assert q.get_summary()["active_hedges_failed"] == 1
 
 
+def test_active_hedge_consecutive_sdk_rejects_trip_emergency_stop():
+    """N consecutive SDK-rejected hedge submits arm the emergency-stop
+    gate, and a single accepted submit resets the streak.
+
+    Regression: the 4-30 live run sent 80+ IOC hedges that the SDK
+    rejected with ``OrderExpiry is invalid``. Because submit_order
+    swallows SDK errors and returns the coid normally, the quoter
+    counted each as a successful hedge and never tripped the kill
+    switch — leaving naked exposure for the rest of the session.
+    """
+    q, gw, _, _, _ = _make_quoter(
+        config_overrides={
+            "active_hedge_enabled": True,
+            "hard_position_cap_usdc": Decimal("100"),
+            "active_hedge_trigger_pct": Decimal("1.0"),
+            "active_hedge_target_pct": Decimal("0.3"),
+            "active_hedge_taker_fee_max_pct": Decimal("0.1"),
+            "active_hedge_pause_after_sec": 0,  # don't gate the next call
+            "active_hedge_max_consecutive_fails": 5,
+            "hard_position_cap_pct": None,
+        },
+    )
+    market = _hedge_market(mid=Decimal("100"))
+    inv = _inv("120")
+
+    async def _fire(n: int) -> int:
+        await q.start()
+        # Force the SDK to reject every submit. The OM's ``submit_order``
+        # catches LighterSDKError, marks the order rejected, and returns
+        # the coid unchanged — exactly the 4-30 production path.
+        gw.signer_client.create_always_fails = True
+        for _ in range(n):
+            await q._maybe_trigger_active_hedge(market, inv)
+        return q._stats["consecutive_active_hedge_fails"]
+
+    fails = asyncio.run(_fire(5))
+    assert fails == 5
+    summary = q.get_summary()
+    assert summary["consecutive_active_hedge_fails"] == 5
+    assert summary["active_hedges_failed"] == 5
+    # ``active_hedges_total`` counts only fully-accepted submits.
+    assert summary["active_hedges_total"] == 0
+    # Threshold reached → emergency stop is armed.
+    assert q._should_emergency_stop() is True
+
+    # A subsequent accepted submit (SDK no longer failing) clears the
+    # streak so a transient SDK hiccup can't permanently tombstone the
+    # session.
+    async def _recover() -> int:
+        gw.signer_client.create_always_fails = False
+        await q._maybe_trigger_active_hedge(market, inv)
+        return q._stats["consecutive_active_hedge_fails"]
+
+    assert asyncio.run(_recover()) == 0
+    assert q._should_emergency_stop() is False
+    assert q.get_summary()["active_hedges_total"] == 1
+
+
 # ----- M. Phase 2.1 P2.1.3: daily drawdown stop --------------------------
 
 

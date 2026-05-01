@@ -338,6 +338,63 @@ def test_submit_order_quantizes_price_and_size_to_int():
     assert call["time_in_force"] == _TIME_IN_FORCE_MAP["post_only"]
 
 
+def test_submit_order_ioc_sets_order_expiry_and_post_only_does_not():
+    """IOC submits forward an explicit ``order_expiry`` (now+30s). Post-only
+    omits the kwarg so the SDK falls back to ``DEFAULT_28_DAY_ORDER_EXPIRY``.
+
+    Regression: the 4-30 live run rejected 80+ active-hedge IOC submits
+    with "OrderExpiry is invalid" because the OM never forwarded
+    ``order_expiry`` and the SDK's -1 sentinel is not valid for IOC.
+    """
+    om, gw, _ = _make_manager()
+
+    async def _go() -> Tuple[int, int]:
+        await om.start()
+        c1 = await om.submit_order(
+            side="buy",
+            market_index=161,
+            price=_D("100"),
+            size_base=_D("1"),
+            price_decimals=3,
+            size_decimals=3,
+            time_in_force="ioc",
+            reduce_only=True,
+        )
+        c2 = await om.submit_order(
+            side="sell",
+            market_index=161,
+            price=_D("100"),
+            size_base=_D("1"),
+            price_decimals=3,
+            size_decimals=3,
+            time_in_force="post_only",
+        )
+        return c1, c2
+
+    before_ms = int(time.time() * 1000)
+    asyncio.run(_go())
+    after_ms = int(time.time() * 1000)
+
+    ioc_call = gw.signer_client.create_calls[0]
+    post_call = gw.signer_client.create_calls[1]
+
+    assert "order_expiry" in ioc_call, "IOC must forward order_expiry"
+    expiry = ioc_call["order_expiry"]
+    # Expect roughly now + 30s. Allow generous slack for the 1ms-clock
+    # capture above to be racy against the OM's internal sent_ts.
+    assert before_ms + 30_000 - 100 <= expiry <= after_ms + 30_000 + 100, (
+        f"order_expiry={expiry} not in [{before_ms+30_000}, {after_ms+30_000}]"
+    )
+    assert ioc_call["time_in_force"] == _TIME_IN_FORCE_MAP["ioc"]
+    assert ioc_call["reduce_only"] is True
+
+    # Post-only: explicit absence so SDK default (-1 → 28-day) applies.
+    assert "order_expiry" not in post_call, (
+        "post_only must not forward order_expiry — let the SDK default apply"
+    )
+    assert post_call["time_in_force"] == _TIME_IN_FORCE_MAP["post_only"]
+
+
 def test_submit_order_creates_managed_order_in_active():
     om, _, _ = _make_manager()
 

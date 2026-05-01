@@ -127,6 +127,12 @@ QUOTER_DEFAULTS: Dict[str, Any] = {
     "active_hedge_target_pct": Decimal("0.3"),
     "active_hedge_taker_fee_max_pct": Decimal("0.1"),
     "active_hedge_pause_after_sec": 30,
+    # Cap consecutive active-hedge SDK rejects before tripping the
+    # global emergency_stop. Without this, an SDK-side reject loop
+    # (e.g. the 4-30 OrderExpiry storm) burns nonces and leaves the
+    # naked exposure unhedged for the entire session. 5 matches the
+    # general consecutive-reject threshold; tighten via yaml override.
+    "active_hedge_max_consecutive_fails": 5,
     # Phase 2.1 P2.1.3: daily max drawdown stop loss. start() captures
     # collateral_start; periodic check fires emergency_stop when
     # drawdown >= min(daily_max_drawdown_usdc, daily_max_drawdown_pct
@@ -243,6 +249,11 @@ class LppQuoter:
             # Phase 2.1 P2.1.2 active hedge.
             "active_hedges_total": 0,
             "active_hedges_failed": 0,
+            # Streak of SDK-rejected hedge submits since the last
+            # successful (= non-rejected) hedge. Drives the kill-switch
+            # in ``_should_emergency_stop`` so a config bug or SDK
+            # contract change can't burn the session on retries.
+            "consecutive_active_hedge_fails": 0,
             # Phase 2.1 P2.1.3 daily drawdown stop.
             "daily_drawdown_breaches": 0,
         }
@@ -463,13 +474,16 @@ class LppQuoter:
                     inv_snap = self._om.get_inventory()
                     logger.error(
                         "EMERGENCY STOP: rejects=%d (cap=%d) cancel_fails=%d (cap=%d) "
-                        "ws_silent=%.1fs (cap=%ds) inv=%s active_orders=%d",
+                        "hedge_fails=%d (cap=%d) ws_silent=%.1fs (cap=%ds) "
+                        "inv=%s active_orders=%d",
                         self._stats["consecutive_rejects"],
                         int(self.config["emergency_stop_on_consecutive_reject_count"]),
                         self._stats["consecutive_cancel_failures"],
                         int(self.config.get(
                             "emergency_stop_on_consecutive_cancel_fail_count", 3
                         )),
+                        self._stats["consecutive_active_hedge_fails"],
+                        int(self.config.get("active_hedge_max_consecutive_fails", 5)),
                         self._ws_silence_sec() or 0,
                         int(self.config["emergency_stop_on_ws_disconnect_sec"]),
                         inv_snap.net_delta_usdc,
@@ -852,8 +866,39 @@ class LppQuoter:
             )
         except Exception as exc:  # noqa: BLE001
             self._stats["active_hedges_failed"] += 1
-            logger.error("ACTIVE HEDGE submit failed: %s", exc)
+            self._stats["consecutive_active_hedge_fails"] += 1
+            logger.error(
+                "ACTIVE HEDGE submit raised: %s (consecutive=%d)",
+                exc,
+                self._stats["consecutive_active_hedge_fails"],
+            )
             return False
+
+        # ``submit_order`` swallows SDK errors and marks the order
+        # rejected — the coid is returned regardless. We must inspect
+        # the post-submit status to know whether the SDK actually
+        # accepted the order. Without this, the 4-30 ``OrderExpiry is
+        # invalid`` storm bumped only ``lifetime_rejected`` on the OM
+        # side; the quoter happily reported each as a successful hedge
+        # and never tripped the kill switch.
+        post_state = self._om.get_order_state(coid)
+        if post_state is not None and post_state.status == "rejected":
+            self._stats["active_hedges_failed"] += 1
+            self._stats["consecutive_active_hedge_fails"] += 1
+            logger.error(
+                "ACTIVE HEDGE: SDK rejected coid=%s reason=%s "
+                "(consecutive=%d, threshold=%d)",
+                coid,
+                post_state.last_error,
+                self._stats["consecutive_active_hedge_fails"],
+                int(self.config.get("active_hedge_max_consecutive_fails", 5)),
+            )
+            return False
+
+        # Successful submit (pending_ack / live / partial_fill) — reset
+        # the streak so future transient SDK hiccups don't accumulate
+        # across hours of healthy hedging.
+        self._stats["consecutive_active_hedge_fails"] = 0
 
         self._stats["active_hedges_total"] += 1
         self._last_active_hedge_ts_ms = int(time.time() * 1000)
@@ -1097,6 +1142,11 @@ class LppQuoter:
            regression that produced the -1.132 SKHYNIXUSD short: when the
            OM cancel path silently fails, stale orders accumulate on the
            book until something fills against them.
+        4. Consecutive active-hedge SDK rejects ≥
+           ``active_hedge_max_consecutive_fails`` — the 4-30 OrderExpiry
+           storm pattern: hedge can't fire, naked exposure builds up,
+           every retry burns a nonce. Tripping early avoids both the
+           rate-limit scrape and the unhedged drift.
         """
         threshold_rejects = int(
             self.config["emergency_stop_on_consecutive_reject_count"]
@@ -1114,6 +1164,19 @@ class LppQuoter:
                 "Emergency: %d consecutive cancel failures (threshold=%d)",
                 self._stats["consecutive_cancel_failures"],
                 threshold_cancel_fails,
+            )
+            return True
+
+        threshold_hedge_fails = int(
+            self.config.get("active_hedge_max_consecutive_fails", 5)
+        )
+        if (
+            self._stats["consecutive_active_hedge_fails"] >= threshold_hedge_fails
+        ):
+            logger.error(
+                "Emergency: %d consecutive active-hedge fails (threshold=%d)",
+                self._stats["consecutive_active_hedge_fails"],
+                threshold_hedge_fails,
             )
             return True
 
@@ -1399,6 +1462,9 @@ class LppQuoter:
             "reconcile_count": self._stats["reconcile_count"],
             "active_hedges_total": self._stats["active_hedges_total"],
             "active_hedges_failed": self._stats["active_hedges_failed"],
+            "consecutive_active_hedge_fails": self._stats[
+                "consecutive_active_hedge_fails"
+            ],
             "daily_drawdown_breaches": self._stats["daily_drawdown_breaches"],
             "collateral_start_usdc": str(self._collateral_start_usdc)
             if self._collateral_start_usdc is not None
