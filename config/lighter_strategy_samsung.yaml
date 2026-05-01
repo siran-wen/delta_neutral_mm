@@ -1,0 +1,84 @@
+# Lighter LPP strategy runtime config (SAMSUNGUSD).
+#
+# Phase 3 multi-market sibling of ``lighter_strategy.yaml`` (SKHYNIX).
+# Same risk/reprice/session knobs — only ``market`` and the per-run
+# log filename diverge.
+#
+# market_index intentionally omitted: ``run_lighter_strategy.py``
+# falls back to ``gateway.get_market_index(symbol)`` when the yaml
+# field is absent or 0, which keeps this file resilient to Lighter
+# renumbering markets.
+#
+# price_decimals / size_decimals are kept explicit despite the
+# preference to auto-fetch: the live-mode entry point currently
+# DOES NOT auto-fetch these from the gateway (defaults to 4 if
+# absent — wrong for Korean RWAs which all run at 3). Verified via
+# ``order_book_details``: SAMSUNGUSD = price_decimals=3,
+# size_decimals=3 as of 2026-05-01.
+
+strategy:
+  market: SAMSUNGUSD
+  price_decimals: 3
+  size_decimals: 3
+
+  target_max_delta_usdc: "50"
+  hard_position_cap_usdc: "100"
+  hard_position_cap_pct: "0.10"
+  skew_max_offset_bp: "5"
+
+  min_market_spread_bp: "0"
+  max_market_spread_bp: "100"
+
+  share_warn_threshold: "0.95"
+  share_warn_widen_bp: "5"
+
+  reprice_drift_bp: "8"
+  reprice_min_interval_sec: "60"
+
+  tick_interval_sec: "1"
+  snapshot_interval_sec: "60"
+  collateral_refresh_interval_sec: "60"
+
+  price_tolerance_bp: "0.5"
+  size_tolerance_pct: "0.05"
+
+  emergency_stop_on_consecutive_reject_count: 5
+  emergency_stop_on_ws_disconnect_sec: 300
+  emergency_stop_on_consecutive_cancel_fail_count: 3
+
+  active_hedge_enabled: false
+  active_hedge_trigger_pct: "0.7"
+  active_hedge_target_pct: "0.3"
+  active_hedge_taker_fee_max_pct: "0.1"
+  active_hedge_pause_after_sec: 30
+  active_hedge_max_consecutive_fails: 5
+
+  daily_max_drawdown_usdc: "100"
+  daily_max_drawdown_pct: "0.05"
+  daily_drawdown_check_interval_sec: 300
+
+  session_overrides:
+    KR_MARKET_HOURS_AM:
+      default_size_usdc: "50"
+    KR_MARKET_HOURS_PM:
+      default_size_usdc: "50"
+    KR_LUNCH_BREAK:
+      default_size_usdc: "50"
+    KR_AFTER_CLOSE:
+      default_size_usdc: "50"
+    KR_OVERNIGHT:
+      default_size_usdc: "50"
+    KR_BEFORE_OPEN:
+      default_size_usdc: "50"
+    KR_WEEKEND:
+      default_size_usdc: "50"
+
+recovery:
+  cancel_stale_orders: true
+  warn_if_existing_position_above_usdc: "50"
+  abort_if_existing_position_above_usdc: "0"
+  wait_after_cancel_sec: 5
+
+logging:
+  level: INFO
+  jsonl_filename: "strategy_samsung_{date}.jsonl"

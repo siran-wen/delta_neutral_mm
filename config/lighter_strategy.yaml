@@ -1,10 +1,16 @@
-# Lighter LPP strategy runtime config.
+# Lighter LPP strategy runtime config (SKHYNIXUSD).
 #
 # Loaded by ``scripts/run_lighter_strategy.py``. CLI flags
 # (``--market`` / ``--duration`` / ``--output-dir``) override the
 # ``strategy`` block below where they overlap; everything else (the
 # planner knobs, recovery thresholds, tracker hookup) comes from
 # this file.
+#
+# Phase 3: multi-market LPP. This file targets SKHYNIXUSD; sibling
+# files ``lighter_strategy_samsung.yaml`` and
+# ``lighter_strategy_hyundai.yaml`` use the same knobs against
+# SAMSUNGUSD and HYUNDAIUSD. Size $50 across all sessions, hedge
+# disabled — see "Phase 3 prep" decision notes for context.
 #
 # LPP weekly pool figures live separately in ``config/lpp_pool.yaml``;
 # this file stays scoped to per-run tuning so the pool numbers can
@@ -19,33 +25,33 @@ strategy:
   price_decimals: 3
   size_decimals: 3
 
-  # Inventory management (Phase 2.1: size $200 / $2k account).
-  # target_max_delta_usdc: skew clamp denominator — at this notional
-  # the skew has reached its full ``skew_max_offset_bp`` push.
-  # hard_position_cap_usdc: absolute cap. Above this notional, the
-  # cap-side quote is dropped entirely.
-  # hard_position_cap_pct: pct-of-collateral double cap. Effective cap
-  # is min(absolute, pct*collateral); protects against the absolute
-  # cap drifting into a too-large fraction of net worth as collateral
-  # shrinks (loss accumulation).
-  target_max_delta_usdc: "300"
-  hard_position_cap_usdc: "600"
-  hard_position_cap_pct: "0.30"
+  # Inventory management (Phase 3: size $50, multi-market spread,
+  # ~$2k account). target_max_delta_usdc = skew clamp denominator;
+  # at this notional the skew has reached its full
+  # ``skew_max_offset_bp`` push. hard_position_cap_usdc = absolute
+  # cap. hard_position_cap_pct = pct-of-collateral double cap;
+  # effective cap is min(absolute, pct*collateral). Three markets
+  # at 10% each cap total exposure to 30% of net worth.
+  target_max_delta_usdc: "50"
+  hard_position_cap_usdc: "100"
+  hard_position_cap_pct: "0.10"
   skew_max_offset_bp: "5"
 
-  # Market-state guards
+  # Market-state guards. min_market_spread_bp pinned to 0 since the
+  # 4-30 verify run found the previous "3" floor was knocking out
+  # legitimate quote ticks during low-vol windows.
   min_market_spread_bp: "0"
   max_market_spread_bp: "100"
 
   # Share-warn (15h SKHYNIX data justified 0.95 over 0.8 — see
-  # `strategy/lpp_quoter.py` defaults docstring)
+  # ``strategy/lpp_quoter.py`` defaults docstring).
   share_warn_threshold: "0.95"
   share_warn_widen_bp: "5"
 
-  # Reprice control. Phase 2.1: 12bp (was 8bp) — bigger size means
-  # each reprice churns more notional, so we widen the drift band
-  # to keep turnover comparable to Phase 1.
-  reprice_drift_bp: "12"
+  # Reprice control. Phase 3: 8bp (was 12bp under Phase 2.1) — size
+  # $50 means each reprice churns far less notional, so the tighter
+  # drift band is back to keeping spread fresh without burning fees.
+  reprice_drift_bp: "8"
   reprice_min_interval_sec: "60"
 
   # Tick / snapshot cadence
@@ -53,7 +59,7 @@ strategy:
   snapshot_interval_sec: "60"
   # Phase 2.1: how often to refresh collateral via REST. Used by the
   # pct-cap path and the daily-drawdown gate.
-  collateral_refresh_interval_sec: 60
+  collateral_refresh_interval_sec: "60"
 
   # diff_quotes tolerance — same as paper trading defaults
   price_tolerance_bp: "0.5"
@@ -70,17 +76,17 @@ strategy:
   emergency_stop_on_consecutive_cancel_fail_count: 3
 
   # Phase 2.1 P2.1.2: active hedge (IOC reduce_only).
-  # When inv breaches active_hedge_trigger_pct of the effective cap,
-  # send an IOC reduce-only at mid * (1 ± taker_fee_max_pct/100) to
-  # flatten down to active_hedge_target_pct of cap. Then pause reprice
-  # for active_hedge_pause_after_sec while the fill propagates. Catches
-  # the KR_OVERNIGHT thin-liquidity case where passive hedging stalled
-  # on the 4-30 v4 run (-$199 inv held 17 minutes).
-  active_hedge_enabled: true
-  active_hedge_trigger_pct: "1.0"
+  # Phase 3: DISABLED. Size $50 doesn't accumulate enough exposure to
+  # need active hedging, and the 5-1 P2.2 live run showed the IOC fix
+  # is still flaky (5 consecutive ``OrderExpiry`` rejects → emergency
+  # stop). Config kept for later re-enable; threshold values frozen
+  # at P2.1 levels so re-enabling is a one-line ``enabled: true`` flip.
+  active_hedge_enabled: false
+  active_hedge_trigger_pct: "0.7"
   active_hedge_target_pct: "0.3"
   active_hedge_taker_fee_max_pct: "0.1"
   active_hedge_pause_after_sec: 30
+  active_hedge_max_consecutive_fails: 5
 
   # Phase 2.1 P2.1.3: daily max drawdown stop loss.
   # Effective threshold = min(daily_max_drawdown_usdc,
@@ -90,25 +96,27 @@ strategy:
   daily_max_drawdown_pct: "0.05"
   daily_drawdown_check_interval_sec: 300
 
-  # Session-level overrides for default_size_usdc / default_distance_bp.
-  # Phase 2.1: stepped up to $200 nominal across active KR hours.
-  # KR_OVERNIGHT / KR_WEEKEND keep $100 because liquidity dries up and
-  # the active-hedge path's IOC slippage tolerance bites harder there.
+  # Session-level overrides for default_size_usdc.
+  # Phase 3: flat $50 across all 7 KR sessions — multi-market
+  # diversification replaces session-level size variation. The
+  # KR_OVERNIGHT / KR_WEEKEND lower-size carve-out is no longer
+  # needed because the absolute size is already small enough that
+  # thin-liquidity slippage doesn't bite as hard.
   session_overrides:
     KR_MARKET_HOURS_AM:
-      default_size_usdc: "200"
+      default_size_usdc: "50"
     KR_MARKET_HOURS_PM:
-      default_size_usdc: "200"
+      default_size_usdc: "50"
     KR_LUNCH_BREAK:
-      default_size_usdc: "200"
+      default_size_usdc: "50"
     KR_AFTER_CLOSE:
-      default_size_usdc: "200"
+      default_size_usdc: "50"
     KR_OVERNIGHT:
-      default_size_usdc: "100"
+      default_size_usdc: "50"
     KR_BEFORE_OPEN:
-      default_size_usdc: "200"
+      default_size_usdc: "50"
     KR_WEEKEND:
-      default_size_usdc: "100"
+      default_size_usdc: "50"
 
 recovery:
   # Cancel any orders found resting on the account at startup.
@@ -133,5 +141,7 @@ logging:
   # Console verbosity (overridden by -v / -vv on the CLI).
   level: INFO
   # JSONL file pattern relative to --output-dir. ``{date}`` is
-  # interpolated to UTC YYYYMMDD at startup.
-  jsonl_filename: "strategy_{date}.jsonl"
+  # interpolated to UTC YYYYMMDD at startup. Phase 3: per-market
+  # filename so concurrent SKHYNIX/SAMSUNG/HYUNDAI runs don't
+  # clobber each other's logs in a shared output dir.
+  jsonl_filename: "strategy_skhynix_{date}.jsonl"
