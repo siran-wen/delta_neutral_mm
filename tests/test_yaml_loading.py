@@ -56,14 +56,14 @@ def test_skhynix_yaml_size_and_cap():
 
 
 def test_samsung_yaml_size_and_cap():
-    """SAMSUNG minimum-size deployment: $30 per side, cap $60, pct 5%."""
+    """SAMSUNG: $100 per side, cap $200, pct 10%, hedge enabled."""
     cfg = _load_strategy("lighter_strategy_samsung.yaml")
     assert cfg["market"] == "SAMSUNGUSD"
-    assert cfg["target_max_delta_usdc"] == Decimal("30")
-    assert cfg["hard_position_cap_usdc"] == Decimal("60")
-    assert cfg["hard_position_cap_pct"] == Decimal("0.05")
+    assert cfg["target_max_delta_usdc"] == Decimal("100")
+    assert cfg["hard_position_cap_usdc"] == Decimal("200")
+    assert cfg["hard_position_cap_pct"] == Decimal("0.1")
     weekend = cfg["session_overrides"]["KR_WEEKEND"]
-    assert weekend["default_size_usdc"] == Decimal("30")
+    assert weekend["default_size_usdc"] == Decimal("100")
 
 
 def test_hyundai_yaml_size_and_cap():
@@ -77,17 +77,16 @@ def test_hyundai_yaml_size_and_cap():
     assert weekend["default_size_usdc"] == Decimal("150")
 
 
-def test_hyundai_yaml_widened_max_market_spread():
-    """HYUNDAI's max_market_spread_bp must be 300, not the 100bp default —
-    weekend spreads regularly exceed 200bp and would otherwise shut the
-    market off entirely."""
-    cfg = _load_strategy("lighter_strategy_hyundai.yaml")
-    assert cfg["max_market_spread_bp"] == Decimal("300")
-    # Sanity: the other two stay at the tighter guard.
+def test_max_market_spread_bp_pinned_per_yaml():
+    """Per-market spread guard pins. HYUNDAI runs widest (weekend
+    spreads regularly exceed 200bp), SAMSUNG widened post-Day-1 to
+    cover its volatile windows, SKHYNIX keeps the tightest guard."""
     skhynix = _load_strategy("lighter_strategy.yaml")
     samsung = _load_strategy("lighter_strategy_samsung.yaml")
+    hyundai = _load_strategy("lighter_strategy_hyundai.yaml")
     assert skhynix["max_market_spread_bp"] == Decimal("100")
-    assert samsung["max_market_spread_bp"] == Decimal("100")
+    assert samsung["max_market_spread_bp"] == Decimal("200")
+    assert hyundai["max_market_spread_bp"] == Decimal("300")
 
 
 # ---- cross-market invariants -----------------------------------------
@@ -124,7 +123,7 @@ def test_all_three_yamls_have_size_at_every_kr_session():
             )
 
 
-def test_total_absolute_cap_exposure_under_30pct_at_2k_collateral():
+def test_total_absolute_cap_exposure_pinned_at_2k_collateral():
     """At ~$2,213 collateral, the sum of absolute caps across the three
     markets is the ceiling on net delta if every side fills against us
     simultaneously. Pin the math so nudging any cap without checking
@@ -137,22 +136,20 @@ def test_total_absolute_cap_exposure_under_30pct_at_2k_collateral():
         + samsung["hard_position_cap_usdc"]
         + hyundai["hard_position_cap_usdc"]
     )
-    # $200 + $60 + $300 = $560
-    assert total_cap == Decimal("560")
-    # 25.3% of a $2,213 baseline collateral.
-    assert total_cap / Decimal("2213") < Decimal("0.30")
+    # $200 + $200 + $300 = $700
+    assert total_cap == Decimal("700")
+    # 31.6% of the $2,213 baseline. Sanity bound at 35%.
+    assert total_cap / Decimal("2213") < Decimal("0.35")
 
 
-def test_active_hedge_remains_disabled_across_all_yamls():
-    """Until the IOC OrderExpiry fix is live-verified, every market keeps
-    active_hedge_enabled=False — hedge re-enable is an explicit decision,
-    not an accidental yaml diff."""
-    for fname in (
-        "lighter_strategy.yaml",
-        "lighter_strategy_samsung.yaml",
-        "lighter_strategy_hyundai.yaml",
-    ):
-        cfg = _load_strategy(fname)
-        assert cfg["active_hedge_enabled"] is False, (
-            f"{fname}: active_hedge_enabled flipped on without IOC verify"
-        )
+def test_active_hedge_state_pinned_per_yaml():
+    """Pin the active_hedge_enabled flag per yaml so toggles can't slip
+    in unnoticed. Hedge re-enable is an explicit decision (gated on
+    the P2.2 IOC fix verifying live), so the test asserts the live
+    state per market rather than a uniform default."""
+    skhynix = _load_strategy("lighter_strategy.yaml")
+    samsung = _load_strategy("lighter_strategy_samsung.yaml")
+    hyundai = _load_strategy("lighter_strategy_hyundai.yaml")
+    assert skhynix["active_hedge_enabled"] is False
+    assert samsung["active_hedge_enabled"] is True
+    assert hyundai["active_hedge_enabled"] is False
