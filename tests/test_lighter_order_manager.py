@@ -338,14 +338,28 @@ def test_submit_order_quantizes_price_and_size_to_int():
     assert call["time_in_force"] == _TIME_IN_FORCE_MAP["post_only"]
 
 
-def test_submit_order_ioc_sets_order_expiry_and_post_only_does_not():
-    """IOC submits forward an explicit ``order_expiry`` (now+30s). Post-only
-    omits the kwarg so the SDK falls back to ``DEFAULT_28_DAY_ORDER_EXPIRY``.
+def test_submit_order_ioc_uses_market_order_type_and_zero_expiry():
+    """IOC payload must match Lighter's SDK helpers exactly:
+    ``order_type = ORDER_TYPE_MARKET`` and ``order_expiry = 0``
+    (= ``DEFAULT_IOC_EXPIRY``). Post-only / GTT still use the
+    LIMIT order type and let the SDK pick the 28-day expiry default.
 
-    Regression: the 4-30 live run rejected 80+ active-hedge IOC submits
-    with "OrderExpiry is invalid" because the OM never forwarded
-    ``order_expiry`` and the SDK's -1 sentinel is not valid for IOC.
+    Regression: the 4-30 + 5-1 live runs rejected 80+ active-hedge IOC
+    submits with "OrderExpiry is invalid". P2.1 patched only
+    ``order_expiry``, setting it to ``now_ms + 30s`` while leaving
+    ``order_type`` at LIMIT — which matches NO SDK helper pattern.
+    Inspecting ``lighter.SignerClient`` source (1.0.9) shows every
+    IOC convenience method (``create_market_order`` and friends)
+    sends ``(order_type=MARKET, time_in_force=IOC, order_expiry=0)``.
+    Lighter's matching engine evidently only accepts IOC with that
+    exact triple — there is no "limit IOC" path despite the SDK's
+    surface allowing the combination via ``create_order``.
     """
+    from execution.lighter.lighter_order_manager import (
+        _LIGHTER_DEFAULT_IOC_EXPIRY,
+        _LIGHTER_ORDER_TYPE_MARKET,
+    )
+
     om, gw, _ = _make_manager()
 
     async def _go() -> Tuple[int, int]:
@@ -371,24 +385,26 @@ def test_submit_order_ioc_sets_order_expiry_and_post_only_does_not():
         )
         return c1, c2
 
-    before_ms = int(time.time() * 1000)
     asyncio.run(_go())
-    after_ms = int(time.time() * 1000)
 
     ioc_call = gw.signer_client.create_calls[0]
     post_call = gw.signer_client.create_calls[1]
 
-    assert "order_expiry" in ioc_call, "IOC must forward order_expiry"
-    expiry = ioc_call["order_expiry"]
-    # Expect roughly now + 30s. Allow generous slack for the 1ms-clock
-    # capture above to be racy against the OM's internal sent_ts.
-    assert before_ms + 30_000 - 100 <= expiry <= after_ms + 30_000 + 100, (
-        f"order_expiry={expiry} not in [{before_ms+30_000}, {after_ms+30_000}]"
+    # IOC: explicit MARKET order_type override + DEFAULT_IOC_EXPIRY (=0).
+    assert ioc_call["order_type"] == _LIGHTER_ORDER_TYPE_MARKET, (
+        f"IOC must override order_type to MARKET, got {ioc_call['order_type']}"
     )
+    assert ioc_call["order_expiry"] == _LIGHTER_DEFAULT_IOC_EXPIRY, (
+        f"IOC must use DEFAULT_IOC_EXPIRY (0), got {ioc_call['order_expiry']}"
+    )
+    assert ioc_call["order_expiry"] == 0  # explicit value pin
     assert ioc_call["time_in_force"] == _TIME_IN_FORCE_MAP["ioc"]
     assert ioc_call["reduce_only"] is True
 
-    # Post-only: explicit absence so SDK default (-1 → 28-day) applies.
+    # Post-only: keep the limit order type and DON'T set order_expiry
+    # (SDK default -1 means 28-day rotation, the desired GTT-like
+    # behaviour for resting maker orders).
+    assert post_call["order_type"] == _ORDER_TYPE_MAP["limit"]
     assert "order_expiry" not in post_call, (
         "post_only must not forward order_expiry — let the SDK default apply"
     )

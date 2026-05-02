@@ -80,21 +80,25 @@ logger = logging.getLogger(__name__)
 # (test_sdk_constants_match_real_sdk_when_available).
 
 _LIGHTER_ORDER_TYPE_LIMIT = 0
+_LIGHTER_ORDER_TYPE_MARKET = 1
 _LIGHTER_TIF_IOC = 0
 _LIGHTER_TIF_GTT = 1
 _LIGHTER_TIF_POST_ONLY = 2
 _LIGHTER_NIL_TRIGGER_PRICE = 0
 _LIGHTER_DEFAULT_28D_EXPIRY = -1
+_LIGHTER_DEFAULT_IOC_EXPIRY = 0
 
 try:  # pragma: no cover - optional SDK presence
     from lighter import SignerClient as _SC  # type: ignore[import-not-found]
 
     _LIGHTER_ORDER_TYPE_LIMIT = _SC.ORDER_TYPE_LIMIT
+    _LIGHTER_ORDER_TYPE_MARKET = _SC.ORDER_TYPE_MARKET
     _LIGHTER_TIF_IOC = _SC.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
     _LIGHTER_TIF_GTT = _SC.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
     _LIGHTER_TIF_POST_ONLY = _SC.ORDER_TIME_IN_FORCE_POST_ONLY
     _LIGHTER_NIL_TRIGGER_PRICE = _SC.NIL_TRIGGER_PRICE
     _LIGHTER_DEFAULT_28D_EXPIRY = _SC.DEFAULT_28_DAY_ORDER_EXPIRY
+    _LIGHTER_DEFAULT_IOC_EXPIRY = _SC.DEFAULT_IOC_EXPIRY
 except (ImportError, AttributeError):
     pass
 
@@ -562,17 +566,25 @@ class LighterOrderManager:
             "time_in_force": sdk_tif,
             "reduce_only": bool(reduce_only),
         }
-        # IOC orders need a real expiry timestamp — the SDK's default
-        # (``DEFAULT_28_DAY_ORDER_EXPIRY = -1``) is rejected with
-        # "OrderExpiry is invalid" for IOC. Post-only / GTT keep the
-        # default so server-side 28-day rotation continues to apply.
-        # 30s is well beyond the SDK's send-tx round-trip and any
-        # plausible matching latency; an IOC walks the book in ms,
-        # so the only reason this expiry would matter is if the order
-        # never reaches the matching engine, in which case we want it
-        # to vanish quickly rather than linger.
+        # IOC payload pattern, sourced from lighter SDK 1.0.9
+        # ``create_market_order`` (signer_client.py:725-741) and the
+        # other ``create_market_order_*`` helpers — all of them encode
+        # IOC as ``(order_type=MARKET, time_in_force=IOC,
+        # order_expiry=DEFAULT_IOC_EXPIRY=0)``. The previous P2.1 fix
+        # set ``order_expiry = now_ms + 30s`` AND left ``order_type``
+        # at ``LIMIT``; the server rejected every such tx with
+        # "OrderExpiry is invalid" (5-1 live: 80+ rejects in 5 min).
+        # Lighter's matching engine apparently only accepts IOC
+        # paired with MARKET order type and the special 0 expiry
+        # sentinel — there is no "limit IOC" path, despite the SDK's
+        # surface allowing the combination via ``create_order``.
+        # ``price`` for a MARKET+IOC is interpreted as the
+        # avg_execution_price (slippage-bounded average), not a hard
+        # limit — which matches what the active-hedge caller
+        # already passes (mid * (1 ± taker_fee_max_pct)).
         if time_in_force == "ioc":
-            sdk_kwargs["order_expiry"] = sent_ts + 30 * 1000
+            sdk_kwargs["order_type"] = _LIGHTER_ORDER_TYPE_MARKET
+            sdk_kwargs["order_expiry"] = _LIGHTER_DEFAULT_IOC_EXPIRY
 
         try:
             await self._send_create_order_with_retry(**sdk_kwargs)
