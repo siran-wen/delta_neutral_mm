@@ -61,6 +61,52 @@ def _coerce_depth(depth_dict: dict, key: str) -> Decimal:
     return Decimal(str(raw))
 
 
+def _apply_bbo_track(
+    actual_bid: Decimal,
+    actual_ask: Decimal,
+    market: MarketSnapshot,
+    mode: str,
+    max_distance_bp: Decimal,
+) -> Tuple[Decimal, Decimal]:
+    """Pull resting prices toward BBO when the static distance overshoots.
+
+    Day 1 production data showed the fixed ``default_distance_bp=30`` left
+    quotes ~17 bp behind a 13-15 bp market spread on SAMSUNG, dragging
+    share to 2.3%. ``passive`` mode pulls the quote up to ``best_bid``
+    (or down to ``best_ask`` for the sell side) whenever the planner's
+    target sits more than ``max_distance_bp`` outside the current BBO,
+    keeping us at the front of the queue while still resting as a maker.
+
+    Modes:
+        ``"off"``     — no adjustment (legacy behaviour).
+        ``"passive"`` — if the planner placed a side farther than
+                        ``max_distance_bp`` from the corresponding BBO,
+                        pull it onto the BBO. ``actual_bid > best_bid``
+                        (improving) is left alone — the BBO-aware block
+                        already validated that, and re-pulling would
+                        widen us back out unnecessarily.
+    """
+    if mode == "off":
+        return actual_bid, actual_ask
+    if mode != "passive":
+        # Unknown mode — silently no-op rather than crashing the
+        # planner. The startup config echo logs the active mode, so a
+        # typo is visible there.
+        return actual_bid, actual_ask
+
+    max_dist = market.mid * max_distance_bp / _BP_DENOM
+
+    bid_floor = market.best_bid - max_dist
+    if actual_bid < bid_floor:
+        actual_bid = market.best_bid
+
+    ask_ceiling = market.best_ask + max_dist
+    if actual_ask > ask_ceiling:
+        actual_ask = market.best_ask
+
+    return actual_bid, actual_ask
+
+
 def plan_quotes(
     market: MarketSnapshot,
     session: SessionPolicy,
@@ -147,6 +193,13 @@ def plan_quotes(
         config["hard_position_cap_usdc"],
         collateral_usdc=collateral_usdc,
         hard_cap_pct=hard_cap_pct,
+        # Defensive: pass the per-side size so the cap check projects
+        # post-fill inventory rather than firing only after a breach.
+        # 5-2 SKHYNIX hit inv=$148 against $100 cap because the old
+        # check only tripped at inv >= cap, but inv=$98 + $50 fill
+        # landed at $148. See is_position_capped docstring for the
+        # post-fill projection logic.
+        size_per_side_usdc=base_size,
     )
 
     # share-warn — estimate our share of the top-tier depth bucket
@@ -198,6 +251,23 @@ def plan_quotes(
     else:
         actual_ask = target_ask
         ask_position = "passive"
+
+    # Phase 3: pull static-distance quotes onto BBO when the configured
+    # ``default_distance_bp`` would otherwise leave us further than
+    # ``bbo_track_max_distance_bp`` behind the live BBO. ``mode="off"``
+    # restores the pre-Phase-3 fixed-distance behaviour exactly.
+    bbo_track_mode = str(config.get("bbo_track_mode", "off"))
+    if bbo_track_mode != "off":
+        bbo_track_max_dist_bp = Decimal(str(
+            config.get("bbo_track_max_distance_bp", 5)
+        ))
+        actual_bid, actual_ask = _apply_bbo_track(
+            actual_bid,
+            actual_ask,
+            market,
+            bbo_track_mode,
+            bbo_track_max_dist_bp,
+        )
 
     # cross-self defense (rare; trips on distance≈0 or oracle/BBO disagreement)
     if actual_bid >= actual_ask:

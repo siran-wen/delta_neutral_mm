@@ -41,7 +41,14 @@ from strategy.types import (  # noqa: E402
 DEFAULT_CONFIG = {
     "target_max_delta_usdc": Decimal("500"),
     "skew_max_offset_bp": Decimal("5"),
-    "hard_position_cap_usdc": Decimal("1000"),
+    # Cap is $2k so the post-fill defensive check
+    # (``is_position_capped`` projects inv + size_per_side) does NOT
+    # trip on the non-cap-focused tests in this file. The KR session
+    # default size is $1k; with cap=$1k those tests' EMPTY_INVENTORY
+    # would now project to exactly the cap and skip both sides.
+    # The two cap-focused tests below explicitly use inv = ±$1500 so
+    # the projected inv (±$2500) still breaches the bumped cap.
+    "hard_position_cap_usdc": Decimal("2000"),
     "min_market_spread_bp": Decimal("3"),
     "max_market_spread_bp": Decimal("100"),
     "share_warn_threshold": Decimal("0.8"),
@@ -510,6 +517,162 @@ def test_quote_size_base_always_positive():
     for q in quotes:
         assert q.size_base > 0
         assert q.size_usdc > 0
+
+
+# ---- Phase 3: BBO-aware dynamic distance ---------------------------
+
+
+def _bbo_track_config(mode: str = "passive", max_dist_bp: int = 5) -> dict:
+    """DEFAULT_CONFIG + bbo_track keys."""
+    cfg = dict(DEFAULT_CONFIG)
+    cfg["bbo_track_mode"] = mode
+    cfg["bbo_track_max_distance_bp"] = max_dist_bp
+    return cfg
+
+
+def _wide_distance_session() -> SessionPolicy:
+    """30 bp default distance — the KR_OVERNIGHT setting that motivated
+    the BBO-track feature. Far outside a tight 10 bp BBO."""
+    return SessionPolicy(
+        name="KR_OVERNIGHT_TEST", action="quote",
+        default_distance_bp=Decimal("30"),
+        default_size_usdc=Decimal("1000"),
+        tier_thresholds_bp=(Decimal("15"), Decimal("25"), Decimal("50")),
+        reason="bbo track unit test",
+    )
+
+
+def test_bbo_track_passive_pulls_bid_to_bbo():
+    """Passive-mode pulls a bid sitting >max_distance below BBO up to BBO.
+
+    mid=100, best_bid=99.95, default_distance=30 bp →
+    target_bid = 99.70. max_distance_bp=5 → bid_floor = 99.90.
+    99.70 < 99.90, so the planner replaces actual_bid with best_bid
+    (99.95) — joining the BBO queue rather than resting 25 bp behind.
+    """
+    session = _wide_distance_session()
+    market = market_kr_lunch_lite(
+        mid="100", bid="99.95", ask="100.05", spread_bp="10",
+        l1_bid="5000", l1_ask="5000",
+    )
+    quotes = plan_quotes(market, session, EMPTY_INVENTORY, _bbo_track_config())
+    bid = next(q for q in quotes if q.side == "buy")
+    assert bid.price == Decimal("99.95")
+
+
+def test_bbo_track_passive_keeps_close_bid():
+    """A bid already inside max_distance of BBO is left untouched.
+
+    With default_distance=3 bp, target_bid = 99.97 — only 2 bp behind
+    the 99.95 BBO. max_distance=5 bp → bid_floor = 99.90; 99.97 is
+    above the floor so no adjustment.
+
+    Note: best_bid=99.95 against target=99.97 means the BBO-aware
+    block tags this as "improving" (target > best_bid). passive
+    bbo-track does not down-adjust improving prices.
+    """
+    session = SessionPolicy(
+        name="TIGHT", action="quote",
+        default_distance_bp=Decimal("3"),
+        default_size_usdc=Decimal("1000"),
+        tier_thresholds_bp=(Decimal("15"), Decimal("25"), Decimal("50")),
+        reason="bbo close-to-bbo test",
+    )
+    market = market_kr_lunch_lite(
+        mid="100", bid="99.95", ask="100.05", spread_bp="10",
+        l1_bid="5000", l1_ask="5000",
+    )
+    quotes = plan_quotes(market, session, EMPTY_INVENTORY, _bbo_track_config())
+    bid = next(q for q in quotes if q.side == "buy")
+    # target_bid = 100 * (1 - 3/10000) = 99.97 → ROUND_DOWN → 99.97
+    assert bid.price == Decimal("99.97")
+
+
+def test_bbo_track_off_preserves_static_distance():
+    """mode="off" gives the legacy fixed-distance behaviour exactly."""
+    session = _wide_distance_session()
+    market = market_kr_lunch_lite(
+        mid="100", bid="99.95", ask="100.05", spread_bp="10",
+        l1_bid="5000", l1_ask="5000",
+    )
+    quotes = plan_quotes(
+        market, session, EMPTY_INVENTORY, _bbo_track_config(mode="off")
+    )
+    bid = next(q for q in quotes if q.side == "buy")
+    ask = next(q for q in quotes if q.side == "sell")
+    # Default 30 bp distance, no BBO-tracking → quotes at mid ± 30bp.
+    # ROUND_DOWN on bid, ROUND_UP on ask, price_decimals=2.
+    assert bid.price == Decimal("99.70")
+    assert ask.price == Decimal("100.30")
+
+
+def test_bbo_track_default_off_when_key_absent():
+    """When bbo_track_mode is missing from config, the planner behaves
+    exactly as it did before this feature shipped."""
+    session = _wide_distance_session()
+    market = market_kr_lunch_lite(
+        mid="100", bid="99.95", ask="100.05", spread_bp="10",
+        l1_bid="5000", l1_ask="5000",
+    )
+    quotes = plan_quotes(market, session, EMPTY_INVENTORY, DEFAULT_CONFIG)
+    bid = next(q for q in quotes if q.side == "buy")
+    ask = next(q for q in quotes if q.side == "sell")
+    assert bid.price == Decimal("99.70")
+    assert ask.price == Decimal("100.30")
+
+
+def test_bbo_track_passive_pulls_ask_to_bbo():
+    """Symmetric to the bid test: ask sitting too far above BBO is
+    pulled down onto best_ask."""
+    session = _wide_distance_session()
+    market = market_kr_lunch_lite(
+        mid="100", bid="99.95", ask="100.05", spread_bp="10",
+        l1_bid="5000", l1_ask="5000",
+    )
+    quotes = plan_quotes(market, session, EMPTY_INVENTORY, _bbo_track_config())
+    ask = next(q for q in quotes if q.side == "sell")
+    # target_ask = 100.30, ceiling = 100.05 + 0.05 = 100.10, pull to 100.05.
+    assert ask.price == Decimal("100.05")
+
+
+def test_bbo_track_passive_with_skew_long_inventory():
+    """Skew + BBO-track compose: a long inventory pushes the bid further
+    out (skew), which only makes BBO-track's pull more relevant.
+
+    inv=$500 long → max skew offset (5 bp on bid). default_distance=30
+    bp + 5 bp skew = 35 bp → target_bid = 99.65, well below the 99.90
+    floor → pull to 99.95. Ask unchanged by skew (skew_factor>0 only
+    pushes the side that grows the position) — pulled to BBO 100.05.
+    """
+    session = _wide_distance_session()
+    market = market_kr_lunch_lite(
+        mid="100", bid="99.95", ask="100.05", spread_bp="10",
+        l1_bid="5000", l1_ask="5000",
+    )
+    quotes = plan_quotes(
+        market, session, long_inv("500"), _bbo_track_config()
+    )
+    bid = next(q for q in quotes if q.side == "buy")
+    ask = next(q for q in quotes if q.side == "sell")
+    assert bid.price == Decimal("99.95")
+    assert ask.price == Decimal("100.05")
+
+
+def test_bbo_track_unknown_mode_is_noop():
+    """Defensive: a typo'd mode value silently falls through (off-equivalent)
+    rather than crashing the planner mid-tick."""
+    session = _wide_distance_session()
+    market = market_kr_lunch_lite(
+        mid="100", bid="99.95", ask="100.05", spread_bp="10",
+        l1_bid="5000", l1_ask="5000",
+    )
+    quotes = plan_quotes(
+        market, session, EMPTY_INVENTORY, _bbo_track_config(mode="aggressive")
+    )
+    bid = next(q for q in quotes if q.side == "buy")
+    ask = next(q for q in quotes if q.side == "sell")
+    assert bid.price == Decimal("99.70")
+    assert ask.price == Decimal("100.30")
 
 
 # ---- log diagnostics — guard against future refactors stripping them ----

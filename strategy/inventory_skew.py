@@ -52,12 +52,30 @@ def is_position_capped(
     hard_cap_usdc: Decimal,
     collateral_usdc: Optional[Decimal] = None,
     hard_cap_pct: Optional[Decimal] = None,
+    size_per_side_usdc: Decimal = Decimal(0),
 ) -> Tuple[bool, bool]:
     """Return ``(skip_bid, skip_ask)``.
 
-    skip_bid is True once net long >= effective_cap (must stop adding longs).
-    skip_ask is True once net short <= -effective_cap (must stop adding shorts).
-    Boundary is inclusive (>=) so the cap is never breached by a fill.
+    Defensive (post-fill projected) cap check: skip the side whose
+    fill would push net delta past ``effective_cap`` *after* the fill,
+    not after the cap is already breached. Without this projection,
+    the planner would happily quote a buy at inv = cap - epsilon; the
+    next fill pushes inv to cap + size_per_side, and only then would
+    the cap fire — too late.
+
+    * skip_bid is True iff ``net_delta_usdc + size_per_side_usdc >=
+      effective_cap`` (a buy fill would land at-or-past the cap).
+    * skip_ask is True iff ``net_delta_usdc - size_per_side_usdc <=
+      -effective_cap`` (a sell fill would land at-or-past the cap on
+      the short side).
+    * Boundary is inclusive (>=) so a projected fill landing exactly
+      on the cap also trips the skip — matches the original
+      "never breach the cap" intent and is the safer choice when
+      pricing precision drifts the projection by a sub-cent.
+
+    With ``size_per_side_usdc = 0`` (the default) the comparison
+    degrades to the original ``inventory >= cap`` check, preserving
+    pre-defensive callers' behaviour exactly.
 
     Phase 2.1: when both ``collateral_usdc`` and ``hard_cap_pct`` are
     supplied, the effective cap is ``min(hard_cap_usdc, hard_cap_pct *
@@ -76,6 +94,8 @@ def is_position_capped(
         pct_cap = hard_cap_pct * collateral_usdc
         if pct_cap < effective_cap:
             effective_cap = pct_cap
-    skip_bid = inventory.net_delta_usdc >= effective_cap
-    skip_ask = inventory.net_delta_usdc <= -effective_cap
+    projected_long_after_buy_fill = inventory.net_delta_usdc + size_per_side_usdc
+    projected_short_after_sell_fill = inventory.net_delta_usdc - size_per_side_usdc
+    skip_bid = projected_long_after_buy_fill >= effective_cap
+    skip_ask = projected_short_after_sell_fill <= -effective_cap
     return (skip_bid, skip_ask)

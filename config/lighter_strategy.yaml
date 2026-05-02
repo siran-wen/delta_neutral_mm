@@ -25,15 +25,18 @@ strategy:
   price_decimals: 3
   size_decimals: 3
 
-  # Inventory management (Phase 3: size $50, multi-market spread,
-  # ~$2k account). target_max_delta_usdc = skew clamp denominator;
-  # at this notional the skew has reached its full
-  # ``skew_max_offset_bp`` push. hard_position_cap_usdc = absolute
-  # cap. hard_position_cap_pct = pct-of-collateral double cap;
-  # effective cap is min(absolute, pct*collateral). Three markets
-  # at 10% each cap total exposure to 30% of net worth.
-  target_max_delta_usdc: "50"
-  hard_position_cap_usdc: "100"
+  # Inventory management (Phase 3 Day-1 retune: SKHYNIX size $100).
+  # target_max_delta_usdc = skew clamp denominator; at this notional
+  # skew has reached its full ``skew_max_offset_bp`` push. The bumped
+  # cap (was $100) accommodates the new $100 per-side size — the
+  # defensive cap check projects inv + size, so cap must exceed
+  # max(|inv|) + size by a comfortable margin.
+  # hard_position_cap_pct kept at 10%; 0.10 * $2,213 collateral = $221
+  # which sits just above the $200 absolute cap, leaving the absolute
+  # cap as the binding constraint at current collateral but allowing
+  # the pct path to tighten if collateral shrinks.
+  target_max_delta_usdc: "100"
+  hard_position_cap_usdc: "200"
   hard_position_cap_pct: "0.10"
   skew_max_offset_bp: "5"
 
@@ -53,6 +56,17 @@ strategy:
   # drift band is back to keeping spread fresh without burning fees.
   reprice_drift_bp: "8"
   reprice_min_interval_sec: "60"
+
+  # Phase 3: BBO-aware dynamic distance. With session
+  # default_distance_bp=30 (set for the wide-spread KR_OVERNIGHT case)
+  # the planner was leaving quotes ~17bp behind a 13-15bp market spread
+  # on SAMSUNG/SKHYNIX during liquid hours, dragging share to single
+  # digits. ``passive`` mode pulls actual_bid up to best_bid (and
+  # actual_ask down to best_ask) whenever the static target overshoots
+  # the BBO by more than ``bbo_track_max_distance_bp``. ``off`` restores
+  # the pre-Phase-3 fixed-distance behaviour exactly.
+  bbo_track_mode: "passive"
+  bbo_track_max_distance_bp: 5
 
   # Tick / snapshot cadence. Phase 3 multi-market: tick stretched
   # 1s → 10s, collateral refresh halved, OM REST sync halved. Three
@@ -109,26 +123,25 @@ strategy:
   daily_drawdown_check_interval_sec: 300
 
   # Session-level overrides for default_size_usdc.
-  # Phase 3: flat $50 across all 7 KR sessions — multi-market
-  # diversification replaces session-level size variation. The
-  # KR_OVERNIGHT / KR_WEEKEND lower-size carve-out is no longer
-  # needed because the absolute size is already small enough that
-  # thin-liquidity slippage doesn't bite as hard.
+  # Phase 3 Day-1 retune: SKHYNIX bumped to $100 across all KR
+  # sessions. Day-1 share at size $50 was 8.6% — Lagrangian solve
+  # against the $1,752/day pool shows $100 lifts share to ~15% with
+  # a roughly proportional reward step (~$280/day projected).
   session_overrides:
     KR_MARKET_HOURS_AM:
-      default_size_usdc: "50"
+      default_size_usdc: "100"
     KR_MARKET_HOURS_PM:
-      default_size_usdc: "50"
+      default_size_usdc: "100"
     KR_LUNCH_BREAK:
-      default_size_usdc: "50"
+      default_size_usdc: "100"
     KR_AFTER_CLOSE:
-      default_size_usdc: "50"
+      default_size_usdc: "100"
     KR_OVERNIGHT:
-      default_size_usdc: "50"
+      default_size_usdc: "100"
     KR_BEFORE_OPEN:
-      default_size_usdc: "50"
+      default_size_usdc: "100"
     KR_WEEKEND:
-      default_size_usdc: "50"
+      default_size_usdc: "100"
 
 recovery:
   # Cancel any orders found resting on the account at startup.

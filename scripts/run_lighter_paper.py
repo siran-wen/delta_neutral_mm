@@ -82,14 +82,23 @@ logger = logging.getLogger("paper_run")
 # showed our ask-side share routinely lived in 0.80-0.95 and the lower
 # threshold would have us widening continuously, sacrificing share for
 # a non-existent adverse-selection risk.
-PAPER_CONFIG: Dict[str, Decimal] = {
+PAPER_CONFIG: Dict[str, Any] = {
     "target_max_delta_usdc": Decimal("500"),
     "skew_max_offset_bp": Decimal("5"),
-    "hard_position_cap_usdc": Decimal("1000"),
+    # Cap is $2k so the post-fill defensive check in is_position_capped
+    # (projects inv + size_per_side) does not trip with the KR session
+    # default size of $1k. Pre-defensive callers worked at $1k cap, but
+    # the new cap check skips both sides when projected = cap exactly.
+    "hard_position_cap_usdc": Decimal("2000"),
     "min_market_spread_bp": Decimal("3"),
     "max_market_spread_bp": Decimal("100"),
     "share_warn_threshold": Decimal("0.95"),
     "share_warn_widen_bp": Decimal("5"),
+    # Phase 3: pull static-distance quotes onto BBO when the wide
+    # KR_OVERNIGHT default_distance_bp would otherwise leave us 20+ bp
+    # behind a 15 bp market spread. Mirrors the production yaml.
+    "bbo_track_mode": "passive",
+    "bbo_track_max_distance_bp": 5,
 }
 
 # Spread tiers used to populate ``MarketSnapshot.depth_by_spread_bp``.

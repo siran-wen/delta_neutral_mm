@@ -698,6 +698,11 @@ async def run_live_mode(
         cfg.get("om_periodic_sync_interval_sec", 30),
     )
     logger.info(
+        "  bbo_track: mode=%s max_distance=%sbp",
+        cfg.get("bbo_track_mode", "off"),
+        cfg.get("bbo_track_max_distance_bp", 5),
+    )
+    logger.info(
         "  emergency: rejects=%s cancel_fails=%s ws_silent=%ss",
         cfg.get("emergency_stop_on_consecutive_reject_count"),
         cfg.get("emergency_stop_on_consecutive_cancel_fail_count"),

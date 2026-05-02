@@ -21,19 +21,35 @@ strategy:
   price_decimals: 3
   size_decimals: 3
 
-  target_max_delta_usdc: "50"
-  hard_position_cap_usdc: "100"
-  hard_position_cap_pct: "0.10"
+  # Phase 3 Day-1 retune: HYUNDAI is the highest-marginal market —
+  # thinnest L1 depth (~$270 vs SAMSUNG's $2,174), so a marginal $100
+  # of size lifts share more here than anywhere else. $150 per side
+  # projects to ~36% share against the $1,752/day pool; cap moved to
+  # $300 (= 2x size) to leave the defensive cap check headroom.
+  # pct cap loosened to 15% so the absolute cap binds first
+  # (0.15 * $2,213 = $332, just above the $300 absolute).
+  target_max_delta_usdc: "150"
+  hard_position_cap_usdc: "300"
+  hard_position_cap_pct: "0.15"
   skew_max_offset_bp: "5"
 
+  # HYUNDAI weekend / overnight spreads observed at 200-450 bp.
+  # The default 100 bp guard knocks out every reprice tick during
+  # those windows, so we widen to 300 bp for HYUNDAI specifically.
+  # SKHYNIX/SAMSUNG keep the tighter 100 bp guard since they trade
+  # more steadily.
   min_market_spread_bp: "0"
-  max_market_spread_bp: "100"
+  max_market_spread_bp: "300"
 
   share_warn_threshold: "0.95"
   share_warn_widen_bp: "5"
 
   reprice_drift_bp: "8"
   reprice_min_interval_sec: "60"
+
+  # BBO tracking — see SKHYNIX yaml for rationale.
+  bbo_track_mode: "passive"
+  bbo_track_max_distance_bp: 5
 
   # Phase 3 multi-market REST budget — see SKHYNIX yaml for rationale.
   tick_interval_sec: "10"
@@ -59,21 +75,22 @@ strategy:
   daily_max_drawdown_pct: "0.05"
   daily_drawdown_check_interval_sec: 300
 
+  # Day-1 retune: max-size deployment across all KR sessions.
   session_overrides:
     KR_MARKET_HOURS_AM:
-      default_size_usdc: "50"
+      default_size_usdc: "150"
     KR_MARKET_HOURS_PM:
-      default_size_usdc: "50"
+      default_size_usdc: "150"
     KR_LUNCH_BREAK:
-      default_size_usdc: "50"
+      default_size_usdc: "150"
     KR_AFTER_CLOSE:
-      default_size_usdc: "50"
+      default_size_usdc: "150"
     KR_OVERNIGHT:
-      default_size_usdc: "50"
+      default_size_usdc: "150"
     KR_BEFORE_OPEN:
-      default_size_usdc: "50"
+      default_size_usdc: "150"
     KR_WEEKEND:
-      default_size_usdc: "50"
+      default_size_usdc: "150"
 
 recovery:
   cancel_stale_orders: true

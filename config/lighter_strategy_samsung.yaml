@@ -21,9 +21,16 @@ strategy:
   price_decimals: 3
   size_decimals: 3
 
-  target_max_delta_usdc: "50"
-  hard_position_cap_usdc: "100"
-  hard_position_cap_pct: "0.10"
+  # Phase 3 Day-1 retune: SAMSUNG L1 depth ~$2,174 makes share scale
+  # poorly (8.6% on SKHYNIX vs 2.3% on SAMSUNG at the same $50 size).
+  # Lagrangian solve says deploy minimum size ($30) here and steer
+  # capital toward SKHYNIX/HYUNDAI. Cap tightened in lockstep —
+  # absolute $60, pct 5% (= 0.05 * $2,213 = $111, so absolute is the
+  # binding constraint). Tighter pct caps SAMSUNG drift if the
+  # account ever runs low on collateral.
+  target_max_delta_usdc: "30"
+  hard_position_cap_usdc: "60"
+  hard_position_cap_pct: "0.05"
   skew_max_offset_bp: "5"
 
   min_market_spread_bp: "0"
@@ -34,6 +41,10 @@ strategy:
 
   reprice_drift_bp: "8"
   reprice_min_interval_sec: "60"
+
+  # BBO tracking — see SKHYNIX yaml for rationale.
+  bbo_track_mode: "passive"
+  bbo_track_max_distance_bp: 5
 
   # Phase 3 multi-market REST budget — see SKHYNIX yaml for rationale.
   tick_interval_sec: "10"
@@ -59,21 +70,22 @@ strategy:
   daily_max_drawdown_pct: "0.05"
   daily_drawdown_check_interval_sec: 300
 
+  # Day-1 retune: minimum-size deployment across all KR sessions.
   session_overrides:
     KR_MARKET_HOURS_AM:
-      default_size_usdc: "50"
+      default_size_usdc: "30"
     KR_MARKET_HOURS_PM:
-      default_size_usdc: "50"
+      default_size_usdc: "30"
     KR_LUNCH_BREAK:
-      default_size_usdc: "50"
+      default_size_usdc: "30"
     KR_AFTER_CLOSE:
-      default_size_usdc: "50"
+      default_size_usdc: "30"
     KR_OVERNIGHT:
-      default_size_usdc: "50"
+      default_size_usdc: "30"
     KR_BEFORE_OPEN:
-      default_size_usdc: "50"
+      default_size_usdc: "30"
     KR_WEEKEND:
-      default_size_usdc: "50"
+      default_size_usdc: "30"
 
 recovery:
   cancel_stale_orders: true

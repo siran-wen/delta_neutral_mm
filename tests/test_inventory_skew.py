@@ -165,3 +165,123 @@ def test_is_position_capped_no_collateral_falls_back_to_usdc_only():
     # And without the pct kwarg at all — also Phase 1 behaviour.
     skip_bid2, _ = is_position_capped(inv("700"), hard_cap_usdc=Decimal("600"))
     assert skip_bid2 is True
+
+
+# ---- defensive (post-fill projected) cap check -----------------------
+#
+# 5-2 production: SKHYNIX inv reached $148 against a $100 hard cap
+# because the old check only tripped at inv >= cap, but with size=$50
+# a fill at inv=$98 landed inventory at $148 — too late. The defensive
+# check projects post-fill inventory so the side is dropped *before*
+# any fill can breach the cap.
+
+def test_cap_defensive_buy_fill_would_exceed():
+    """inv=$80 + buy_size=$50 → projected $130 ≥ cap=$100 → skip_bid.
+
+    Sell side stays open: projected_short = 80 - 50 = 30 ≥ -100, safe.
+    """
+    skip_bid, skip_ask = is_position_capped(
+        inv("80"),
+        hard_cap_usdc=Decimal("100"),
+        size_per_side_usdc=Decimal("50"),
+    )
+    assert skip_bid is True
+    assert skip_ask is False
+
+
+def test_cap_defensive_sell_fill_would_exceed():
+    """inv=-$80 short. sell fill projects to -130, breaches -cap → skip_ask.
+
+    Buy side reduces the short, projects to -30, still >= -100 → safe.
+    """
+    skip_bid, skip_ask = is_position_capped(
+        inv("-80"),
+        hard_cap_usdc=Decimal("100"),
+        size_per_side_usdc=Decimal("50"),
+    )
+    assert skip_bid is False
+    assert skip_ask is True
+
+
+def test_cap_defensive_both_safe():
+    """inv=$30 + size=$50 → both projected fills well within ±cap=$100."""
+    skip_bid, skip_ask = is_position_capped(
+        inv("30"),
+        hard_cap_usdc=Decimal("100"),
+        size_per_side_usdc=Decimal("50"),
+    )
+    assert skip_bid is False  # 30 + 50 = 80 < 100
+    assert skip_ask is False  # 30 - 50 = -20 > -100
+
+
+def test_cap_backwards_compat_size_zero():
+    """size_per_side_usdc default = 0 → check degrades to inv >= cap.
+
+    Pre-defensive callers that don't pass the new kwarg keep their
+    exact original behaviour; inv=$80 < cap=$100 → no skip.
+    """
+    skip_bid, skip_ask = is_position_capped(
+        inv("80"),
+        hard_cap_usdc=Decimal("100"),
+    )
+    assert skip_bid is False
+    assert skip_ask is False
+
+
+def test_cap_with_pct_cap_smaller_uses_pct():
+    """Defensive check still composes correctly with the pct double cap.
+
+    hard_cap_usdc=$200 but pct=0.05 * $2000 collateral = $100, so
+    effective_cap = $100. inv=$30 + size=$50 → projected $80 < $100,
+    safe; inv=$60 + size=$50 → projected $110 >= $100, skip_bid.
+    """
+    skip_bid_safe, skip_ask_safe = is_position_capped(
+        inv("30"),
+        hard_cap_usdc=Decimal("200"),
+        collateral_usdc=Decimal("2000"),
+        hard_cap_pct=Decimal("0.05"),
+        size_per_side_usdc=Decimal("50"),
+    )
+    assert skip_bid_safe is False
+    assert skip_ask_safe is False
+
+    skip_bid_breach, _ = is_position_capped(
+        inv("60"),
+        hard_cap_usdc=Decimal("200"),
+        collateral_usdc=Decimal("2000"),
+        hard_cap_pct=Decimal("0.05"),
+        size_per_side_usdc=Decimal("50"),
+    )
+    assert skip_bid_breach is True
+
+
+def test_cap_size_exactly_meets_cap_inclusive():
+    """Projected fill landing exactly on the cap also trips skip (>=).
+
+    inv=$50 + size=$50 → projected $100 == cap=$100 → skip_bid.
+    Inclusive boundary matches original behaviour and is safer when
+    pricing precision drifts the projection by sub-cent amounts.
+    """
+    skip_bid, _ = is_position_capped(
+        inv("50"),
+        hard_cap_usdc=Decimal("100"),
+        size_per_side_usdc=Decimal("50"),
+    )
+    assert skip_bid is True
+
+
+def test_cap_day1_skhynix_replay_inv_98_size_50():
+    """Regression: the exact 5-2 21:43:37 SKHYNIX state.
+
+    inv=$98 (under the $100 cap, so old check passed and a buy was
+    quoted). Next fill landed inv at $148 — 48% over cap. The
+    defensive check rejects the bid before it leaves the planner.
+    """
+    skip_bid, skip_ask = is_position_capped(
+        inv("98"),
+        hard_cap_usdc=Decimal("100"),
+        size_per_side_usdc=Decimal("50"),
+    )
+    assert skip_bid is True
+    # Sell side still safe — flattens the existing long.
+    assert skip_ask is False
