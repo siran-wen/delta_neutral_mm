@@ -28,8 +28,8 @@ strategy:
   # $300 (= 2x size) to leave the defensive cap check headroom.
   # pct cap loosened to 15% so the absolute cap binds first
   # (0.15 * $2,213 = $332, just above the $300 absolute).
-  target_max_delta_usdc: "150"
-  hard_position_cap_usdc: "300"
+  target_max_delta_usdc: "200"
+  hard_position_cap_usdc: "400"
   hard_position_cap_pct: "0.15"
   skew_max_offset_bp: "5"
 
@@ -86,19 +86,19 @@ strategy:
   # Day-1 retune: max-size deployment across all KR sessions.
   session_overrides:
     KR_MARKET_HOURS_AM:
-      default_size_usdc: "150"
+      default_size_usdc: "100"
     KR_MARKET_HOURS_PM:
-      default_size_usdc: "150"
+      default_size_usdc: "100"
     KR_LUNCH_BREAK:
-      default_size_usdc: "150"
+      default_size_usdc: "75"
     KR_AFTER_CLOSE:
-      default_size_usdc: "150"
+      default_size_usdc: "75"
     KR_OVERNIGHT:
-      default_size_usdc: "150"
+      default_size_usdc: "200"
     KR_BEFORE_OPEN:
-      default_size_usdc: "150"
+      default_size_usdc: "100"
     KR_WEEKEND:
-      default_size_usdc: "150"
+      default_size_usdc: "200"
 
 recovery:
   cancel_stale_orders: true

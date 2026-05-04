@@ -56,25 +56,26 @@ def test_skhynix_yaml_size_and_cap():
 
 
 def test_samsung_yaml_size_and_cap():
-    """SAMSUNG: $100 per side, cap $200, pct 10%, hedge enabled."""
+    """SAMSUNG retune (5-4): target $100, cap $400, pct 20%."""
     cfg = _load_strategy("lighter_strategy_samsung.yaml")
     assert cfg["market"] == "SAMSUNGUSD"
     assert cfg["target_max_delta_usdc"] == Decimal("100")
-    assert cfg["hard_position_cap_usdc"] == Decimal("200")
-    assert cfg["hard_position_cap_pct"] == Decimal("0.1")
+    assert cfg["hard_position_cap_usdc"] == Decimal("400")
+    assert cfg["hard_position_cap_pct"] == Decimal("0.2")
     weekend = cfg["session_overrides"]["KR_WEEKEND"]
     assert weekend["default_size_usdc"] == Decimal("100")
 
 
 def test_hyundai_yaml_size_and_cap():
-    """HYUNDAI thin-depth max-size: $150 per side, cap $300, pct 15%."""
+    """HYUNDAI retune (5-4): target $200, cap $400, pct 15%.
+    KR_WEEKEND/KR_OVERNIGHT bumped to $200 (deeper-pocket overnight)."""
     cfg = _load_strategy("lighter_strategy_hyundai.yaml")
     assert cfg["market"] == "HYUNDAIUSD"
-    assert cfg["target_max_delta_usdc"] == Decimal("150")
-    assert cfg["hard_position_cap_usdc"] == Decimal("300")
+    assert cfg["target_max_delta_usdc"] == Decimal("200")
+    assert cfg["hard_position_cap_usdc"] == Decimal("400")
     assert cfg["hard_position_cap_pct"] == Decimal("0.15")
     weekend = cfg["session_overrides"]["KR_WEEKEND"]
-    assert weekend["default_size_usdc"] == Decimal("150")
+    assert weekend["default_size_usdc"] == Decimal("200")
 
 
 def test_max_market_spread_bp_pinned_per_yaml():
@@ -130,9 +131,10 @@ def test_total_absolute_cap_exposure_pinned_at_2k_collateral():
     simultaneously. Pin the math so nudging any cap without checking
     total exposure fails fast.
 
-    5-4 retune: SKHYNIX bumped to $600 cap (was $200) since it carries
-    the most flow and the prior cap left reward on the table. Total
-    is now $1100 = 49.7% of collateral — sanity bound at 55%."""
+    5-4 retune (revised): SAMSUNG cap bumped $200 → $400 and HYUNDAI
+    cap bumped $300 → $400. Total now $1400 = 63% of collateral —
+    sanity bound bumped to 70% to allow the new exposure ceiling
+    while still failing if a future cap edit drives total > $1550."""
     skhynix = _load_strategy("lighter_strategy.yaml")
     samsung = _load_strategy("lighter_strategy_samsung.yaml")
     hyundai = _load_strategy("lighter_strategy_hyundai.yaml")
@@ -141,9 +143,9 @@ def test_total_absolute_cap_exposure_pinned_at_2k_collateral():
         + samsung["hard_position_cap_usdc"]
         + hyundai["hard_position_cap_usdc"]
     )
-    # $600 + $200 + $300 = $1100
-    assert total_cap == Decimal("1100")
-    assert total_cap / Decimal("2213") < Decimal("0.55")
+    # $600 + $400 + $400 = $1400
+    assert total_cap == Decimal("1400")
+    assert total_cap / Decimal("2213") < Decimal("0.70")
 
 
 def test_active_hedge_state_pinned_per_yaml():
@@ -167,8 +169,11 @@ def test_active_hedge_state_pinned_per_yaml():
     # / HYUNDAI yamls; SKHYNIX migrates after live validation.
     assert skhynix["active_hedge_enabled"] is True
 
-    # SAMSUNG: P7 post_only retune, disabled pending paper verification.
-    assert samsung["active_hedge_enabled"] is False
+    # SAMSUNG: P7 post_only retune, re-enabled (5-4) for live paper
+    # verification of the post_only LIMIT close path. P8's
+    # disable-only-on-fail safety net means a re-enable here can't
+    # tank the whole strategy on hedge regression.
+    assert samsung["active_hedge_enabled"] is True
     assert samsung["active_hedge_trigger_pct"] == Decimal("0.7")
     assert samsung["active_hedge_target_pct"] == Decimal("0.0")
     assert samsung["active_hedge_taker_fee_max_pct"] == Decimal("0.50")
