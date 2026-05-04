@@ -46,7 +46,7 @@ import logging
 import time
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 from execution.lighter.lighter_order_manager import (
@@ -117,22 +117,52 @@ QUOTER_DEFAULTS: Dict[str, Any] = {
     # below controls how often we pull latest collateral via REST.
     "hard_position_cap_pct": None,
     "collateral_refresh_interval_sec": 60,
-    # Phase 2.1 P2.1.2: active hedge. When inv breaches trigger_pct of
-    # the effective cap, send an IOC reduce_only at mid * (1 ± slippage)
-    # to flatten down to target_pct. After firing, reuse the
-    # _reconcile_pause_until_ms gate to suppress reprice for
-    # active_hedge_pause_after_sec while the hedge fills propagate.
+    # Phase 2.1 P2.1.2 → P7 (5-4): active hedge. P7 design uses post_only
+    # LIMIT (NOT IOC) at best_bid + 1 tick (sell) / best_ask - 1 tick
+    # (buy). Reasoning: even after the P6 pre-cancel + IOC fix, Day-3
+    # SAMSUNG (5-3 → 5-4 UTC) saw 3/3 IOC submits silently rejected
+    # with status=pending_ack filled=0 (server-side cancel ~60s later
+    # via REST sync). The user confirmed Lighter's web UI throws
+    # "无法吃自己的单" on manual IOC close, proving the self-trade
+    # protection is account-level and reduce_only-triggered, not just
+    # active-book matching. See memory ``lighter_active_hedge_post_only``.
+    # post_only LIMIT walks the regular maker path with no self-trade
+    # checks; the trade-off is fill is no longer instant — we wait
+    # active_hedge_post_submit_wait_sec for a natural taker.
     "active_hedge_enabled": False,
     "active_hedge_trigger_pct": Decimal("1.0"),
     "active_hedge_target_pct": Decimal("0.3"),
-    "active_hedge_taker_fee_max_pct": Decimal("0.1"),
-    "active_hedge_pause_after_sec": 30,
-    # Cap consecutive active-hedge SDK rejects before tripping the
-    # global emergency_stop. Without this, an SDK-side reject loop
-    # (e.g. the 4-30 OrderExpiry storm) burns nonces and leaves the
-    # naked exposure unhedged for the entire session. 5 matches the
-    # general consecutive-reject threshold; tighten via yaml override.
-    "active_hedge_max_consecutive_fails": 5,
+    # Slip cap from mid: P7 BBO + 1 tick is typically tiny (≤5bp on
+    # SAMSUNG) but the cap also gates the mass-dump skip (refuse the
+    # close when the BBO has walked >max_slip_pct from mid). 0.5%
+    # absorbs a 25-50bp typical spread + the 1-tick improvement.
+    "active_hedge_taker_fee_max_pct": Decimal("0.5"),
+    # Pause repricing for this long after a successful close, so the
+    # filled hedge propagates through ws/REST sync before the next
+    # plan_quotes runs. P7 widened 30 → 60 to let the post-fill
+    # ledger update settle.
+    "active_hedge_pause_after_sec": 60,
+    # Cap consecutive active-hedge fails before tripping emergency_stop.
+    # P7 tightened 5 → 3: a stuck post_only mechanism (3 timeouts in a
+    # row, ~6 minutes total) is more diagnostic than 5, and we'd rather
+    # cut a dead session than let it bleed.
+    "active_hedge_max_consecutive_fails": 3,
+    # Pre-cancel deadline: wait at most this long for the OM to mirror
+    # cancellation of our resting quotes (via ws push). Defensive in
+    # P7 (post_only doesn't strictly need the cancel for self-trade
+    # avoidance) but kept to keep the book hygienic during the close.
+    "active_hedge_pre_cancel_wait_sec": Decimal("3"),
+    # Post-submit deadline: how long to wait for the post_only LIMIT
+    # to fill via a natural taker. P7 widened 5 → 120: post_only is
+    # not instantaneous like IOC was; a real KR_MARKET_HOURS taker
+    # typically lands sub-30s, weekends/overnight may take longer
+    # (but inventory accumulates more slowly there too). On timeout
+    # the resting hedge is cancelled and the fail counter ticks.
+    "active_hedge_post_submit_wait_sec": Decimal("120"),
+    # Poll cadence during the post-submit fill wait. 0.5s is a fair
+    # compromise between fill responsiveness and CPU/get_order_state
+    # call rate. Tests override down to 0.01s for fast-running cases.
+    "active_hedge_poll_interval_sec": Decimal("0.5"),
     # Phase 2.1 P2.1.3: daily max drawdown stop loss. start() captures
     # collateral_start; periodic check fires emergency_stop when
     # drawdown >= min(daily_max_drawdown_usdc, daily_max_drawdown_pct
@@ -280,6 +310,18 @@ class LppQuoter:
         self._active_hedge_enabled: bool = bool(
             self.config.get("active_hedge_enabled", False)
         )
+        # P8 (5-4): when consecutive fails hit the threshold we disable
+        # active_hedge for the remainder of the run instead of tripping
+        # global emergency_stop. Day-3 SAMSUNG (P6 IOC silent reject 3×
+        # → emergency_stop @ 5-4 01:48 → 14h SAMSUNG fully offline)
+        # showed coupling hedge failure to whole-strategy shutdown is
+        # the wrong default: cap + passive close + manual close cover
+        # the residual exposure, and other markets in the same run
+        # (SKHYNIX/HYUNDAI) shouldn't go down with SAMSUNG's hedge.
+        # On disable: log the banner, flip ``_active_hedge_enabled``
+        # to False (so the next call short-circuits), reset the
+        # streak counter to 0. User restart re-arms via yaml.
+        self._active_hedge_disabled_due_to_fails: bool = False
         self._last_active_hedge_ts_ms: int = 0
 
         # Phase 2.1 P2.1.3: daily drawdown.
@@ -474,18 +516,22 @@ class LppQuoter:
                     inv_snap = self._om.get_inventory()
                     logger.error(
                         "EMERGENCY STOP: rejects=%d (cap=%d) cancel_fails=%d (cap=%d) "
-                        "hedge_fails=%d (cap=%d) ws_silent=%.1fs (cap=%ds) "
-                        "inv=%s active_orders=%d",
+                        "ws_silent=%.1fs (cap=%ds) hedge_fails=%d "
+                        "active_hedge_disabled=%s inv=%s active_orders=%d",
                         self._stats["consecutive_rejects"],
                         int(self.config["emergency_stop_on_consecutive_reject_count"]),
                         self._stats["consecutive_cancel_failures"],
                         int(self.config.get(
                             "emergency_stop_on_consecutive_cancel_fail_count", 3
                         )),
-                        self._stats["consecutive_active_hedge_fails"],
-                        int(self.config.get("active_hedge_max_consecutive_fails", 5)),
                         self._ws_silence_sec() or 0,
                         int(self.config["emergency_stop_on_ws_disconnect_sec"]),
+                        # P8: hedge_fails is informational (not a
+                        # trigger). disabled flag reflects whether the
+                        # sub-feature was already shut down before this
+                        # whole-strategy stop.
+                        self._stats["consecutive_active_hedge_fails"],
+                        self._active_hedge_disabled_due_to_fails,
                         inv_snap.net_delta_usdc,
                         len(self._om.get_active_orders()),
                     )
@@ -772,29 +818,101 @@ class LppQuoter:
                 return pct_cap
         return cap_usdc
 
+    def _record_active_hedge_fail(self) -> int:
+        """Bump active-hedge fail counters; if the streak hits the
+        configured threshold, **disable** active_hedge for the rest of
+        the run (instead of tripping global emergency_stop).
+
+        Returns the post-bump streak count (the caller usually logs it
+        as ``consecutive=N``). When the threshold is crossed, the
+        helper logs the DISABLED banner and resets the streak to 0 so
+        a single helper call handles the whole transition.
+
+        P8 (5-4) design: Day-3 SAMSUNG had IOC silent reject 3× →
+        emergency_stop → 14h fully offline (other markets too).
+        That coupling is wrong. Hedge is a sub-feature; the cap +
+        passive close + manual close cover the residual exposure.
+        Only disable the sub-feature, not the whole strategy.
+        Restart re-arms via yaml.
+        """
+        self._stats["active_hedges_failed"] += 1
+        self._stats["consecutive_active_hedge_fails"] += 1
+        count = self._stats["consecutive_active_hedge_fails"]
+        threshold = int(
+            self.config.get("active_hedge_max_consecutive_fails", 3)
+        )
+        if count >= threshold and self._active_hedge_enabled:
+            logger.error(
+                "ACTIVE HEDGE DISABLED after %d consecutive fails "
+                "(threshold=%d). Strategy continues with passive "
+                "close + cap; manual close required for over-cap "
+                "inv. Restart strategy to re-enable active_hedge.",
+                count,
+                threshold,
+            )
+            self._active_hedge_disabled_due_to_fails = True
+            self._active_hedge_enabled = False
+            self._stats["consecutive_active_hedge_fails"] = 0
+        return count
+
     async def _maybe_trigger_active_hedge(
         self,
         market: MarketSnapshot,
         inventory: InventoryState,
     ) -> bool:
-        """Check inv against the trigger; if breached, send IOC reduce_only.
+        """Check inv against the trigger; if breached, submit a
+        post_only LIMIT close (NOT IOC) and wait for natural fill.
 
-        Returns True iff a hedge was submitted (caller should skip the
-        rest of the tick). The hedge:
-          * fires only when ``active_hedge_enabled`` is True;
-          * is sized as ``abs(inv) - target_usdc`` so it leaves the
-            account at ``target_pct * effective_cap`` notional, not flat;
-          * uses ``time_in_force="ioc"`` + ``reduce_only=True`` so a
-            partial fill is acceptable and the hedge can never flip
-            the sign;
-          * pauses repricing for ``active_hedge_pause_after_sec`` via
-            ``_reconcile_pause_until_ms`` so the next reprice doesn't
-            race the hedge fill before ws/REST sync catches up.
+        P7 design — Day-3 SAMSUNG regression (2026-05-04). Even with
+        P6's pre-cancel + IOC reduce_only fix, 3/3 IOC submits silently
+        rejected (status=pending_ack filled=0; REST-synced to cancelled
+        ~60s later). The user verified Lighter's web UI throws
+        "无法吃自己的单" on manual IOC close, proving the self-trade
+        protection is server-side, account-level, and triggered even
+        without on-book maker conflict. We can't out-engineer it from
+        the IOC side: any IOC reduce_only the same account submits is
+        rejected if recent same-market nonces sit in the engine's
+        history.
 
-        Slippage tolerance is ``active_hedge_taker_fee_max_pct`` in
-        percent (e.g. 0.1 → 0.1%). The price is set at
-        ``mid * (1 ± slippage)`` so the IOC walks at most that far
-        through the book before the unfilled portion auto-cancels.
+        The fix: don't IOC at all. Submit post_only LIMIT at
+        ``best_bid + 1 tick`` (sell close) / ``best_ask - 1 tick``
+        (buy close). The order sits as the new best_ask / best_bid,
+        getting top-of-queue. The next external taker fills it.
+        Critical differences from the IOC path:
+
+          * ``order_type=LIMIT`` (not MARKET) — no taker semantics.
+          * ``time_in_force=POST_ONLY`` — server doesn't run self-trade
+            checks on this path.
+          * ``reduce_only=False`` — reduce_only itself may be a
+            self-trade trigger; using a regular limit avoids the flag.
+
+        Trade-off: fill is no longer instant. We poll for fill up to
+        ``active_hedge_post_submit_wait_sec`` (default 120s, vs the
+        IOC era's 5s). Three consecutive timeouts arm emergency_stop.
+
+        Five-stage flow:
+
+        1. Trigger eligibility (unchanged): ``active_hedge_enabled``
+           + ``abs(inv) >= trigger_pct * effective_cap``. Hedge size
+           leaves us at ``target_pct * effective_cap`` notional
+           (default 0 = flat-close).
+        2. BBO-improving price: ``best_bid + tick`` (sell) /
+           ``best_ask - tick`` (buy). Improves the spread by 1 tick,
+           becoming the new top-of-book on the close side. For any
+           normal spread (≥ 2 ticks) this never crosses; if it would,
+           Lighter rejects post_only locally and we count it as fail.
+        3. Slip sanity check: refuse if ``abs(close_price - mid) / mid
+           > taker_fee_max_pct``. Catches mass-dump regimes where one
+           BBO has walked far from mid; not a mechanism failure so the
+           fail counter is NOT incremented (skip-not-fail).
+        4. Pre-cancel resting makers (defensive — keeps the book clean
+           during the close). Refuse with fail-counter ↑ if pre-cancel
+           deadline elapses with quotes still live.
+        5. Submit post_only LIMIT and poll for fill up to
+           ``active_hedge_post_submit_wait_sec``. Filled (full or
+           partial) → success + pause + counter reset. Externally
+           cancelled / rejected before any fill → fail. Timeout →
+           cancel the resting hedge + fail.
         """
         if not self._active_hedge_enabled:
             return False
@@ -806,7 +924,7 @@ class LppQuoter:
             str(self.config.get("active_hedge_trigger_pct", "1.0"))
         )
         target_pct = Decimal(
-            str(self.config.get("active_hedge_target_pct", "0.3"))
+            str(self.config.get("active_hedge_target_pct", "0.0"))
         )
         trigger_usdc = cap_usdc * trigger_pct
         target_usdc = cap_usdc * target_pct
@@ -818,6 +936,9 @@ class LppQuoter:
         if hedge_size_usdc <= 0:
             return False
 
+        if market.mid <= 0:
+            return False
+
         size_step = Decimal(10) ** -market.size_decimals
         hedge_size_base = (hedge_size_usdc / market.mid).quantize(
             size_step, rounding=ROUND_DOWN
@@ -827,88 +948,236 @@ class LppQuoter:
 
         hedge_side = "sell" if inventory.net_delta_usdc > 0 else "buy"
         max_slippage = Decimal(
-            str(self.config.get("active_hedge_taker_fee_max_pct", "0.1"))
+            str(self.config.get("active_hedge_taker_fee_max_pct", "0.5"))
         ) / Decimal(100)
+
         tick = Decimal(10) ** -market.price_decimals
-        if hedge_side == "buy":
-            hedge_price = (market.mid * (Decimal(1) + max_slippage)).quantize(
-                tick, rounding=ROUND_DOWN
+        if hedge_side == "sell":
+            # Improve best_bid by 1 tick: sell sits between best_bid
+            # and best_ask (assuming spread > 1 tick), becoming the
+            # new top-of-book ask. Next external taker buy crosses.
+            close_price = (market.best_bid + tick).quantize(
+                tick, rounding=ROUND_HALF_UP
             )
         else:
-            hedge_price = (market.mid * (Decimal(1) - max_slippage)).quantize(
-                tick, rounding=ROUND_DOWN
+            close_price = (market.best_ask - tick).quantize(
+                tick, rounding=ROUND_HALF_UP
             )
+        if close_price <= 0:
+            return False
+
+        implied_slip = abs(close_price - market.mid) / market.mid
+        if implied_slip > max_slippage:
+            logger.warning(
+                "ACTIVE HEDGE skipped: post_only close slip=%s%% exceeds "
+                "max=%s%% (side=%s mid=%s best_bid=%s best_ask=%s "
+                "close_price=%s, inv=%s) — wide spread, will retry on "
+                "next eligible tick",
+                (implied_slip * Decimal(100)).quantize(Decimal("0.0001")),
+                (max_slippage * Decimal(100)).quantize(Decimal("0.0001")),
+                hedge_side,
+                market.mid,
+                market.best_bid,
+                market.best_ask,
+                close_price,
+                inventory.net_delta_usdc,
+            )
+            return False
+
+        my_quote_coids = [
+            o.client_order_index
+            for o in self._om.get_active_orders()
+            if o.market_index == int(market.market_index)
+        ]
+        if my_quote_coids:
+            logger.info(
+                "ACTIVE HEDGE: pre-cancelling %d resting orders on "
+                "market %d before post_only close (book hygiene)",
+                len(my_quote_coids),
+                market.market_index,
+            )
+            await asyncio.gather(
+                *(self._om.cancel_order(coid) for coid in my_quote_coids),
+                return_exceptions=True,
+            )
+            wait_sec = float(
+                self.config.get("active_hedge_pre_cancel_wait_sec", 3)
+            )
+            cancel_target = set(my_quote_coids)
+            deadline = time.time() + wait_sec
+            while time.time() < deadline:
+                still_active = {
+                    o.client_order_index
+                    for o in self._om.get_active_orders()
+                    if o.market_index == int(market.market_index)
+                } & cancel_target
+                if not still_active:
+                    break
+                await asyncio.sleep(0.05)
+            still_active = {
+                o.client_order_index
+                for o in self._om.get_active_orders()
+                if o.market_index == int(market.market_index)
+            } & cancel_target
+            if still_active:
+                logger.error(
+                    "ACTIVE HEDGE aborted: pre-cancel deadline (%ss) "
+                    "elapsed with %d quotes still live on market %d "
+                    "(coids=%s)",
+                    wait_sec,
+                    len(still_active),
+                    market.market_index,
+                    sorted(still_active),
+                )
+                self._record_active_hedge_fail()
+                return False
 
         logger.error(
-            "ACTIVE HEDGE: inv=%s breaches trigger=%s, IOC %s %s base @ %s "
-            "(target=%s, max_slip_pct=%s, cap_eff=%s)",
+            "ACTIVE HEDGE: inv=%s breaches trigger=%s, post_only %s %s "
+            "base @ %s (target=%s, max_slip_pct=%s, cap_eff=%s, mid=%s, "
+            "bbo=[%s,%s], pre_cancelled=%d)",
             inventory.net_delta_usdc,
             trigger_usdc,
             hedge_side,
             hedge_size_base,
-            hedge_price,
+            close_price,
             target_usdc,
             max_slippage * Decimal(100),
             cap_usdc,
+            market.mid,
+            market.best_bid,
+            market.best_ask,
+            len(my_quote_coids),
         )
 
         try:
             coid = await self._om.submit_order(
                 side=hedge_side,
                 market_index=market.market_index,
-                price=hedge_price,
+                price=close_price,
                 size_base=hedge_size_base,
                 price_decimals=market.price_decimals,
                 size_decimals=market.size_decimals,
                 order_type="limit",
-                time_in_force="ioc",
-                reduce_only=True,
+                time_in_force="post_only",
+                reduce_only=False,
             )
         except Exception as exc:  # noqa: BLE001
-            self._stats["active_hedges_failed"] += 1
-            self._stats["consecutive_active_hedge_fails"] += 1
+            fail_count = self._record_active_hedge_fail()
             logger.error(
                 "ACTIVE HEDGE submit raised: %s (consecutive=%d)",
                 exc,
-                self._stats["consecutive_active_hedge_fails"],
+                fail_count,
             )
             return False
 
-        # ``submit_order`` swallows SDK errors and marks the order
-        # rejected — the coid is returned regardless. We must inspect
-        # the post-submit status to know whether the SDK actually
-        # accepted the order. Without this, the 4-30 ``OrderExpiry is
-        # invalid`` storm bumped only ``lifetime_rejected`` on the OM
-        # side; the quoter happily reported each as a successful hedge
-        # and never tripped the kill switch.
+        # Immediate SDK rejection guard. ``submit_order`` swallows SDK
+        # errors and returns the coid with status=rejected — we must
+        # cross-check rather than treat the coid as proof of acceptance.
+        # Most likely cause for post_only rejection: the BBO moved
+        # between snapshot and submit, and our +1-tick price now
+        # crosses, so Lighter rejects the post_only locally with
+        # ``canceled-post-only``. Fail counter ticks; next attempt may
+        # succeed if the market settled.
         post_state = self._om.get_order_state(coid)
         if post_state is not None and post_state.status == "rejected":
-            self._stats["active_hedges_failed"] += 1
-            self._stats["consecutive_active_hedge_fails"] += 1
+            fail_count = self._record_active_hedge_fail()
             logger.error(
                 "ACTIVE HEDGE: SDK rejected coid=%s reason=%s "
                 "(consecutive=%d, threshold=%d)",
                 coid,
                 post_state.last_error,
-                self._stats["consecutive_active_hedge_fails"],
-                int(self.config.get("active_hedge_max_consecutive_fails", 5)),
+                fail_count,
+                int(self.config.get("active_hedge_max_consecutive_fails", 3)),
             )
             return False
 
-        # Successful submit (pending_ack / live / partial_fill) — reset
-        # the streak so future transient SDK hiccups don't accumulate
-        # across hours of healthy hedging.
-        self._stats["consecutive_active_hedge_fails"] = 0
+        # Wait for natural fill or timeout. post_only does NOT cross
+        # — fill depends on an external taker walking through the
+        # book. KR_MARKET_HOURS has enough flow that 120s is generous;
+        # KR_WEEKEND/overnight is sparse but inventory accumulates
+        # slower there too, so the trigger fires less often.
+        terminal = frozenset({"filled", "cancelled", "rejected", "expired"})
+        post_wait_sec = float(
+            self.config.get("active_hedge_post_submit_wait_sec", 120)
+        )
+        poll_interval = float(
+            self.config.get("active_hedge_poll_interval_sec", 0.5)
+        )
+        post_deadline = time.time() + post_wait_sec
+        final_state = self._om.get_order_state(coid)
+        while time.time() < post_deadline:
+            if final_state is None:
+                break
+            if final_state.filled_base > 0:
+                break
+            if final_state.status in terminal:
+                break
+            await asyncio.sleep(poll_interval)
+            final_state = self._om.get_order_state(coid)
 
+        is_fail = False
+        fail_reason: Optional[str] = None
+        if final_state is None:
+            is_fail = True
+            fail_reason = "order vanished from OM tracking"
+        elif final_state.filled_base > 0:
+            is_fail = False
+        elif final_state.status in terminal:
+            # External cancel / unexpected reject before any fill.
+            # Includes the P6-era IOC silent-reject pattern in case
+            # someone reverts the post_only path: filled=0 +
+            # status=expired/cancelled still counts as a fail.
+            is_fail = True
+            fail_reason = (
+                f"{final_state.status} before any fill "
+                f"(external cancel / unexpected reject)"
+            )
+        else:
+            # Wait deadline elapsed with the order still live and
+            # unfilled. Cancel the resting hedge so it doesn't sit on
+            # the book past its useful window, then count as fail.
+            is_fail = True
+            fail_reason = (
+                f"timeout after {post_wait_sec:.1f}s with no fill "
+                f"(status={final_state.status}, "
+                f"filled={final_state.filled_base})"
+            )
+            try:
+                await self._om.cancel_order(coid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "ACTIVE HEDGE: cancel-after-timeout coid=%s "
+                    "raised: %s",
+                    coid,
+                    exc,
+                )
+
+        if is_fail:
+            fail_count = self._record_active_hedge_fail()
+            logger.error(
+                "ACTIVE HEDGE failed: %s coid=%s "
+                "(consecutive=%d, threshold=%d)",
+                fail_reason,
+                coid,
+                fail_count,
+                int(self.config.get("active_hedge_max_consecutive_fails", 3)),
+            )
+            return False
+
+        self._stats["consecutive_active_hedge_fails"] = 0
         self._stats["active_hedges_total"] += 1
         self._last_active_hedge_ts_ms = int(time.time() * 1000)
-        pause_sec = int(self.config.get("active_hedge_pause_after_sec", 30))
+        pause_sec = int(self.config.get("active_hedge_pause_after_sec", 60))
         self._reconcile_pause_until_ms = (
             self._last_active_hedge_ts_ms + pause_sec * 1000
         )
         logger.info(
-            "ACTIVE HEDGE: submitted coid=%s, pausing reprice for %ds",
+            "ACTIVE HEDGE close filled: coid=%s status=%s filled=%s, "
+            "pausing reprice for %ds",
             coid,
+            final_state.status if final_state else "<unknown>",
+            final_state.filled_base if final_state else Decimal(0),
             pause_sec,
         )
         return True
@@ -1136,17 +1405,22 @@ class LppQuoter:
 
         Conditions:
         1. Consecutive place rejects ≥ ``emergency_stop_on_consecutive_reject_count``
-        2. WS msg gap (any channel) > ``emergency_stop_on_ws_disconnect_sec``
-        3. Consecutive cancel failures ≥
+        2. Consecutive cancel failures ≥
            ``emergency_stop_on_consecutive_cancel_fail_count`` — guards the
            regression that produced the -1.132 SKHYNIXUSD short: when the
            OM cancel path silently fails, stale orders accumulate on the
            book until something fills against them.
-        4. Consecutive active-hedge SDK rejects ≥
-           ``active_hedge_max_consecutive_fails`` — the 4-30 OrderExpiry
-           storm pattern: hedge can't fire, naked exposure builds up,
-           every retry burns a nonce. Tripping early avoids both the
-           rate-limit scrape and the unhedged drift.
+        3. WS msg gap (any channel) > ``emergency_stop_on_ws_disconnect_sec``
+
+        **Not** a condition (P8, 5-4): consecutive active-hedge fails.
+        Day-3 SAMSUNG had IOC silent reject 3× → emergency_stop @
+        5-4 01:48 → 14h SAMSUNG fully offline (and other markets in
+        the same run went down too). That coupling is wrong: the
+        cap + passive close + manual close cover residual exposure
+        when the hedge sub-feature breaks. The
+        ``active_hedge_max_consecutive_fails`` threshold now drives
+        ``_record_active_hedge_fail`` to disable just the sub-feature
+        while the strategy keeps quoting.
         """
         threshold_rejects = int(
             self.config["emergency_stop_on_consecutive_reject_count"]
@@ -1164,19 +1438,6 @@ class LppQuoter:
                 "Emergency: %d consecutive cancel failures (threshold=%d)",
                 self._stats["consecutive_cancel_failures"],
                 threshold_cancel_fails,
-            )
-            return True
-
-        threshold_hedge_fails = int(
-            self.config.get("active_hedge_max_consecutive_fails", 5)
-        )
-        if (
-            self._stats["consecutive_active_hedge_fails"] >= threshold_hedge_fails
-        ):
-            logger.error(
-                "Emergency: %d consecutive active-hedge fails (threshold=%d)",
-                self._stats["consecutive_active_hedge_fails"],
-                threshold_hedge_fails,
             )
             return True
 
@@ -1465,6 +1726,9 @@ class LppQuoter:
             "consecutive_active_hedge_fails": self._stats[
                 "consecutive_active_hedge_fails"
             ],
+            "active_hedge_disabled_due_to_fails": (
+                self._active_hedge_disabled_due_to_fails
+            ),
             "daily_drawdown_breaches": self._stats["daily_drawdown_breaches"],
             "collateral_start_usdc": str(self._collateral_start_usdc)
             if self._collateral_start_usdc is not None

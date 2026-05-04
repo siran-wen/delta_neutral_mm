@@ -44,12 +44,12 @@ def _load_strategy(yaml_filename: str) -> dict:
 
 
 def test_skhynix_yaml_size_and_cap():
-    """SKHYNIX size $100, cap $200, pct 10%, KR_WEEKEND $100."""
+    """SKHYNIX retune (5-4): target $300, cap $600, pct 30%."""
     cfg = _load_strategy("lighter_strategy.yaml")
     assert cfg["market"] == "SKHYNIXUSD"
-    assert cfg["target_max_delta_usdc"] == Decimal("100")
-    assert cfg["hard_position_cap_usdc"] == Decimal("200")
-    assert cfg["hard_position_cap_pct"] == Decimal("0.10")
+    assert cfg["target_max_delta_usdc"] == Decimal("300")
+    assert cfg["hard_position_cap_usdc"] == Decimal("600")
+    assert cfg["hard_position_cap_pct"] == Decimal("0.30")
     assert cfg["skew_max_offset_bp"] == Decimal("5")
     weekend = cfg["session_overrides"]["KR_WEEKEND"]
     assert weekend["default_size_usdc"] == Decimal("100")
@@ -78,15 +78,16 @@ def test_hyundai_yaml_size_and_cap():
 
 
 def test_max_market_spread_bp_pinned_per_yaml():
-    """Per-market spread guard pins. HYUNDAI runs widest (weekend
-    spreads regularly exceed 200bp), SAMSUNG widened post-Day-1 to
-    cover its volatile windows, SKHYNIX keeps the tightest guard."""
+    """Per-market spread guard pins. 5-4 retune: all three widened to
+    500 bp after observing several KR_OVERNIGHT/KR_WEEKEND windows
+    where the natural spread blew out past the prior 100/200/300
+    pins and stalled the strategy entirely."""
     skhynix = _load_strategy("lighter_strategy.yaml")
     samsung = _load_strategy("lighter_strategy_samsung.yaml")
     hyundai = _load_strategy("lighter_strategy_hyundai.yaml")
-    assert skhynix["max_market_spread_bp"] == Decimal("100")
-    assert samsung["max_market_spread_bp"] == Decimal("200")
-    assert hyundai["max_market_spread_bp"] == Decimal("300")
+    assert skhynix["max_market_spread_bp"] == Decimal("500")
+    assert samsung["max_market_spread_bp"] == Decimal("500")
+    assert hyundai["max_market_spread_bp"] == Decimal("500")
 
 
 # ---- cross-market invariants -----------------------------------------
@@ -127,7 +128,11 @@ def test_total_absolute_cap_exposure_pinned_at_2k_collateral():
     """At ~$2,213 collateral, the sum of absolute caps across the three
     markets is the ceiling on net delta if every side fills against us
     simultaneously. Pin the math so nudging any cap without checking
-    total exposure fails fast."""
+    total exposure fails fast.
+
+    5-4 retune: SKHYNIX bumped to $600 cap (was $200) since it carries
+    the most flow and the prior cap left reward on the table. Total
+    is now $1100 = 49.7% of collateral — sanity bound at 55%."""
     skhynix = _load_strategy("lighter_strategy.yaml")
     samsung = _load_strategy("lighter_strategy_samsung.yaml")
     hyundai = _load_strategy("lighter_strategy_hyundai.yaml")
@@ -136,20 +141,46 @@ def test_total_absolute_cap_exposure_pinned_at_2k_collateral():
         + samsung["hard_position_cap_usdc"]
         + hyundai["hard_position_cap_usdc"]
     )
-    # $200 + $200 + $300 = $700
-    assert total_cap == Decimal("700")
-    # 31.6% of the $2,213 baseline. Sanity bound at 35%.
-    assert total_cap / Decimal("2213") < Decimal("0.35")
+    # $600 + $200 + $300 = $1100
+    assert total_cap == Decimal("1100")
+    assert total_cap / Decimal("2213") < Decimal("0.55")
 
 
 def test_active_hedge_state_pinned_per_yaml():
-    """Pin the active_hedge_enabled flag per yaml so toggles can't slip
-    in unnoticed. Hedge re-enable is an explicit decision (gated on
-    the P2.2 IOC fix verifying live), so the test asserts the live
-    state per market rather than a uniform default."""
+    """Pin the active_hedge_* knobs per-yaml. The three markets are
+    tuned independently (and re-enable is per-market: SKHYNIX has the
+    most flow and runs hedge live; SAMSUNG/HYUNDAI stay disabled until
+    P7 paper-verified). Per-yaml assertion rather than cross-yaml
+    uniformity so the markets can drift without false alarms.
+
+    Day-3 SAMSUNG (5-3 → 5-4 UTC) showed the P6 cancel-then-IOC fix
+    still hits Lighter's account-level self-trade protection (3/3 IOC
+    submits silently rejected); P7 abandons IOC entirely and submits
+    post_only LIMIT @ best_bid + 1 tick / best_ask - 1 tick.
+    """
     skhynix = _load_strategy("lighter_strategy.yaml")
     samsung = _load_strategy("lighter_strategy_samsung.yaml")
     hyundai = _load_strategy("lighter_strategy_hyundai.yaml")
-    assert skhynix["active_hedge_enabled"] is False
-    assert samsung["active_hedge_enabled"] is True
+
+    # SKHYNIX: hedge enabled (live), retains the older P2.1-era IOC
+    # config block. P7 paper verification + retune is on the SAMSUNG
+    # / HYUNDAI yamls; SKHYNIX migrates after live validation.
+    assert skhynix["active_hedge_enabled"] is True
+
+    # SAMSUNG: P7 post_only retune, disabled pending paper verification.
+    assert samsung["active_hedge_enabled"] is False
+    assert samsung["active_hedge_trigger_pct"] == Decimal("0.7")
+    assert samsung["active_hedge_target_pct"] == Decimal("0.0")
+    assert samsung["active_hedge_taker_fee_max_pct"] == Decimal("0.50")
+    assert samsung["active_hedge_pause_after_sec"] == 60
+    assert samsung["active_hedge_max_consecutive_fails"] == 3
+    assert samsung["active_hedge_post_submit_wait_sec"] == 120
+
+    # HYUNDAI: same P7 retune as SAMSUNG, disabled pending paper.
     assert hyundai["active_hedge_enabled"] is False
+    assert hyundai["active_hedge_trigger_pct"] == Decimal("0.7")
+    assert hyundai["active_hedge_target_pct"] == Decimal("0.0")
+    assert hyundai["active_hedge_taker_fee_max_pct"] == Decimal("0.50")
+    assert hyundai["active_hedge_pause_after_sec"] == 60
+    assert hyundai["active_hedge_max_consecutive_fails"] == 3
+    assert hyundai["active_hedge_post_submit_wait_sec"] == 120

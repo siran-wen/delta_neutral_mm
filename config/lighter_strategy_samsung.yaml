@@ -34,7 +34,7 @@ strategy:
   skew_max_offset_bp: "5"
 
   min_market_spread_bp: "0"
-  max_market_spread_bp: "200"
+  max_market_spread_bp: "500"
 
   share_warn_threshold: "0.95"
   share_warn_widen_bp: "5"
@@ -59,12 +59,24 @@ strategy:
   emergency_stop_on_ws_disconnect_sec: 300
   emergency_stop_on_consecutive_cancel_fail_count: 3
 
-  active_hedge_enabled: true
+  # P7 (5-4) SAMSUNG retune: post_only LIMIT close at BBO ± 1 tick.
+  # Day-3 SAMSUNG (5-3 → 5-4 UTC) showed the P6 IOC + pre-cancel fix
+  # still hits Lighter's account-level self-trade protection (3/3 IOC
+  # submits silently rejected, $201 residual long, emergency_stop).
+  # The web UI throws "无法吃自己的单" on manual IOC close, proving the
+  # rejection is server-side. Switching to post_only LIMIT walks the
+  # regular maker path; trade-off is fill is no longer instant —
+  # post_submit_wait widened 5 → 120s for natural taker. Stays
+  # disabled until P7 paper-verified.
+  # taker_fee_max_pct: 1.50 → 0.50 (P7 BBO+1tick has tiny slip but
+  # the cap also gates the mass-dump skip; 50bp is comfortable).
+  active_hedge_enabled: false
   active_hedge_trigger_pct: "0.7"
   active_hedge_target_pct: "0.0"
-  active_hedge_taker_fee_max_pct: "0.15"
-  active_hedge_pause_after_sec: 30
-  active_hedge_max_consecutive_fails: 5
+  active_hedge_taker_fee_max_pct: "0.50"
+  active_hedge_pause_after_sec: 60
+  active_hedge_max_consecutive_fails: 3
+  active_hedge_post_submit_wait_sec: 120
 
   daily_max_drawdown_usdc: "100"
   daily_max_drawdown_pct: "0.05"

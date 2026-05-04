@@ -662,12 +662,16 @@ async def run_live_mode(
         cfg.get("hard_position_cap_pct") or "(disabled)",
     )
     logger.info(
-        "  active_hedge: enabled=%s trigger=%s target=%s slip_pct=%s pause=%ss",
+        "  active_hedge: enabled=%s trigger=%s target=%s slip_pct=%s "
+        "pause=%ss post_submit_wait=%ss max_fails=%s "
+        "(P8: fail_mode=disable-only, NOT emergency_stop)",
         cfg.get("active_hedge_enabled", False),
         cfg.get("active_hedge_trigger_pct"),
         cfg.get("active_hedge_target_pct"),
         cfg.get("active_hedge_taker_fee_max_pct"),
         cfg.get("active_hedge_pause_after_sec"),
+        cfg.get("active_hedge_post_submit_wait_sec"),
+        cfg.get("active_hedge_max_consecutive_fails"),
     )
     logger.info(
         "  daily_drawdown: max_usdc=%s max_pct=%s interval=%ss",
@@ -801,6 +805,12 @@ async def run_live_mode(
                 summary.get("emergency_stops", 0),
                 summary.get("consecutive_rejects", 0),
                 summary.get("consecutive_cancel_failures", 0),
+            )
+            logger.info(
+                "  active_hedge: total=%d failed=%d disabled_due_to_fails=%s",
+                summary.get("active_hedges_total", 0),
+                summary.get("active_hedges_failed", 0),
+                summary.get("active_hedge_disabled_due_to_fails", False),
             )
             logger.info(
                 "  om: submitted=%d filled=%d cancelled=%d rejected=%d active=%d",

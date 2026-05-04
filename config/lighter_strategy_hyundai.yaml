@@ -39,7 +39,7 @@ strategy:
   # SKHYNIX/SAMSUNG keep the tighter 100 bp guard since they trade
   # more steadily.
   min_market_spread_bp: "0"
-  max_market_spread_bp: "300"
+  max_market_spread_bp: "500"
 
   share_warn_threshold: "0.95"
   share_warn_widen_bp: "5"
@@ -64,12 +64,20 @@ strategy:
   emergency_stop_on_ws_disconnect_sec: 300
   emergency_stop_on_consecutive_cancel_fail_count: 3
 
+  # P7 (5-4) retune: post_only LIMIT close (NOT IOC) — aligned with
+  # the SAMSUNG yaml so the Day-3 self-trade-protection fix applies
+  # uniformly across markets when re-enabled. See lpp_quoter
+  # _maybe_trigger_active_hedge docstring for the full Day-3 SAMSUNG
+  # regression context. taker_fee_max_pct 0.30 → 0.50 (P7 needs more
+  # headroom for the mass-dump skip than IOC-through did);
+  # post_submit_wait 5 → 120 (post_only waits for natural taker).
   active_hedge_enabled: false
   active_hedge_trigger_pct: "0.7"
-  active_hedge_target_pct: "0.3"
-  active_hedge_taker_fee_max_pct: "0.1"
-  active_hedge_pause_after_sec: 30
-  active_hedge_max_consecutive_fails: 5
+  active_hedge_target_pct: "0.0"
+  active_hedge_taker_fee_max_pct: "0.50"
+  active_hedge_pause_after_sec: 60
+  active_hedge_max_consecutive_fails: 3
+  active_hedge_post_submit_wait_sec: 120
 
   daily_max_drawdown_usdc: "100"
   daily_max_drawdown_pct: "0.05"
