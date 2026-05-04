@@ -29,8 +29,8 @@ strategy:
   # pct cap loosened to 15% so the absolute cap binds first
   # (0.15 * $2,213 = $332, just above the $300 absolute).
   target_max_delta_usdc: "200"
-  hard_position_cap_usdc: "400"
-  hard_position_cap_pct: "0.15"
+  hard_position_cap_usdc: "500"
+  hard_position_cap_pct: "0.2"
   skew_max_offset_bp: "5"
 
   # HYUNDAI weekend / overnight spreads observed at 200-450 bp.
@@ -73,25 +73,39 @@ strategy:
   asymmetric_quote_trigger_pct: "0.7"
   asymmetric_close_mode: "improve_bbo"
   asymmetric_anti_distance_bp: "30"
+  # P10 (5-5): inv-aware close size scaling — see SKHYNIX/SAMSUNG
+  # yamls for the Day-5 SAMSUNG oscillation that drove the change.
+  asymmetric_close_size_scaling: "linear"
 
   daily_max_drawdown_usdc: "100"
   daily_max_drawdown_pct: "0.05"
   daily_drawdown_check_interval_sec: 300
 
-  # Day-1 retune: max-size deployment across all KR sessions.
+  # 5-5 retune: per-session sizing from Day-5 forensics.
+  # Notable shifts:
+  #   KR_MARKET_HOURS_PM 100 -> 50: HYUNDAI PM share hit 3.45% even
+  #     at $100 — drop hard to dilute below the share-warn band.
+  #   KR_AFTER_CLOSE 75 -> 50: same pattern, share 1.01%.
+  #   KR_MARKET_HOURS_AM 100 -> 200: AM still has share headroom.
+  #   KR_BEFORE_OPEN 100 -> 150: bumped on Day-5 reward signal.
+  #   KR_PRE_OPEN_WITHDRAW activated at 200: 5-5 session_aware patch
+  #     flipped this window from action="withdraw" to "quote" after
+  #     Day-5 found MM activity.
   session_overrides:
     KR_MARKET_HOURS_AM:
-      default_size_usdc: "100"
+      default_size_usdc: "200"
     KR_MARKET_HOURS_PM:
-      default_size_usdc: "100"
+      default_size_usdc: "50"
     KR_LUNCH_BREAK:
       default_size_usdc: "75"
     KR_AFTER_CLOSE:
-      default_size_usdc: "75"
+      default_size_usdc: "50"
     KR_OVERNIGHT:
       default_size_usdc: "200"
     KR_BEFORE_OPEN:
-      default_size_usdc: "100"
+      default_size_usdc: "150"
+    KR_PRE_OPEN_WITHDRAW:
+      default_size_usdc: "200"
     KR_WEEKEND:
       default_size_usdc: "200"
 

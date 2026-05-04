@@ -910,3 +910,271 @@ def test_asymmetric_quoting_respects_pct_cap_trigger():
     # inv=$85 > $35 → asymmetric should fire.
     quotes = plan_quotes(market, _asym_session(), inv, cfg, collateral_usdc=Decimal("1000"))
     assert any("asymmetric_close" in q.notes for q in quotes)
+
+
+# ----- P10 (5-5): inv-aware close size scaling ------------------------
+#
+# When asymmetric mode is active, the close-leg notional scales
+# linearly from ``default_size_usdc`` at the trigger threshold up to
+# ``effective_cap`` when inv touches the cap. The anti leg stays at
+# ``default_size_usdc``. ``"fixed"`` restores the P9 behaviour where
+# both legs use ``default_size_usdc``.
+#
+# Test config: cap=$400, default_size=$100, trigger_pct=0.7 →
+# trigger=$280. ``cap_room = $120``. SAMSUNG-shaped market gives
+# tick=0.001 and close-leg price (long inv, improve_bbo) = best_bid
+# + tick = 159.961.
+
+
+def _p10_session() -> SessionPolicy:
+    """SessionPolicy mirroring the P10 spec example: $100 default size."""
+    return SessionPolicy(
+        name="P10_TEST",
+        action="quote",
+        default_distance_bp=Decimal("10"),
+        default_size_usdc=Decimal("100"),
+        tier_thresholds_bp=(Decimal("15"), Decimal("25"), Decimal("50")),
+        reason="p10 test",
+    )
+
+
+def _p10_config(**overrides) -> dict:
+    """Default-tuned config for P10 tests. cap=$400 + trigger pct 0.7
+    → trigger threshold $280, cap_room=$120."""
+    cfg = {
+        "target_max_delta_usdc": Decimal("400"),
+        "skew_max_offset_bp": Decimal("5"),
+        "hard_position_cap_usdc": Decimal("400"),
+        "min_market_spread_bp": Decimal("3"),
+        "max_market_spread_bp": Decimal("100"),
+        "share_warn_threshold": Decimal("0.95"),
+        "share_warn_widen_bp": Decimal("5"),
+        "asymmetric_quote_enabled": True,
+        "asymmetric_quote_trigger_pct": Decimal("0.7"),
+        "asymmetric_close_mode": "improve_bbo",
+        "asymmetric_anti_distance_bp": Decimal("30"),
+        "asymmetric_close_size_scaling": "linear",
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def _expected_size_base(usdc: Decimal, price: Decimal, size_decimals: int = 3) -> Decimal:
+    """Replicate the planner's size_base quantization (ROUND_DOWN to
+    ``size_decimals``)."""
+    from decimal import ROUND_DOWN as _RD
+    step = Decimal(1) / (Decimal(10) ** size_decimals)
+    return (usdc / price).quantize(step, rounding=_RD)
+
+
+def _p10_market_or_default() -> MarketSnapshot:
+    """SAMSUNG-shaped market for the P10 tests. Identical to
+    ``_asym_market`` — kept as a P10-named alias to make the test
+    coupling explicit."""
+    return _asym_market()
+
+
+def test_asymmetric_close_size_at_trigger_uses_default():
+    """At inv == trigger, scale=0 → close = default_size = $100, anti
+    = default = $100. Both legs sized identically (same as P9)."""
+    market = _p10_market_or_default()
+    inv = long_inv("280", mid="160")  # = trigger
+    quotes = plan_quotes(market, _p10_session(), inv, _p10_config())
+    by_side = {q.side: q for q in quotes}
+    sell, buy = by_side["sell"], by_side["buy"]
+    # Long inv → sell is close, buy is anti. Both at $100.
+    assert sell.size_base == _expected_size_base(Decimal("100"), sell.price)
+    assert buy.size_base == _expected_size_base(Decimal("100"), buy.price)
+
+
+def test_asymmetric_close_size_at_midway():
+    """inv halfway between trigger and cap → scale=0.5 → close =
+    $100 + ($400-$100)*0.5 = $250.
+
+    Note on the anti leg: at inv=$340 with default=$100 and cap=$400,
+    ``is_position_capped`` projects post-buy-fill inv at $440 ≥ $400,
+    so the anti (buy) leg is correctly skipped by the cap-projection
+    safety. The close leg is what P10 changes — and it sizes to $250
+    here rather than P9's flat $100, draining the position ~2.5×
+    faster per fill.
+    """
+    market = _p10_market_or_default()
+    inv = long_inv("340", mid="160")  # midway: (340-280)/(400-280) = 0.5
+    quotes = plan_quotes(market, _p10_session(), inv, _p10_config())
+    by_side = {q.side: q for q in quotes}
+    # Cap-projection drops the buy (anti) leg; sell (close) emits.
+    assert "sell" in by_side
+    sell = by_side["sell"]
+    assert sell.size_base == _expected_size_base(Decimal("250"), sell.price)
+    assert "asymmetric_close" in sell.notes
+
+
+def test_asymmetric_close_size_at_cap():
+    """inv just under cap → scale ≈ 1 → close ≈ cap = $400.
+    (At inv=$398, scale=(398-280)/(400-280)=0.9833,
+    close = $100 + $300×0.9833 = $395.)
+
+    Single-sided here too: $398 + $100 ≥ $400 trips the cap projection
+    on the anti leg. The close leg's $395 notional is the P10 payoff —
+    one fill could land inv at ~$3, far below the trigger.
+    """
+    market = _p10_market_or_default()
+    inv = long_inv("398", mid="160")
+    quotes = plan_quotes(market, _p10_session(), inv, _p10_config())
+    by_side = {q.side: q for q in quotes}
+    assert "sell" in by_side
+    sell = by_side["sell"]
+    assert sell.size_base == _expected_size_base(Decimal("395"), sell.price)
+    assert "asymmetric_close" in sell.notes
+
+
+def test_asymmetric_close_anti_both_legs_when_under_cap_projection():
+    """At inv just past the trigger (and below cap - default), both
+    legs emit: close scales tiny over default, anti stays at default.
+
+    Verifies that P10 keeps the P9 two-leg invariant intact when the
+    cap-projection isn't tripping. inv=$285 → scale=5/120=0.0417,
+    close = $100 + $300×0.0417 = $112.50. Anti = $100.
+    Cap projection: $285 + $100 = $385 < $400 → both legs.
+    """
+    market = _p10_market_or_default()
+    inv = long_inv("285", mid="160")
+    quotes = plan_quotes(market, _p10_session(), inv, _p10_config())
+    by_side = {q.side: q for q in quotes}
+    assert "sell" in by_side and "buy" in by_side
+    sell, buy = by_side["sell"], by_side["buy"]
+    assert sell.size_base == _expected_size_base(Decimal("112.5"), sell.price)
+    assert buy.size_base == _expected_size_base(Decimal("100"), buy.price)
+    assert "asymmetric_close" in sell.notes
+    assert "asymmetric_anti" in buy.notes
+
+
+def test_asymmetric_close_size_at_full_cap_clamps_to_cap():
+    """inv = cap exactly → scale = 1 → close = cap = $400 = inv;
+    ``min(close, inv_abs)`` is a no-op here. Verifies the
+    integer-cap boundary."""
+    market = _p10_market_or_default()
+    inv = long_inv("400", mid="160")  # at cap
+    quotes = plan_quotes(market, _p10_session(), inv, _p10_config())
+    by_side = {q.side: q for q in quotes}
+    # Long inv ≥ cap may also drop the bid via is_position_capped
+    # ($400 + $100 ≥ $400 → True). So we may see only the sell quote.
+    assert "sell" in by_side
+    sell = by_side["sell"]
+    # close size = cap = $400 (scale=1)
+    assert sell.size_base == _expected_size_base(Decimal("400"), sell.price)
+
+
+def test_asymmetric_close_size_does_not_exceed_inv():
+    """Defensive: when ``default_size_usdc`` > the live inventory
+    (rare misconfig: small cap, large default), the linear formula
+    can produce close > inv. ``min(close, inv_abs)`` clamps it.
+
+    Construct: default=$300, cap=$400, trigger=$280, inv=$280.
+    scale=0 → linear=$300, but inv_abs=$280, so close clamps to $280.
+    """
+    market = _p10_market_or_default()
+    sess = SessionPolicy(
+        name="P10_BIG_DEFAULT",
+        action="quote",
+        default_distance_bp=Decimal("10"),
+        default_size_usdc=Decimal("300"),  # > trigger $280
+        tier_thresholds_bp=(Decimal("15"), Decimal("25"), Decimal("50")),
+        reason="p10 clamp test",
+    )
+    inv = long_inv("280", mid="160")
+    cfg = _p10_config()
+    quotes = plan_quotes(market, sess, inv, cfg)
+    by_side = {q.side: q for q in quotes}
+    # If the cap-projection drops the bid, only sell remains.
+    assert "sell" in by_side
+    sell = by_side["sell"]
+    # close size clamped from $300 to inv_abs=$280
+    assert sell.size_base == _expected_size_base(Decimal("280"), sell.price)
+
+
+def test_asymmetric_close_size_short_side():
+    """Mirror of the long midway test on the short side. inv=-$340 →
+    buy is close, sized to $250 by the linear scaling. The sell-side
+    anti leg gets dropped by the cap-projection ($-340 - $100 =
+    $-440 ≤ -$400)."""
+    market = _p10_market_or_default()
+    inv = InventoryState(
+        net_delta_base=Decimal("-340") / Decimal("160"),
+        net_delta_usdc=Decimal("-340"),
+        avg_entry_price=Decimal("160"),
+        open_orders_count=0,
+    )
+    quotes = plan_quotes(market, _p10_session(), inv, _p10_config())
+    by_side = {q.side: q for q in quotes}
+    assert "buy" in by_side
+    buy = by_side["buy"]
+    # Short → buy=close ($250).
+    assert buy.size_base == _expected_size_base(Decimal("250"), buy.price)
+    assert "asymmetric_close" in buy.notes
+
+
+def test_asymmetric_size_scaling_fixed_falls_back_to_default():
+    """``asymmetric_close_size_scaling="fixed"`` restores the P9
+    behaviour: both legs use the session default size regardless of
+    inv severity."""
+    market = _p10_market_or_default()
+    inv = long_inv("390", mid="160")  # very high inv
+    cfg = _p10_config(asymmetric_close_size_scaling="fixed")
+    quotes = plan_quotes(market, _p10_session(), inv, cfg)
+    by_side = {q.side: q for q in quotes}
+    # Long inv near cap may drop the bid via is_position_capped
+    # ($390 + $100 = $490 > $400 cap). Sell still emits at default.
+    assert "sell" in by_side
+    sell = by_side["sell"]
+    # Fixed mode → close uses default $100 even at inv=$390.
+    assert sell.size_base == _expected_size_base(Decimal("100"), sell.price)
+
+
+def test_asymmetric_size_scaling_default_value_is_linear():
+    """When the config omits ``asymmetric_close_size_scaling``, the
+    planner defaults to ``"linear"`` — sizes match the midway test."""
+    market = _p10_market_or_default()
+    inv = long_inv("340", mid="160")  # midway
+    cfg = _p10_config()
+    del cfg["asymmetric_close_size_scaling"]  # absent → default linear
+    quotes = plan_quotes(market, _p10_session(), inv, cfg)
+    by_side = {q.side: q for q in quotes}
+    assert "sell" in by_side
+    sell = by_side["sell"]
+    # Same expectation as the explicit linear midway test.
+    assert sell.size_base == _expected_size_base(Decimal("250"), sell.price)
+
+
+def test_asymmetric_size_scaling_does_not_affect_symmetric_path():
+    """When inv is below the trigger, the asymmetric block doesn't
+    run — both legs use the session default size, untouched by the
+    P10 scaling logic."""
+    market = _p10_market_or_default()
+    inv = long_inv("200", mid="160")  # below trigger $280
+    quotes = plan_quotes(market, _p10_session(), inv, _p10_config())
+    by_side = {q.side: q for q in quotes}
+    sell, buy = by_side["sell"], by_side["buy"]
+    # Symmetric path: both legs at session default $100.
+    assert sell.size_base == _expected_size_base(Decimal("100"), sell.price)
+    assert buy.size_base == _expected_size_base(Decimal("100"), buy.price)
+
+
+def test_asymmetric_size_scaling_preserves_close_price_invariant():
+    """P10 must not affect price — only size. The close leg still
+    sits at best_bid + 1 tick (improve_bbo) and the anti leg still
+    sits at mid - asymmetric_anti_distance_bp.
+
+    Uses inv=$285 (just past trigger) where the cap-projection
+    leaves both legs alive, so we can verify both prices.
+    """
+    market = _p10_market_or_default()  # bid=159.96 ask=160.04 mid=160
+    inv = long_inv("285", mid="160")
+    quotes = plan_quotes(market, _p10_session(), inv, _p10_config())
+    by_side = {q.side: q for q in quotes}
+    assert "sell" in by_side and "buy" in by_side
+    sell, buy = by_side["sell"], by_side["buy"]
+    # Close price unchanged by P10.
+    assert sell.price == Decimal("159.961")
+    # Anti price unchanged by P10 (160 × 0.997 = 159.520).
+    assert buy.price == Decimal("159.520")

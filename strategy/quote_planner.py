@@ -175,6 +175,12 @@ def plan_quotes(
     base_size = session.default_size_usdc
     tier_l1, _, _ = session.tier_thresholds_bp
 
+    # P10 (5-5): per-leg size inputs. Default to ``base_size`` so the
+    # symmetric path is unchanged; the asymmetric block below may
+    # override one or both with inv-aware close-size scaling.
+    bid_size_usdc_input: Decimal = base_size
+    ask_size_usdc_input: Decimal = base_size
+
     bid_offset, ask_offset = compute_skew_offsets(
         inventory,
         config["target_max_delta_usdc"],
@@ -365,14 +371,76 @@ def plan_quotes(
                     if actual_ask < market.best_ask
                     else "passive"
                 )
+            # P10 (5-5): inv-aware close size scaling. Day-5 SAMSUNG
+            # under P9 oscillated between -$249 and -$308 because the
+            # close leg always fired at ``default_size_usdc`` (~$100)
+            # — too slow to drain a $349 short. ``"linear"`` scales the
+            # close leg from ``default_size_usdc`` at the trigger
+            # threshold to ``effective_cap`` when inv touches the cap;
+            # the anti leg stays at default to keep the maker-reward
+            # density up. ``"fixed"`` restores the P9 behaviour.
+            #
+            # Defensive ``min(close, inv_abs)`` guards against the
+            # rare config where ``default_size_usdc > trigger_threshold``
+            # (small cap, large default) — at scale=0 the linear
+            # formula would otherwise emit a close bigger than the
+            # actual position. The cap-projection skip in
+            # ``is_position_capped`` still uses ``base_size`` and
+            # remains the outer safety bound; bigger close fills just
+            # mean we exit the single-sided cap window faster.
+            size_scaling_mode = str(
+                config.get("asymmetric_close_size_scaling", "linear")
+            )
+            inv_abs = abs(inventory.net_delta_usdc)
+            if size_scaling_mode == "linear":
+                cap_room = effective_cap - trigger_threshold
+                if cap_room > 0:
+                    scale_raw = (inv_abs - trigger_threshold) / cap_room
+                    if scale_raw > _ONE:
+                        scale = _ONE
+                    elif scale_raw < _ZERO:
+                        scale = _ZERO
+                    else:
+                        scale = scale_raw
+                else:
+                    # trigger_pct >= 1.0 (degenerate config) — treat
+                    # any breach as a full-cap close.
+                    scale = _ONE
+                close_size_usdc = (
+                    base_size + (effective_cap - base_size) * scale
+                )
+                if close_size_usdc > inv_abs:
+                    close_size_usdc = inv_abs
+                anti_size_usdc = base_size
+            else:
+                # ``"fixed"`` (or unknown) — P9 behaviour: both legs
+                # at the session default size, no inv-aware scaling.
+                scale = _ZERO
+                close_size_usdc = base_size
+                anti_size_usdc = base_size
+
+            if asymmetric_close_side == "sell":
+                # Long inv: sell leg is close, buy leg is anti.
+                ask_size_usdc_input = close_size_usdc
+                bid_size_usdc_input = anti_size_usdc
+            else:
+                # Short inv: buy leg is close, sell leg is anti.
+                bid_size_usdc_input = close_size_usdc
+                ask_size_usdc_input = anti_size_usdc
+
             logger.info(
                 "plan_quotes: asymmetric_quote active inv=%s "
-                "trigger=%s close_side=%s mode=%s anti_dist_bp=%s",
+                "trigger=%s close_side=%s mode=%s anti_dist_bp=%s "
+                "size_scaling=%s scale=%s close_usdc=%s anti_usdc=%s",
                 inventory.net_delta_usdc,
                 trigger_threshold,
                 asymmetric_close_side,
                 close_mode,
                 anti_distance_bp,
+                size_scaling_mode,
+                scale,
+                close_size_usdc,
+                anti_size_usdc,
             )
 
     # cross-self defense (rare; trips on distance≈0 or oracle/BBO disagreement)
@@ -390,8 +458,8 @@ def plan_quotes(
     ask_tier = _determine_tier(actual_ask_distance_bp, session.tier_thresholds_bp)
 
     size_step = _ONE / (Decimal(10) ** market.size_decimals)
-    bid_size_base = (base_size / actual_bid).quantize(size_step, rounding=ROUND_DOWN)
-    ask_size_base = (base_size / actual_ask).quantize(size_step, rounding=ROUND_DOWN)
+    bid_size_base = (bid_size_usdc_input / actual_bid).quantize(size_step, rounding=ROUND_DOWN)
+    ask_size_base = (ask_size_usdc_input / actual_ask).quantize(size_step, rounding=ROUND_DOWN)
     bid_size_usdc = bid_size_base * actual_bid
     ask_size_usdc = ask_size_base * actual_ask
 
@@ -443,8 +511,8 @@ def plan_quotes(
             ))
         else:
             logger.warning(
-                "bid size quantized to 0 for %s: base_size=%s, price=%s — skipping",
-                market.symbol, base_size, actual_bid,
+                "bid size quantized to 0 for %s: size_input=%s, price=%s — skipping",
+                market.symbol, bid_size_usdc_input, actual_bid,
             )
 
     if skip_ask:
@@ -467,8 +535,8 @@ def plan_quotes(
             ))
         else:
             logger.warning(
-                "ask size quantized to 0 for %s: base_size=%s, price=%s — skipping",
-                market.symbol, base_size, actual_ask,
+                "ask size quantized to 0 for %s: size_input=%s, price=%s — skipping",
+                market.symbol, ask_size_usdc_input, actual_ask,
             )
 
     # Decision summary — debug level so production -v prints it but

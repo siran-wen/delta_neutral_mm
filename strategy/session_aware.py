@@ -69,11 +69,20 @@ _DEFAULTS: Dict[str, dict] = {
         "reason": "KR before open (22:30-23:30 UTC, 07:30-08:30 KST)",
     },
     "KR_PRE_OPEN_WITHDRAW": {
-        "action": "withdraw",
-        "default_distance_bp": Decimal("0"),
-        "default_size_usdc": Decimal("0"),
+        # 5-5 retune: flipped from action="withdraw" to "quote" after
+        # Day-5 forensics surfaced active MM during this 30-min window
+        # (the original assumption was that everyone withdrew before
+        # the AM session resumed). Distance/size mirror the adjacent
+        # KR_BEFORE_OPEN row since the pre-resumption liquidity
+        # profile is similar; per-yaml session_overrides typically
+        # tighten size beyond this base. The session NAME still
+        # carries the "WITHDRAW" suffix for log-pattern continuity —
+        # don't rename it without sweeping the LPP forensics tooling.
+        "action": "quote",
+        "default_distance_bp": Decimal("8"),
+        "default_size_usdc": Decimal("500"),
         "tier_thresholds_bp": _KR_TIER_THRESHOLDS,
-        "reason": "KR pre-open withdraw window (23:30-24:00 UTC)",
+        "reason": "KR pre-open quote window (23:30-24:00 UTC, was withdraw pre 5-5)",
     },
     "KR_WEEKEND": {
         "action": "quote",
@@ -141,7 +150,10 @@ def get_kr_equity_session(
         }
 
     Only the three numeric fields above can be overridden — name and
-    action are always derived from the calendar.
+    action are always derived from the calendar. Action history note:
+    KR_PRE_OPEN_WITHDRAW used to ship as action="withdraw"; the 5-5
+    retune flipped it to "quote" after Day-5 forensics found MM
+    activity during the 23:30-24:00 UTC window.
     """
     now_utc = _to_utc(now)
 

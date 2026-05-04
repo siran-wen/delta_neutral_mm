@@ -29,8 +29,8 @@ strategy:
   # binding constraint). Tighter pct caps SAMSUNG drift if the
   # account ever runs low on collateral.
   target_max_delta_usdc: "100"
-  hard_position_cap_usdc: "400"
-  hard_position_cap_pct: "0.2"
+  hard_position_cap_usdc: "500"
+  hard_position_cap_pct: "0.25"
   skew_max_offset_bp: "5"
 
   min_market_spread_bp: "0"
@@ -73,27 +73,47 @@ strategy:
   asymmetric_quote_trigger_pct: "0.7"
   asymmetric_close_mode: "improve_bbo"
   asymmetric_anti_distance_bp: "30"
+  # P10 (5-5): scale close size from default at trigger up to cap when
+  # inv touches the cap. Day-5 SAMSUNG specifically motivated this —
+  # the $100 close was too slow against -$349 inv and inv oscillated
+  # -$249 ↔ -$308. With cap=$400 and trigger=$280, midway inv ($340)
+  # now closes at ~$250 and at-cap closes at full $400. Anti stays at
+  # default. See the SKHYNIX yaml for the full rationale.
+  asymmetric_close_size_scaling: "linear"
 
   daily_max_drawdown_usdc: "100"
   daily_max_drawdown_pct: "0.05"
   daily_drawdown_check_interval_sec: 300
 
-  # Day-1 retune: minimum-size deployment across all KR sessions.
+  # 5-5 retune: per-session sizing from Day-5 forensics.
+  # Notable shifts:
+  #   KR_MARKET_HOURS_PM 200 -> 50: large MM entered the PM book and
+  #     squeezed our share — drop size, ride existing quotes instead.
+  #   KR_MARKET_HOURS_AM 150 -> 200: AM share still has room.
+  #   KR_LUNCH_BREAK 100 -> 50: thin book, dial down notional.
+  #   KR_BEFORE_OPEN 100 -> 150 / KR_WEEKEND 100 -> 150: bumped on
+  #     observed reward density during these windows.
+  #   KR_PRE_OPEN_WITHDRAW activated at 200: 5-5 session_aware patch
+  #     flipped the calendar from action="withdraw" to "quote" for
+  #     this window after Day-5 found MM activity. Now actually
+  #     quotes through plan_quotes.
   session_overrides:
     KR_MARKET_HOURS_AM:
-      default_size_usdc: "150"
-    KR_MARKET_HOURS_PM:
       default_size_usdc: "200"
+    KR_MARKET_HOURS_PM:
+      default_size_usdc: "50"
     KR_LUNCH_BREAK:
-      default_size_usdc: "100"
+      default_size_usdc: "50"
     KR_AFTER_CLOSE:
       default_size_usdc: "100"
     KR_OVERNIGHT:
       default_size_usdc: "100"
     KR_BEFORE_OPEN:
-      default_size_usdc: "100"
+      default_size_usdc: "150"
+    KR_PRE_OPEN_WITHDRAW:
+      default_size_usdc: "200"
     KR_WEEKEND:
-      default_size_usdc: "100"
+      default_size_usdc: "150"
 
 recovery:
   cancel_stale_orders: true

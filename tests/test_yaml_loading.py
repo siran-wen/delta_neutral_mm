@@ -56,24 +56,27 @@ def test_skhynix_yaml_size_and_cap():
 
 
 def test_samsung_yaml_size_and_cap():
-    """SAMSUNG retune (5-4): target $100, cap $400, pct 20%."""
+    """SAMSUNG retune (5-5 sizes + cap bump): target $100, cap $500,
+    pct 25%. Cap bumped 400 -> 500 alongside HYUNDAI in the 5-5
+    retune (Day-5 collateral headroom). KR_WEEKEND bumped 100 -> 150."""
     cfg = _load_strategy("lighter_strategy_samsung.yaml")
     assert cfg["market"] == "SAMSUNGUSD"
     assert cfg["target_max_delta_usdc"] == Decimal("100")
-    assert cfg["hard_position_cap_usdc"] == Decimal("400")
-    assert cfg["hard_position_cap_pct"] == Decimal("0.2")
+    assert cfg["hard_position_cap_usdc"] == Decimal("500")
+    assert cfg["hard_position_cap_pct"] == Decimal("0.25")
     weekend = cfg["session_overrides"]["KR_WEEKEND"]
-    assert weekend["default_size_usdc"] == Decimal("100")
+    assert weekend["default_size_usdc"] == Decimal("150")
 
 
 def test_hyundai_yaml_size_and_cap():
-    """HYUNDAI retune (5-4): target $200, cap $400, pct 15%.
-    KR_WEEKEND/KR_OVERNIGHT bumped to $200 (deeper-pocket overnight)."""
+    """HYUNDAI retune (5-5 cap bump): target $200, cap $500, pct 20%.
+    Cap bumped 400 -> 500 alongside SAMSUNG in the 5-5 retune.
+    KR_WEEKEND/KR_OVERNIGHT stay at $200 (deeper-pocket overnight)."""
     cfg = _load_strategy("lighter_strategy_hyundai.yaml")
     assert cfg["market"] == "HYUNDAIUSD"
     assert cfg["target_max_delta_usdc"] == Decimal("200")
-    assert cfg["hard_position_cap_usdc"] == Decimal("400")
-    assert cfg["hard_position_cap_pct"] == Decimal("0.15")
+    assert cfg["hard_position_cap_usdc"] == Decimal("500")
+    assert cfg["hard_position_cap_pct"] == Decimal("0.2")
     weekend = cfg["session_overrides"]["KR_WEEKEND"]
     assert weekend["default_size_usdc"] == Decimal("200")
 
@@ -131,10 +134,10 @@ def test_total_absolute_cap_exposure_pinned_at_2k_collateral():
     simultaneously. Pin the math so nudging any cap without checking
     total exposure fails fast.
 
-    5-4 retune (revised): SAMSUNG cap bumped $200 → $400 and HYUNDAI
-    cap bumped $300 → $400. Total now $1400 = 63% of collateral —
-    sanity bound bumped to 70% to allow the new exposure ceiling
-    while still failing if a future cap edit drives total > $1550."""
+    5-5 retune: SAMSUNG cap $400 → $500 and HYUNDAI cap $400 → $500.
+    Total now $1600 = 72% of collateral — sanity bound bumped to 75%
+    to allow the new exposure ceiling while still failing if a future
+    cap edit drives total > $1660."""
     skhynix = _load_strategy("lighter_strategy.yaml")
     samsung = _load_strategy("lighter_strategy_samsung.yaml")
     hyundai = _load_strategy("lighter_strategy_hyundai.yaml")
@@ -143,9 +146,9 @@ def test_total_absolute_cap_exposure_pinned_at_2k_collateral():
         + samsung["hard_position_cap_usdc"]
         + hyundai["hard_position_cap_usdc"]
     )
-    # $600 + $400 + $400 = $1400
-    assert total_cap == Decimal("1400")
-    assert total_cap / Decimal("2213") < Decimal("0.70")
+    # $600 + $500 + $500 = $1600
+    assert total_cap == Decimal("1600")
+    assert total_cap / Decimal("2213") < Decimal("0.75")
 
 
 def test_asymmetric_quote_state_pinned_per_yaml():
@@ -169,6 +172,10 @@ def test_asymmetric_quote_state_pinned_per_yaml():
         assert cfg["asymmetric_quote_trigger_pct"] == Decimal("0.7")
         assert cfg["asymmetric_close_mode"] == "improve_bbo"
         assert cfg["asymmetric_anti_distance_bp"] == Decimal("30")
+        # P10 (5-5): inv-aware close size scaling. All three markets
+        # ship with "linear" — the P10 default. "fixed" is the P9
+        # fall-back if a market needs to opt out for ad-hoc testing.
+        assert cfg["asymmetric_close_size_scaling"] == "linear"
 
     # P9 strip: the old active_hedge_* keys must be gone — pin to
     # catch a partial revert from a config patch.

@@ -153,6 +153,21 @@ QUOTER_DEFAULTS: Dict[str, Any] = {
     # values (e.g. 50bp) bias the inventory drift back toward zero
     # faster.
     "asymmetric_anti_distance_bp": Decimal("30"),
+    # P10 (5-5): inv-aware close-leg size scaling.
+    # ``"linear"`` (default): close leg size scales linearly from
+    # ``default_size_usdc`` at the trigger threshold up to
+    # ``effective_cap`` when inv touches the cap. Anti leg stays at
+    # ``default_size_usdc`` so the maker-reward density on the
+    # away-from-cap side is unaffected. ``"fixed"`` restores the P9
+    # behaviour where both legs use ``default_size_usdc``.
+    #
+    # Day-5 SAMSUNG showed P9's fixed close size oscillated inv
+    # between -$249 and -$308: $100 close fills couldn't drain a
+    # $349 short faster than the anti side refilled it. Linear
+    # scaling sizes the close to the severity (close ≈ $250 at
+    # midway, ≈ cap when inv touches cap), so a single fill can
+    # land us back below the trigger.
+    "asymmetric_close_size_scaling": "linear",
     # Phase 2.1 P2.1.3: daily max drawdown stop loss. start() captures
     # collateral_start; periodic check fires emergency_stop when
     # drawdown >= min(daily_max_drawdown_usdc, daily_max_drawdown_pct

@@ -67,9 +67,14 @@ def test_monday_05_30_is_market_hours_pm():
 
 
 def test_monday_23_45_is_pre_open_withdraw():
+    """5-5 retune: this window's name still ends in WITHDRAW (kept for
+    log-pattern continuity) but the action is now ``quote`` after the
+    Day-5 finding. Distance/size mirror KR_BEFORE_OPEN."""
     s = get_kr_equity_session(MON(23, 45))
     assert s.name == "KR_PRE_OPEN_WITHDRAW"
-    assert s.action == "withdraw"
+    assert s.action == "quote"
+    assert s.default_distance_bp == Decimal("8")
+    assert s.default_size_usdc == Decimal("500")
 
 
 def test_sunday_23_00_is_before_open():

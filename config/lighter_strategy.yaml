@@ -83,6 +83,15 @@ strategy:
   asymmetric_quote_trigger_pct: "0.7"
   asymmetric_close_mode: "improve_bbo"
   asymmetric_anti_distance_bp: "30"
+  # P10 (5-5): inv-aware close size scaling. "linear" scales the
+  # close-leg notional from default_size_usdc at the trigger up to
+  # effective_cap when inv touches the cap (anti leg stays at
+  # default). Day-5 SAMSUNG under P9 oscillated -$249 ↔ -$308 because
+  # $100 closes couldn't drain a $349 short faster than the anti
+  # refilled it; linear sizing lets a single fill land us back
+  # below trigger. Set to "fixed" to revert to the P9 close-size
+  # behaviour for ad-hoc testing.
+  asymmetric_close_size_scaling: "linear"
 
   # Phase 2.1 P2.1.3: daily max drawdown stop loss.
   # Effective threshold = min(daily_max_drawdown_usdc,
@@ -92,24 +101,32 @@ strategy:
   daily_max_drawdown_pct: "0.05"
   daily_drawdown_check_interval_sec: 300
 
-  # Session-level overrides for default_size_usdc / default_distance_bp.
-  # 5-4 retune: KR_MARKET_HOURS_AM/PM tuned to $150 per user directive
-  # (observed reward $36/h vs KR_WEEKEND $2.81/h; explicit yaml input).
-  # KR_OVERNIGHT / KR_WEEKEND keep $100 because liquidity dries up.
-  # KR_LUNCH_BREAK / KR_AFTER_CLOSE / KR_BEFORE_OPEN stay at $200 (not
-  # in this retune's scope — "其他维持").
+  # 5-5 retune: per-session sizing from Day-5 forensics.
+  # Notable shifts:
+  #   KR_AFTER_CLOSE 200 -> 50: share collapsed to 2.17% — book got
+  #     deep, big notional only dilutes us.
+  #   KR_MARKET_HOURS_PM 150 -> 200: share rose despite the bump, so
+  #     deploying more captures additional reward.
+  #   KR_OVERNIGHT 100 -> 150: data justified more notional.
+  #   KR_LUNCH_BREAK 200 -> 100 / KR_BEFORE_OPEN 200 -> 100: trimmed
+  #     where reward density flagged.
+  #   KR_PRE_OPEN_WITHDRAW activated at 200: 5-5 session_aware patch
+  #     flipped the calendar from action="withdraw" to "quote" for
+  #     this window after Day-5 found MM activity.
   session_overrides:
     KR_MARKET_HOURS_AM:
       default_size_usdc: "150"
     KR_MARKET_HOURS_PM:
-      default_size_usdc: "150"
+      default_size_usdc: "200"
     KR_LUNCH_BREAK:
-      default_size_usdc: "200"
-    KR_AFTER_CLOSE:
-      default_size_usdc: "200"
-    KR_OVERNIGHT:
       default_size_usdc: "100"
+    KR_AFTER_CLOSE:
+      default_size_usdc: "50"
+    KR_OVERNIGHT:
+      default_size_usdc: "150"
     KR_BEFORE_OPEN:
+      default_size_usdc: "100"
+    KR_PRE_OPEN_WITHDRAW:
       default_size_usdc: "200"
     KR_WEEKEND:
       default_size_usdc: "100"

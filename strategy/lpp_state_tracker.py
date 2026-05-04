@@ -107,12 +107,14 @@ _CAP_TABLE: Dict[Tuple[str, str], Optional[Decimal]] = {
     ("KR_OVERNIGHT", "L1"): Decimal("5300"),
     ("KR_OVERNIGHT", "L2"): Decimal("12000"),
     ("KR_OVERNIGHT", "L3"): Decimal("31000"),
-    # Pre-open withdraw (23:30-24:00 UTC) — withdraw session, no
-    # quotes expected. Caps zero so any stray quote produces zero
-    # rewardable share.
-    ("KR_PRE_OPEN_WITHDRAW", "L1"): Decimal("0"),
-    ("KR_PRE_OPEN_WITHDRAW", "L2"): Decimal("0"),
-    ("KR_PRE_OPEN_WITHDRAW", "L3"): Decimal("0"),
+    # Pre-open window (23:30-24:00 UTC). 5-5 retune flipped this from
+    # action="withdraw" → "quote" after Day-5 forensics found active
+    # MM here. Caps cloned from KR_BEFORE_OPEN since the windows are
+    # contiguous and the pre-resumption liquidity profile matches —
+    # tune in place once we have a dedicated LPP spreadsheet row.
+    ("KR_PRE_OPEN_WITHDRAW", "L1"): Decimal("7500"),
+    ("KR_PRE_OPEN_WITHDRAW", "L2"): Decimal("20000"),
+    ("KR_PRE_OPEN_WITHDRAW", "L3"): Decimal("51000"),
     # Weekend (Fri 09:00 UTC - Sun 22:30 UTC) — RWA-wide tiers
     # (50/100/200 bp boundaries declared by SessionPolicy). The
     # cap *labels* are still L1/L2/L3 and apply to that wider
