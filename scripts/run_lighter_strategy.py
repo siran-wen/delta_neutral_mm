@@ -247,11 +247,11 @@ def _coerce_decimal_fields(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "reprice_drift_bp", "reprice_min_interval_sec",
         "tick_interval_sec", "snapshot_interval_sec",
         "price_tolerance_bp", "size_tolerance_pct",
-        # Phase 2.1: double cap + active hedge + daily drawdown.
+        # Phase 2.1: double cap + daily drawdown.
         "hard_position_cap_pct",
-        "active_hedge_trigger_pct", "active_hedge_target_pct",
-        "active_hedge_taker_fee_max_pct",
         "daily_max_drawdown_usdc", "daily_max_drawdown_pct",
+        # P9 (5-4): asymmetric BBO quoting.
+        "asymmetric_quote_trigger_pct", "asymmetric_anti_distance_bp",
     }
     out: Dict[str, Any] = dict(cfg)
     for k in decimal_keys:
@@ -662,16 +662,14 @@ async def run_live_mode(
         cfg.get("hard_position_cap_pct") or "(disabled)",
     )
     logger.info(
-        "  active_hedge: enabled=%s trigger=%s target=%s slip_pct=%s "
-        "pause=%ss post_submit_wait=%ss max_fails=%s "
-        "(P8: fail_mode=disable-only, NOT emergency_stop)",
-        cfg.get("active_hedge_enabled", False),
-        cfg.get("active_hedge_trigger_pct"),
-        cfg.get("active_hedge_target_pct"),
-        cfg.get("active_hedge_taker_fee_max_pct"),
-        cfg.get("active_hedge_pause_after_sec"),
-        cfg.get("active_hedge_post_submit_wait_sec"),
-        cfg.get("active_hedge_max_consecutive_fails"),
+        "  asymmetric_quote: enabled=%s trigger_pct=%s "
+        "close_mode=%s anti_distance_bp=%s "
+        "(P9: keeps both legs post_only when inv > trigger; "
+        "no IOC, no fail counter)",
+        cfg.get("asymmetric_quote_enabled", False),
+        cfg.get("asymmetric_quote_trigger_pct"),
+        cfg.get("asymmetric_close_mode", "improve_bbo"),
+        cfg.get("asymmetric_anti_distance_bp"),
     )
     logger.info(
         "  daily_drawdown: max_usdc=%s max_pct=%s interval=%ss",
@@ -807,10 +805,9 @@ async def run_live_mode(
                 summary.get("consecutive_cancel_failures", 0),
             )
             logger.info(
-                "  active_hedge: total=%d failed=%d disabled_due_to_fails=%s",
-                summary.get("active_hedges_total", 0),
-                summary.get("active_hedges_failed", 0),
-                summary.get("active_hedge_disabled_due_to_fails", False),
+                "  asymmetric_quote: enabled=%s reprices=%d",
+                summary.get("asymmetric_quote_enabled", False),
+                summary.get("asymmetric_reprices", 0),
             )
             logger.info(
                 "  om: submitted=%d filled=%d cancelled=%d rejected=%d active=%d",

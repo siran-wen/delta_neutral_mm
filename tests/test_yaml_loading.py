@@ -148,44 +148,41 @@ def test_total_absolute_cap_exposure_pinned_at_2k_collateral():
     assert total_cap / Decimal("2213") < Decimal("0.70")
 
 
-def test_active_hedge_state_pinned_per_yaml():
-    """Pin the active_hedge_* knobs per-yaml. The three markets are
-    tuned independently (and re-enable is per-market: SKHYNIX has the
-    most flow and runs hedge live; SAMSUNG/HYUNDAI stay disabled until
-    P7 paper-verified). Per-yaml assertion rather than cross-yaml
-    uniformity so the markets can drift without false alarms.
+def test_asymmetric_quote_state_pinned_per_yaml():
+    """Pin the P9 asymmetric_quote_* knobs per-yaml. The three markets
+    share the same trigger / mode / anti-distance because the inv
+    profile (cap × 0.7 = trigger threshold) and the BBO improvement
+    pattern aren't market-specific — only enabled state may diverge
+    if a market needs to opt out for ad-hoc testing.
 
-    Day-3 SAMSUNG (5-3 → 5-4 UTC) showed the P6 cancel-then-IOC fix
-    still hits Lighter's account-level self-trade protection (3/3 IOC
-    submits silently rejected); P7 abandons IOC entirely and submits
-    post_only LIMIT @ best_bid + 1 tick / best_ask - 1 tick.
+    P9 (5-4) replaced the P6/P7/P8 active_hedge IOC + post_only
+    emergency paths with a plan_quotes-level override that prices
+    the close leg aggressively at the BBO and the anti leg wide,
+    keeping both legs maker-priced and post_only.
     """
     skhynix = _load_strategy("lighter_strategy.yaml")
     samsung = _load_strategy("lighter_strategy_samsung.yaml")
     hyundai = _load_strategy("lighter_strategy_hyundai.yaml")
 
-    # SKHYNIX: hedge enabled (live), retains the older P2.1-era IOC
-    # config block. P7 paper verification + retune is on the SAMSUNG
-    # / HYUNDAI yamls; SKHYNIX migrates after live validation.
-    assert skhynix["active_hedge_enabled"] is True
+    for cfg in (skhynix, samsung, hyundai):
+        assert cfg["asymmetric_quote_enabled"] is True
+        assert cfg["asymmetric_quote_trigger_pct"] == Decimal("0.7")
+        assert cfg["asymmetric_close_mode"] == "improve_bbo"
+        assert cfg["asymmetric_anti_distance_bp"] == Decimal("30")
 
-    # SAMSUNG: P7 post_only retune, re-enabled (5-4) for live paper
-    # verification of the post_only LIMIT close path. P8's
-    # disable-only-on-fail safety net means a re-enable here can't
-    # tank the whole strategy on hedge regression.
-    assert samsung["active_hedge_enabled"] is True
-    assert samsung["active_hedge_trigger_pct"] == Decimal("0.7")
-    assert samsung["active_hedge_target_pct"] == Decimal("0.0")
-    assert samsung["active_hedge_taker_fee_max_pct"] == Decimal("0.50")
-    assert samsung["active_hedge_pause_after_sec"] == 60
-    assert samsung["active_hedge_max_consecutive_fails"] == 3
-    assert samsung["active_hedge_post_submit_wait_sec"] == 120
-
-    # HYUNDAI: same P7 retune as SAMSUNG, disabled pending paper.
-    assert hyundai["active_hedge_enabled"] is False
-    assert hyundai["active_hedge_trigger_pct"] == Decimal("0.7")
-    assert hyundai["active_hedge_target_pct"] == Decimal("0.0")
-    assert hyundai["active_hedge_taker_fee_max_pct"] == Decimal("0.50")
-    assert hyundai["active_hedge_pause_after_sec"] == 60
-    assert hyundai["active_hedge_max_consecutive_fails"] == 3
-    assert hyundai["active_hedge_post_submit_wait_sec"] == 120
+    # P9 strip: the old active_hedge_* keys must be gone — pin to
+    # catch a partial revert from a config patch.
+    for cfg in (skhynix, samsung, hyundai):
+        for legacy_key in (
+            "active_hedge_enabled",
+            "active_hedge_trigger_pct",
+            "active_hedge_target_pct",
+            "active_hedge_taker_fee_max_pct",
+            "active_hedge_pause_after_sec",
+            "active_hedge_max_consecutive_fails",
+            "active_hedge_post_submit_wait_sec",
+            "active_hedge_pre_cancel_wait_sec",
+        ):
+            assert legacy_key not in cfg, (
+                f"P9 strip incomplete: legacy {legacy_key} still in yaml"
+            )

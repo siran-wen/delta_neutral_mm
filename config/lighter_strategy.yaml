@@ -69,18 +69,20 @@ strategy:
   # backup cancel via the gateway and breaks out of the run loop.
   emergency_stop_on_consecutive_cancel_fail_count: 3
 
-  # Phase 2.1 P2.1.2: active hedge (IOC reduce_only).
-  # When inv breaches active_hedge_trigger_pct of the effective cap,
-  # send an IOC reduce-only at mid * (1 ± taker_fee_max_pct/100) to
-  # flatten down to active_hedge_target_pct of cap. Then pause reprice
-  # for active_hedge_pause_after_sec while the fill propagates. Catches
-  # the KR_OVERNIGHT thin-liquidity case where passive hedging stalled
-  # on the 4-30 v4 run (-$199 inv held 17 minutes).
-  active_hedge_enabled: true
-  active_hedge_trigger_pct: "1.0"
-  active_hedge_target_pct: "0.3"
-  active_hedge_taker_fee_max_pct: "0.1"
-  active_hedge_pause_after_sec: 30
+  # P9 (5-4): asymmetric BBO quoting. When abs(inv) breaches
+  # asymmetric_quote_trigger_pct * effective_cap, plan_quotes emits
+  # both legs as post_only LIMITs but asymmetric — close leg at the
+  # BBO (sell at best_bid + 1 tick when long; buy at best_ask - 1 tick
+  # when short), anti leg widens to asymmetric_anti_distance_bp from
+  # mid. Replaces the P6-P8 active_hedge IOC / post_only-emergency
+  # paths (Day-3 SAMSUNG showed Lighter's account-level self-trade
+  # protection silently rejects IOC reduce_only; P7's post_only
+  # workaround dropped the anti leg during close, costing maker
+  # reward). User-driven manual close handles large residuals.
+  asymmetric_quote_enabled: true
+  asymmetric_quote_trigger_pct: "0.7"
+  asymmetric_close_mode: "improve_bbo"
+  asymmetric_anti_distance_bp: "30"
 
   # Phase 2.1 P2.1.3: daily max drawdown stop loss.
   # Effective threshold = min(daily_max_drawdown_usdc,

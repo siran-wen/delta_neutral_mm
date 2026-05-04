@@ -300,16 +300,16 @@ def test_coerce_decimal_fields_converts_known_keys():
 
 
 def test_coerce_decimal_handles_phase21_fields():
-    """Phase 2.1 added 6 new Decimal-typed yaml fields. Verify each gets
-    coerced from yaml string → Decimal so plan_quotes / lpp_quoter
-    arithmetic stays in Decimal-land."""
+    """Phase 2.1 + P9 (5-4) Decimal-typed yaml fields. P9 dropped the
+    active_hedge_* family in favour of asymmetric_quote_* — verify
+    the live set coerces cleanly to Decimal."""
     raw = {
         "hard_position_cap_pct": "0.30",
-        "active_hedge_trigger_pct": "1.0",
-        "active_hedge_target_pct": "0.3",
-        "active_hedge_taker_fee_max_pct": "0.1",
         "daily_max_drawdown_usdc": "100",
         "daily_max_drawdown_pct": "0.05",
+        # P9 (5-4): asymmetric BBO quoting Decimal fields.
+        "asymmetric_quote_trigger_pct": "0.7",
+        "asymmetric_anti_distance_bp": "30",
     }
     out = _coerce_decimal_fields(raw)
     for k, expected in raw.items():

@@ -696,3 +696,217 @@ def test_plan_quotes_logs_empty_reason_when_spread_too_tight(caplog):
     assert quotes == []
     assert "market_spread" in caplog.text
     assert "min" in caplog.text
+
+
+# ----- P9 (5-4): asymmetric BBO quoting ---------------------------------
+#
+# When abs(inv) breaches asymmetric_quote_trigger_pct * effective_cap,
+# plan_quotes overrides both legs: close leg sits aggressively at the
+# BBO (sell at best_bid+tick when long; buy at best_ask-tick when
+# short), anti leg widens to ``asymmetric_anti_distance_bp`` from
+# mid. Net: keep both legs post_only, no IOC, no fail counter, no
+# disable state. Replaces the P6/P7/P8 active_hedge paths.
+
+
+def _asym_market(
+    mid: str = "160",
+    bid: str = "159.96",
+    ask: str = "160.04",
+    *,
+    price_decimals: int = 3,
+    size_decimals: int = 3,
+) -> MarketSnapshot:
+    """SAMSUNG-shaped market for the asymmetric tests; tick = 0.001 at
+    price_decimals=3 keeps the BBO+1tick math unambiguous."""
+    return MarketSnapshot(
+        symbol="SAMSUNGUSD",
+        market_index=161,
+        mid=Decimal(mid),
+        mark_price=None,
+        index_price=None,
+        best_bid=Decimal(bid),
+        best_ask=Decimal(ask),
+        spread_bp=(Decimal(ask) - Decimal(bid)) / Decimal(mid) * Decimal(10000),
+        depth_by_spread_bp={
+            15: {"bid_usdc": Decimal(0), "ask_usdc": Decimal(0), "total_usdc": Decimal(0)},
+            25: {"bid_usdc": Decimal(0), "ask_usdc": Decimal(0), "total_usdc": Decimal(0)},
+            50: {"bid_usdc": Decimal(0), "ask_usdc": Decimal(0), "total_usdc": Decimal(0)},
+        },
+        price_decimals=price_decimals,
+        size_decimals=size_decimals,
+        ts_ms=1_700_000_000_000,
+    )
+
+
+def _asym_session() -> SessionPolicy:
+    """Generic SessionPolicy for the asymmetric tests — small size and
+    a 10bp default distance so the asymmetric overrides are obvious."""
+    return SessionPolicy(
+        name="ASYM_TEST",
+        action="quote",
+        default_distance_bp=Decimal("10"),
+        default_size_usdc=Decimal("50"),
+        tier_thresholds_bp=(Decimal("15"), Decimal("25"), Decimal("50")),
+        reason="test",
+    )
+
+
+def _asym_config(**overrides) -> dict:
+    """Default-tuned config for asymmetric tests. cap=$300 + trigger
+    pct 0.7 → trigger threshold $210."""
+    cfg = {
+        "target_max_delta_usdc": Decimal("300"),
+        "skew_max_offset_bp": Decimal("5"),
+        "hard_position_cap_usdc": Decimal("300"),
+        "min_market_spread_bp": Decimal("3"),
+        "max_market_spread_bp": Decimal("100"),
+        "share_warn_threshold": Decimal("0.95"),
+        "share_warn_widen_bp": Decimal("5"),
+        "asymmetric_quote_enabled": True,
+        "asymmetric_quote_trigger_pct": Decimal("0.7"),
+        "asymmetric_close_mode": "improve_bbo",
+        "asymmetric_anti_distance_bp": Decimal("30"),
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def test_asymmetric_quoting_inv_below_trigger_stays_symmetric():
+    """Below trigger ($210 = $300 × 0.7), plan_quotes runs the normal
+    symmetric path. The asymmetric_* notes must NOT appear."""
+    market = _asym_market()
+    inv = long_inv("200", mid="160")  # inv=$200 < trigger $210
+    quotes = plan_quotes(market, _asym_session(), inv, _asym_config())
+    assert len(quotes) == 2
+    for q in quotes:
+        assert "asymmetric_close" not in q.notes
+        assert "asymmetric_anti" not in q.notes
+
+
+def test_asymmetric_quoting_inv_breaches_long():
+    """Long inv above trigger → sell leg = best_bid + 1 tick (close
+    leg, queue priority); buy leg = mid - 30bp (anti leg, wider than
+    the symmetric 10bp). Both legs are tagged."""
+    market = _asym_market()  # bid=159.96 ask=160.04 mid=160 tick=0.001
+    inv = long_inv("220", mid="160")  # > trigger $210
+    quotes = plan_quotes(market, _asym_session(), inv, _asym_config())
+    assert len(quotes) == 2
+    by_side = {q.side: q for q in quotes}
+    sell, buy = by_side["sell"], by_side["buy"]
+    # Close leg: sell at best_bid + 1 tick = 159.961
+    assert sell.price == Decimal("159.961")
+    assert "asymmetric_close" in sell.notes
+    # Anti leg: buy at mid * (1 - 30/10000) = 160 * 0.997 = 159.520
+    assert buy.price == Decimal("159.520")
+    assert "asymmetric_anti" in buy.notes
+    # Sanity: close leg is between best_bid and best_ask (post_only valid)
+    assert sell.price > market.best_bid
+    assert sell.price < market.best_ask
+
+
+def test_asymmetric_quoting_inv_breaches_short():
+    """Short inv below -trigger → buy leg = best_ask - 1 tick; sell
+    leg = mid + 30bp."""
+    market = _asym_market()
+    # net_delta_usdc = -$220
+    inv = InventoryState(
+        net_delta_base=Decimal("-1.375"),
+        net_delta_usdc=Decimal("-220"),
+        avg_entry_price=Decimal("160"),
+        open_orders_count=0,
+    )
+    quotes = plan_quotes(market, _asym_session(), inv, _asym_config())
+    assert len(quotes) == 2
+    by_side = {q.side: q for q in quotes}
+    sell, buy = by_side["sell"], by_side["buy"]
+    # Close leg: buy at best_ask - 1 tick = 160.039
+    assert buy.price == Decimal("160.039")
+    assert "asymmetric_close" in buy.notes
+    # Anti leg: sell at mid * (1 + 30/10000) = 160 * 1.003 = 160.480
+    assert sell.price == Decimal("160.480")
+    assert "asymmetric_anti" in sell.notes
+
+
+def test_asymmetric_quoting_match_bbo_mode():
+    """``asymmetric_close_mode=match_bbo`` puts the close leg AT the
+    existing BBO (joining the queue at the back) instead of improving."""
+    market = _asym_market()
+    inv = long_inv("220", mid="160")
+    quotes = plan_quotes(
+        market, _asym_session(), inv,
+        _asym_config(asymmetric_close_mode="match_bbo"),
+    )
+    by_side = {q.side: q for q in quotes}
+    # Sell leg matches best_ask exactly.
+    assert by_side["sell"].price == market.best_ask
+    # Buy anti leg unchanged from improve_bbo case.
+    assert by_side["buy"].price == Decimal("159.520")
+
+
+def test_asymmetric_quoting_disabled_falls_back_to_symmetric():
+    """``asymmetric_quote_enabled=False`` → asymmetric notes never
+    appear and prices come from the symmetric path even when inv is
+    above the would-be trigger."""
+    market = _asym_market()
+    inv = long_inv("220", mid="160")
+    quotes = plan_quotes(
+        market, _asym_session(), inv,
+        _asym_config(asymmetric_quote_enabled=False),
+    )
+    for q in quotes:
+        assert "asymmetric_close" not in q.notes
+        assert "asymmetric_anti" not in q.notes
+
+
+def test_asymmetric_quoting_no_fail_no_disable_state():
+    """P9 invariant: plan_quotes never raises and never returns []
+    purely because of asymmetric mode. Repeated calls with breached
+    inventory produce identical asymmetric output (no implicit
+    state, no fail counter)."""
+    market = _asym_market()
+    inv = long_inv("220", mid="160")
+    cfg = _asym_config()
+    quotes_a = plan_quotes(market, _asym_session(), inv, cfg)
+    quotes_b = plan_quotes(market, _asym_session(), inv, cfg)
+    quotes_c = plan_quotes(market, _asym_session(), inv, cfg)
+    # Three identical asymmetric outputs — no decay, no disable.
+    assert len(quotes_a) == 2
+    assert len(quotes_b) == 2
+    assert len(quotes_c) == 2
+    for a, b, c in zip(quotes_a, quotes_b, quotes_c):
+        assert a.price == b.price == c.price
+        assert a.side == b.side == c.side
+
+
+def test_asymmetric_quoting_recovers_after_inv_drops():
+    """When inv falls back below trigger, plan_quotes returns to
+    symmetric mode automatically — the trigger is purely a
+    threshold check on the live inv, no hysteresis state."""
+    market = _asym_market()
+    cfg = _asym_config()
+    sess = _asym_session()
+    # Above trigger: asymmetric.
+    breached = plan_quotes(market, sess, long_inv("220", mid="160"), cfg)
+    assert any("asymmetric_close" in q.notes for q in breached)
+    # Below trigger: symmetric.
+    recovered = plan_quotes(market, sess, long_inv("100", mid="160"), cfg)
+    for q in recovered:
+        assert "asymmetric_close" not in q.notes
+        assert "asymmetric_anti" not in q.notes
+
+
+def test_asymmetric_quoting_respects_pct_cap_trigger():
+    """When ``hard_position_cap_pct`` × collateral is the binding
+    cap (smaller than the absolute), the asymmetric trigger uses
+    the pct-derived cap, not the absolute. Mirrors the
+    ``is_position_capped`` effective-cap logic."""
+    market = _asym_market()
+    inv = long_inv("85", mid="160")  # $85
+    cfg = _asym_config(
+        hard_position_cap_usdc=Decimal("300"),  # absolute = 300
+        hard_position_cap_pct=Decimal("0.05"),  # pct cap = 0.05*1000 = 50
+    )
+    # collateral=1000, pct cap=50 (binds), trigger pct=0.7 → threshold=$35.
+    # inv=$85 > $35 → asymmetric should fire.
+    quotes = plan_quotes(market, _asym_session(), inv, cfg, collateral_usdc=Decimal("1000"))
+    assert any("asymmetric_close" in q.notes for q in quotes)

@@ -269,6 +269,112 @@ def plan_quotes(
             bbo_track_max_dist_bp,
         )
 
+    # P9 (5-4): asymmetric BBO quoting. When abs(inv) breaches
+    # ``asymmetric_quote_trigger_pct * effective_cap``, both legs stay
+    # post_only (no IOC, no taker, no fail/disable counters), but the
+    # close-side leg sits aggressively near BBO and the anti-side leg
+    # widens to ``asymmetric_anti_distance_bp`` from mid. Net effect:
+    # we keep collecting maker rewards on both sides while the close
+    # leg gets queue priority for any natural taker that walks in.
+    #
+    # P6/P7/P8 IOC and post_only-emergency paths are abandoned —
+    # Day-3 SAMSUNG (5-3 → 5-4 UTC) showed Lighter's account-level
+    # self-trade protection silently rejects IOC reduce_only, and
+    # P7's post_only-with-timeout-disable left $396 SAMSUNG long
+    # unhedged for 2h with single-sided quoting (lost reward
+    # window). Asymmetric quoting trusts user-driven manual close
+    # for cleanup; the cap + skew + this asymmetric layer cover
+    # the bounded-tail-risk case.
+    asymmetric_active = False
+    asymmetric_close_side: Optional[str] = None
+    if bool(config.get("asymmetric_quote_enabled", False)):
+        trigger_pct_raw = config.get("asymmetric_quote_trigger_pct", "0.7")
+        trigger_pct = (
+            trigger_pct_raw
+            if isinstance(trigger_pct_raw, Decimal)
+            else Decimal(str(trigger_pct_raw))
+        )
+        effective_cap = Decimal(str(config["hard_position_cap_usdc"]))
+        if (
+            hard_cap_pct is not None
+            and collateral_usdc is not None
+            and collateral_usdc > 0
+        ):
+            pct_cap = hard_cap_pct * collateral_usdc
+            if pct_cap < effective_cap:
+                effective_cap = pct_cap
+        trigger_threshold = effective_cap * trigger_pct
+        if abs(inventory.net_delta_usdc) >= trigger_threshold:
+            asymmetric_active = True
+            close_mode = str(
+                config.get("asymmetric_close_mode", "improve_bbo")
+            )
+            anti_distance_bp_raw = config.get(
+                "asymmetric_anti_distance_bp", "30"
+            )
+            anti_distance_bp = (
+                anti_distance_bp_raw
+                if isinstance(anti_distance_bp_raw, Decimal)
+                else Decimal(str(anti_distance_bp_raw))
+            )
+            if inventory.net_delta_usdc > 0:
+                # Long: sell-side is the close leg, buy-side is anti.
+                asymmetric_close_side = "sell"
+                if close_mode == "match_bbo":
+                    # Join the existing top-of-book ask queue.
+                    actual_ask = market.best_ask
+                    ask_position = "passive"
+                else:
+                    # ``improve_bbo`` (default): become the new
+                    # top-of-book ask. Cross-self defense below
+                    # catches the rare case where best_bid + tick
+                    # lands at-or-above best_ask (1-tick spread).
+                    actual_ask = market.best_bid + tick
+                    ask_position = "improving"
+                # Anti (buy) sits ``anti_distance_bp`` from mid —
+                # wider than the symmetric default to dampen fill
+                # probability without dropping the leg entirely.
+                anti_bid_raw = market.mid * (
+                    _ONE - anti_distance_bp / _BP_DENOM
+                )
+                actual_bid = _quantize_price(
+                    anti_bid_raw, tick, ROUND_DOWN
+                )
+                bid_position = (
+                    "improving"
+                    if actual_bid > market.best_bid
+                    else "passive"
+                )
+            else:
+                # Short: buy-side is the close leg, sell-side is anti.
+                asymmetric_close_side = "buy"
+                if close_mode == "match_bbo":
+                    actual_bid = market.best_bid
+                    bid_position = "passive"
+                else:
+                    actual_bid = market.best_ask - tick
+                    bid_position = "improving"
+                anti_ask_raw = market.mid * (
+                    _ONE + anti_distance_bp / _BP_DENOM
+                )
+                actual_ask = _quantize_price(
+                    anti_ask_raw, tick, ROUND_UP
+                )
+                ask_position = (
+                    "improving"
+                    if actual_ask < market.best_ask
+                    else "passive"
+                )
+            logger.info(
+                "plan_quotes: asymmetric_quote active inv=%s "
+                "trigger=%s close_side=%s mode=%s anti_dist_bp=%s",
+                inventory.net_delta_usdc,
+                trigger_threshold,
+                asymmetric_close_side,
+                close_mode,
+                anti_distance_bp,
+            )
+
     # cross-self defense (rare; trips on distance≈0 or oracle/BBO disagreement)
     if actual_bid >= actual_ask:
         mid_actual = (actual_bid + actual_ask) / Decimal(2)
@@ -296,6 +402,11 @@ def plan_quotes(
         bid_notes.append("skew_long")
     if bid_position == "would_cross_market":
         bid_notes.append("crossed_market")
+    if asymmetric_active:
+        bid_notes.append(
+            "asymmetric_close" if asymmetric_close_side == "buy"
+            else "asymmetric_anti"
+        )
 
     ask_notes: List[str] = []
     if share_warn_ask:
@@ -304,6 +415,11 @@ def plan_quotes(
         ask_notes.append("skew_short")
     if ask_position == "would_cross_market":
         ask_notes.append("crossed_market")
+    if asymmetric_active:
+        ask_notes.append(
+            "asymmetric_close" if asymmetric_close_side == "sell"
+            else "asymmetric_anti"
+        )
 
     quotes: List[Quote] = []
 

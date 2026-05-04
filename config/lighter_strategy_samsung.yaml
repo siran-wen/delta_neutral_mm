@@ -59,24 +59,20 @@ strategy:
   emergency_stop_on_ws_disconnect_sec: 300
   emergency_stop_on_consecutive_cancel_fail_count: 3
 
-  # P7 (5-4) SAMSUNG retune: post_only LIMIT close at BBO ± 1 tick.
-  # Day-3 SAMSUNG (5-3 → 5-4 UTC) showed the P6 IOC + pre-cancel fix
-  # still hits Lighter's account-level self-trade protection (3/3 IOC
-  # submits silently rejected, $201 residual long, emergency_stop).
-  # The web UI throws "无法吃自己的单" on manual IOC close, proving the
-  # rejection is server-side. Switching to post_only LIMIT walks the
-  # regular maker path; trade-off is fill is no longer instant —
-  # post_submit_wait widened 5 → 120s for natural taker. Stays
-  # disabled until P7 paper-verified.
-  # taker_fee_max_pct: 1.50 → 0.50 (P7 BBO+1tick has tiny slip but
-  # the cap also gates the mass-dump skip; 50bp is comfortable).
-  active_hedge_enabled: true
-  active_hedge_trigger_pct: "0.7"
-  active_hedge_target_pct: "0.0"
-  active_hedge_taker_fee_max_pct: "0.50"
-  active_hedge_pause_after_sec: 60
-  active_hedge_max_consecutive_fails: 3
-  active_hedge_post_submit_wait_sec: 120
+  # P9 (5-4) SAMSUNG retune: asymmetric BBO quoting. P7 post_only
+  # close added a separate 120s wait + cancel-anti-leg machinery; on
+  # Day-4 a $396 SAMSUNG long sat single-sided for 2h (anti leg
+  # cancelled, lost reward). P9 keeps both legs live: when abs(inv)
+  # breaches trigger_pct * effective_cap, plan_quotes prices the
+  # close leg aggressively at the BBO and widens the anti leg to
+  # asymmetric_anti_distance_bp from mid. No timeout, no fail
+  # counter, no disable state — the inventory drifts back as
+  # natural takers hit the close leg, and user-driven manual close
+  # handles rare large residuals.
+  asymmetric_quote_enabled: true
+  asymmetric_quote_trigger_pct: "0.7"
+  asymmetric_close_mode: "improve_bbo"
+  asymmetric_anti_distance_bp: "30"
 
   daily_max_drawdown_usdc: "100"
   daily_max_drawdown_pct: "0.05"
