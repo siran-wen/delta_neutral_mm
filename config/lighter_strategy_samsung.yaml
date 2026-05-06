@@ -56,7 +56,7 @@ strategy:
   size_tolerance_pct: "0.05"
 
   emergency_stop_on_consecutive_reject_count: 5
-  emergency_stop_on_ws_disconnect_sec: 300
+  emergency_stop_on_ws_disconnect_sec: 1800
   emergency_stop_on_consecutive_cancel_fail_count: 3
 
   # P9 (5-4) SAMSUNG retune: asymmetric BBO quoting. P7 post_only
@@ -101,15 +101,15 @@ strategy:
     KR_MARKET_HOURS_AM:
       default_size_usdc: "200"
     KR_MARKET_HOURS_PM:
-      default_size_usdc: "50"
+      default_size_usdc: "150"
     KR_LUNCH_BREAK:
-      default_size_usdc: "50"
-    KR_AFTER_CLOSE:
       default_size_usdc: "100"
+    KR_AFTER_CLOSE:
+      default_size_usdc: "200"
     KR_OVERNIGHT:
       default_size_usdc: "100"
     KR_BEFORE_OPEN:
-      default_size_usdc: "150"
+      default_size_usdc: "100"
     KR_PRE_OPEN_WITHDRAW:
       default_size_usdc: "200"
     KR_WEEKEND:

@@ -61,7 +61,7 @@ strategy:
 
   # Emergency stop
   emergency_stop_on_consecutive_reject_count: 5
-  emergency_stop_on_ws_disconnect_sec: 300
+  emergency_stop_on_ws_disconnect_sec: 1800
   # Triggers when the cancel path silently fails N times in a row —
   # protects against the regression that produced a -1.132 SKHYNIXUSD
   # short on the first live test (cancels would no-op while new orders
@@ -121,11 +121,11 @@ strategy:
     KR_LUNCH_BREAK:
       default_size_usdc: "100"
     KR_AFTER_CLOSE:
-      default_size_usdc: "50"
+      default_size_usdc: "200"
     KR_OVERNIGHT:
-      default_size_usdc: "150"
+      default_size_usdc: "200"
     KR_BEFORE_OPEN:
-      default_size_usdc: "100"
+      default_size_usdc: "200"
     KR_PRE_OPEN_WITHDRAW:
       default_size_usdc: "200"
     KR_WEEKEND:
