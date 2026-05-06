@@ -419,6 +419,30 @@ def plan_quotes(
                 close_size_usdc = base_size
                 anti_size_usdc = base_size
 
+            # P10.5 (Day-7): optional absolute cap on close-leg
+            # notional. P10 linear scaling collapses inv fast on
+            # quiet markets but in trending tape the close fills
+            # at the moment price is moving against us, and big
+            # close + small anti makes the inv overshoot the
+            # other way. Day-7 SAMSUNG saw single-pass swings of
+            # -$134 → +$444 → -$159 (closes up to $496 / $598).
+            # Capping the close limits the single-fill adverse-
+            # selection tail without giving up the P10 fast-
+            # convergence bias on the close side. ``None``
+            # preserves P10 behaviour exactly (back-compat).
+            close_size_max_raw = config.get(
+                "asymmetric_close_size_max_usdc"
+            )
+            close_size_max: Optional[Decimal] = None
+            if close_size_max_raw is not None:
+                close_size_max = (
+                    close_size_max_raw
+                    if isinstance(close_size_max_raw, Decimal)
+                    else Decimal(str(close_size_max_raw))
+                )
+                if close_size_usdc > close_size_max:
+                    close_size_usdc = close_size_max
+
             if asymmetric_close_side == "sell":
                 # Long inv: sell leg is close, buy leg is anti.
                 ask_size_usdc_input = close_size_usdc
@@ -431,7 +455,8 @@ def plan_quotes(
             logger.info(
                 "plan_quotes: asymmetric_quote active inv=%s "
                 "trigger=%s close_side=%s mode=%s anti_dist_bp=%s "
-                "size_scaling=%s scale=%s close_usdc=%s anti_usdc=%s",
+                "size_scaling=%s scale=%s close_usdc=%s anti_usdc=%s "
+                "close_max_usdc=%s",
                 inventory.net_delta_usdc,
                 trigger_threshold,
                 asymmetric_close_side,
@@ -441,6 +466,7 @@ def plan_quotes(
                 scale,
                 close_size_usdc,
                 anti_size_usdc,
+                close_size_max if close_size_max is not None else "none",
             )
 
     # cross-self defense (rare; trips on distance≈0 or oracle/BBO disagreement)

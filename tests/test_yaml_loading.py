@@ -202,3 +202,33 @@ def test_asymmetric_quote_state_pinned_per_yaml():
             assert legacy_key not in cfg, (
                 f"P9 strip incomplete: legacy {legacy_key} still in yaml"
             )
+
+
+def test_asymmetric_close_size_max_usdc_pinned_per_yaml():
+    """Pin the P10.5 (Day-7) absolute close-size cap. Day-7 P10
+    produced single closes up to $598 / $496 / $402 across the three
+    markets and the resulting inventory swings cost more in adverse-
+    selection drag on trending tape than the faster P10 convergence
+    saved. Caps:
+
+      * SKHYNIX  $350 (cap=$600, default=$300, scaled max = $350)
+      * SAMSUNG  $250 (cap=$500, default=$100, scaled max = $250)
+      * HYUNDAI  $300 (cap=$500, default=$200, scaled max = $300)
+
+    Stored as strings in yaml so the loader's Decimal-coercion path
+    is the one tested in production. ``_coerce_decimal_fields`` does
+    NOT currently coerce this key (it's optional; quote_planner
+    converts the raw value at use site), so we assert against the
+    raw string the yaml carries."""
+    skhynix_raw = yaml.safe_load(
+        (_CONFIG_DIR / "lighter_strategy.yaml").read_text(encoding="utf-8")
+    )["strategy"]
+    samsung_raw = yaml.safe_load(
+        (_CONFIG_DIR / "lighter_strategy_samsung.yaml").read_text(encoding="utf-8")
+    )["strategy"]
+    hyundai_raw = yaml.safe_load(
+        (_CONFIG_DIR / "lighter_strategy_hyundai.yaml").read_text(encoding="utf-8")
+    )["strategy"]
+    assert skhynix_raw["asymmetric_close_size_max_usdc"] == "350"
+    assert samsung_raw["asymmetric_close_size_max_usdc"] == "250"
+    assert hyundai_raw["asymmetric_close_size_max_usdc"] == "300"

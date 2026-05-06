@@ -671,6 +671,18 @@ async def run_live_mode(
         cfg.get("asymmetric_close_mode", "improve_bbo"),
         cfg.get("asymmetric_anti_distance_bp"),
     )
+    # P10 / P10.5: close-size scaling + optional absolute cap.
+    # close_size_max_usdc=None means P10 behaviour (linear scaling
+    # up to effective_cap); a numeric value caps the close at that
+    # notional even when the linear formula would push higher
+    # (Day-7 adverse-selection mitigation).
+    logger.info(
+        "  asymmetric_close_size: scaling=%s max_usdc=%s "
+        "(P10: linear/fixed; P10.5: optional absolute cap on "
+        "close to bound adverse-selection tail)",
+        cfg.get("asymmetric_close_size_scaling", "linear"),
+        cfg.get("asymmetric_close_size_max_usdc") or "(not set)",
+    )
     logger.info(
         "  daily_drawdown: max_usdc=%s max_pct=%s interval=%ss",
         cfg.get("daily_max_drawdown_usdc"),

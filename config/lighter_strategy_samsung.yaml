@@ -97,6 +97,14 @@ strategy:
   # now closes at ~$250 and at-cap closes at full $400. Anti stays at
   # default. See the SKHYNIX yaml for the full rationale.
   asymmetric_close_size_scaling: "linear"
+  # P10.5 (Day-7): absolute cap on close-leg notional. SAMSUNG
+  # Day-7 P10 produced closes up to $496 (cap=$500, default=$100)
+  # and the inventory swings (-$134 → +$444 → -$159 in one cycle)
+  # showed the close was overshooting on trending tape. $250 caps
+  # the adverse-selection tail while still letting the close run
+  # 2.5× the default. Set to null/comment out to fall back to
+  # plain P10. See the SKHYNIX yaml for the design rationale.
+  asymmetric_close_size_max_usdc: "250"
 
   daily_max_drawdown_usdc: "100"
   daily_max_drawdown_pct: "0.05"

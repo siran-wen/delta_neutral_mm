@@ -1178,3 +1178,123 @@ def test_asymmetric_size_scaling_preserves_close_price_invariant():
     assert sell.price == Decimal("159.961")
     # Anti price unchanged by P10 (160 × 0.997 = 159.520).
     assert buy.price == Decimal("159.520")
+
+
+# ----- P10.5 (Day-7): absolute cap on close-leg notional -------------
+#
+# P10.5 sits on top of the P10 linear scaling and caps the close-leg
+# notional at ``asymmetric_close_size_max_usdc`` whenever set. Day-7
+# observation: P10 produced single closes up to $598 (SKHYNIX) on a
+# $600 cap with $300 default, and the inventory swings (-$134 →
+# +$444 → -$159 in a single fill cycle) cost more in adverse-
+# selection drag on trending tape than the faster P10 convergence
+# saved. The cap bounds the single-fill loss tail without giving up
+# the P10 fast-convergence bias on the close side.
+#
+# Test config mirrors the SAMSUNG yaml: cap=$500, trigger_pct=0.7
+# → trigger=$350. Default size $100 set via session. cap_room=$150.
+
+
+def _p105_config(**overrides) -> dict:
+    """SAMSUNG-shaped P10.5 test config: cap=$500, trigger_pct=0.7
+    (trigger=$350), default linear scaling. Tests override
+    ``asymmetric_close_size_max_usdc`` (or omit it to assert P10
+    fall-back behaviour)."""
+    cfg = _p10_config()
+    cfg["target_max_delta_usdc"] = Decimal("500")
+    cfg["hard_position_cap_usdc"] = Decimal("500")
+    cfg.update(overrides)
+    return cfg
+
+
+def test_asymmetric_close_size_capped_by_max_usdc():
+    """Cap fires when the linear formula would push close above the
+    max. inv=$450 with cap=$500/trigger=$350/default=$100 →
+    P10 close = $100 + ($500-$100) × (450-350)/(500-350) ≈ $366.67;
+    P10.5 with max=$250 clamps it to $250. Verifies the absolute
+    cap actually bounds the close size."""
+    market = _p10_market_or_default()
+    inv = long_inv("450", mid="160")  # near cap
+    cfg = _p105_config(asymmetric_close_size_max_usdc=Decimal("250"))
+    quotes = plan_quotes(market, _p10_session(), inv, cfg)
+    by_side = {q.side: q for q in quotes}
+    # $450 + $100 = $550 ≥ cap → bid (anti) skipped by cap-projection;
+    # close (sell) emits at the capped notional.
+    assert "sell" in by_side
+    sell = by_side["sell"]
+    assert sell.size_base == _expected_size_base(Decimal("250"), sell.price)
+    assert "asymmetric_close" in sell.notes
+
+
+def test_asymmetric_close_size_max_usdc_does_not_affect_low_inv():
+    """When linear close < max, the cap is a no-op. inv=$380 just
+    past trigger=$350 → P10 close = $100 + $400 × 30/150 = $180.
+    With max=$250, close stays at $180 (cap not triggered)."""
+    market = _p10_market_or_default()
+    inv = long_inv("380", mid="160")
+    cfg = _p105_config(asymmetric_close_size_max_usdc=Decimal("250"))
+    quotes = plan_quotes(market, _p10_session(), inv, cfg)
+    by_side = {q.side: q for q in quotes}
+    # $380 + $100 = $480 < $500 cap → both legs emit. Close=sell at $180.
+    assert "sell" in by_side and "buy" in by_side
+    sell, buy = by_side["sell"], by_side["buy"]
+    assert sell.size_base == _expected_size_base(Decimal("180"), sell.price)
+    # Anti unaffected by P10.5 — stays at session default.
+    assert buy.size_base == _expected_size_base(Decimal("100"), buy.price)
+    assert "asymmetric_close" in sell.notes
+
+
+def test_asymmetric_close_size_max_usdc_none_falls_back_to_p10():
+    """When ``asymmetric_close_size_max_usdc`` is absent (or None),
+    behaviour matches P10 exactly — close can scale all the way to
+    effective_cap. inv=$450 → close ≈ $366.67 (no clamp at $250 here
+    because no cap is configured). Back-compat guarantee."""
+    market = _p10_market_or_default()
+    inv = long_inv("450", mid="160")
+    cfg = _p105_config()  # no asymmetric_close_size_max_usdc
+    assert "asymmetric_close_size_max_usdc" not in cfg
+    quotes = plan_quotes(market, _p10_session(), inv, cfg)
+    by_side = {q.side: q for q in quotes}
+    assert "sell" in by_side
+    sell = by_side["sell"]
+    # P10 linear: close = 100 + (500-100) × (450-350)/(500-350)
+    #          = 100 + 400 × 100/150 = 100 + 800/3 ≈ 366.67
+    expected_close = Decimal("100") + Decimal("400") * (
+        Decimal("100") / Decimal("150")
+    )
+    assert sell.size_base == _expected_size_base(expected_close, sell.price)
+    assert "asymmetric_close" in sell.notes
+
+
+def test_asymmetric_close_size_max_usdc_clamped_with_inv_abs():
+    """Compose P10.5 cap with the existing P10 inv_abs clamp. With
+    default=$300 > inv_abs (small position, big default), the inv
+    clamp pulls close down to inv_abs first; the P10.5 max cap
+    then pulls it the rest of the way to ``max_usdc``.
+
+    Setup: cap=$400, default=$300, trigger_pct=0.7 → trigger=$280,
+    inv=$280 (at trigger). Linear formula → $300 (scale=0 + default);
+    inv_abs clamp → $280; max=$250 clamp → $250. Verifies the two
+    clamps compose in the correct order."""
+    market = _p10_market_or_default()
+    sess = SessionPolicy(
+        name="P105_BIG_DEFAULT",
+        action="quote",
+        default_distance_bp=Decimal("10"),
+        default_size_usdc=Decimal("300"),  # > inv_abs
+        tier_thresholds_bp=(Decimal("15"), Decimal("25"), Decimal("50")),
+        reason="p10.5 inv_abs + max compose",
+    )
+    inv = long_inv("280", mid="160")  # at trigger ($280 with cap=$400)
+    cfg = _p10_config(  # cap=$400 here, default=$300 from session
+        asymmetric_close_size_max_usdc=Decimal("250"),
+    )
+    quotes = plan_quotes(market, sess, inv, cfg)
+    by_side = {q.side: q for q in quotes}
+    assert "sell" in by_side
+    sell = by_side["sell"]
+    # Linear: $300 + ($400-$300)*0 = $300.
+    # inv_abs clamp: min($300, $280) = $280.
+    # P10.5 cap: min($280, $250) = $250.
+    assert sell.size_base == _expected_size_base(Decimal("250"), sell.price)
+    assert "asymmetric_close" in sell.notes

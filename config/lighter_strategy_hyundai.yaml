@@ -76,6 +76,13 @@ strategy:
   # P10 (5-5): inv-aware close size scaling — see SKHYNIX/SAMSUNG
   # yamls for the Day-5 SAMSUNG oscillation that drove the change.
   asymmetric_close_size_scaling: "linear"
+  # P10.5 (Day-7): absolute cap on close-leg notional. HYUNDAI
+  # Day-7 P10 produced closes up to $402 (cap=$500, default=$200);
+  # cap at $300 = default + ~33% of cap_room. Bounds the adverse-
+  # selection tail on the thinnest of the three books. Set to
+  # null/comment out to fall back to plain P10. See SKHYNIX
+  # yaml for the design rationale.
+  asymmetric_close_size_max_usdc: "300"
 
   daily_max_drawdown_usdc: "100"
   daily_max_drawdown_pct: "0.05"

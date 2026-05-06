@@ -1,8 +1,9 @@
-"""Paper-mode verification of the P9/P10 (5-4 / 5-5) asymmetric BBO quoting.
+"""Paper-mode verification of the P9/P10/P10.5 asymmetric BBO quoting.
 
 Drives ``plan_quotes`` directly with a SAMSUNG-shaped MarketSnapshot
-across three inventory severities and validates both the price layout
-(P9) and the close-size scaling (P10):
+across four inventory severities and validates the price layout
+(P9), the close-size scaling (P10), and the absolute close-size cap
+(P10.5):
 
     1. **Both legs emit** when below the cap-projection limit — no
        single-sided quoting solely from the asymmetric branch.
@@ -14,6 +15,11 @@ across three inventory severities and validates both the price layout
     5. **(P10)** Close-leg notional scales linearly: $default at
        trigger, ~midway at the trigger-cap midpoint, ~cap at inv near
        cap. Anti notional stays at $default.
+    6. **(P10.5)** ``asymmetric_close_size_max_usdc`` caps the close
+       at an absolute notional even when the linear formula would
+       push higher — Day-7 adverse-selection mitigation. The script
+       prints a P10-vs-P10.5 comparison table so the cap-firing
+       scenarios are obvious.
 
 Run::
 
@@ -47,7 +53,7 @@ from strategy.types import (  # noqa: E402
 
 
 def _load_yaml(path: Optional[Path]) -> Dict[str, Any]:
-    """Pull asymmetric_* knobs from a yaml; fall back to P9/P10 defaults."""
+    """Pull asymmetric_* knobs from a yaml; fall back to P9/P10/P10.5 defaults."""
     if path is None or not path.exists():
         return {
             "asymmetric_quote_enabled": True,
@@ -55,6 +61,9 @@ def _load_yaml(path: Optional[Path]) -> Dict[str, Any]:
             "asymmetric_close_mode": "improve_bbo",
             "asymmetric_anti_distance_bp": Decimal("30"),
             "asymmetric_close_size_scaling": "linear",
+            # P10.5 default — picked to mirror SAMSUNG yaml; tests
+            # below reflect cap firing in 3/4 scenarios at this value.
+            "asymmetric_close_size_max_usdc": Decimal("250"),
         }
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     strat = raw.get("strategy") or {}
@@ -65,12 +74,14 @@ def _load_yaml(path: Optional[Path]) -> Dict[str, Any]:
         "asymmetric_close_mode",
         "asymmetric_anti_distance_bp",
         "asymmetric_close_size_scaling",
+        "asymmetric_close_size_max_usdc",
     ):
         if k in strat:
             v = strat[k]
             if k in {
                 "asymmetric_quote_trigger_pct",
                 "asymmetric_anti_distance_bp",
+                "asymmetric_close_size_max_usdc",
             } and isinstance(v, str):
                 v = Decimal(v)
             out[k] = v
@@ -121,22 +132,34 @@ def _expected_close_usdc(
     trigger: Decimal,
     default_size: Decimal,
     mode: str,
+    max_usdc: Optional[Decimal] = None,
 ) -> Decimal:
-    """Mirror the planner's close-size formula for the assertion."""
+    """Mirror the planner's close-size formula for the assertion.
+
+    Order of clamps mirrors ``strategy.quote_planner``:
+        1. Linear (or fixed) scaling produces an unconstrained close.
+        2. ``min(close, inv_abs)`` clamps to the actual position
+           (defensive against default > inv).
+        3. ``min(close, max_usdc)`` (P10.5) caps the close at an
+           absolute notional. ``None`` skips this step → P10 behaviour.
+    """
     if mode != "linear":
-        return default_size
-    cap_room = cap - trigger
-    if cap_room > 0:
-        scale = (inv_abs - trigger) / cap_room
-        if scale > Decimal(1):
-            scale = Decimal(1)
-        elif scale < Decimal(0):
-            scale = Decimal(0)
+        close = default_size
     else:
-        scale = Decimal(1)
-    close = default_size + (cap - default_size) * scale
+        cap_room = cap - trigger
+        if cap_room > 0:
+            scale = (inv_abs - trigger) / cap_room
+            if scale > Decimal(1):
+                scale = Decimal(1)
+            elif scale < Decimal(0):
+                scale = Decimal(0)
+        else:
+            scale = Decimal(1)
+        close = default_size + (cap - default_size) * scale
     if close > inv_abs:
         close = inv_abs
+    if max_usdc is not None and close > max_usdc:
+        close = max_usdc
     return close
 
 
@@ -151,12 +174,15 @@ def _run_scenario(
     market: MarketSnapshot,
     session: SessionPolicy,
     cfg: Dict[str, Any],
-) -> Tuple[bool, List[str]]:
-    """Execute one scenario, print the outcome, and return ``(pass, failures)``."""
+) -> Tuple[bool, List[str], Dict[str, Decimal]]:
+    """Execute one scenario, print the outcome, and return
+    ``(pass, failures, comparison_row)`` where ``comparison_row``
+    carries the P10 / P10.5 close sizes for the summary table."""
     cap = cfg["hard_position_cap_usdc"]
     trigger = cap * cfg["asymmetric_quote_trigger_pct"]
     default_size = session.default_size_usdc
     scaling = cfg.get("asymmetric_close_size_scaling", "linear")
+    max_usdc = cfg.get("asymmetric_close_size_max_usdc")
 
     inv = InventoryState(
         net_delta_base=inv_usdc / market.mid,
@@ -174,7 +200,10 @@ def _run_scenario(
     print(
         f"  inv=${inv_usdc} cap=${cap} trigger=${trigger} default=${default_size}"
     )
-    print(f"  scaling={scaling} mode={cfg.get('asymmetric_close_mode', 'improve_bbo')}")
+    print(
+        f"  scaling={scaling} mode={cfg.get('asymmetric_close_mode', 'improve_bbo')} "
+        f"max_usdc={max_usdc}"
+    )
     print(f"  quotes emitted = {len(quotes)}")
     for q in quotes:
         print(
@@ -220,27 +249,35 @@ def _run_scenario(
                 f"{expected_anti_price}"
             )
 
-    # P10 invariant — close size matches the linear formula. We always
-    # have at least the close leg (the cap-projection only drops the
-    # leg that grows inventory, never the close leg).
+    # P10 / P10.5 invariant — close size matches the linear formula
+    # plus optional cap. We always have at least the close leg (the
+    # cap-projection only drops the leg that grows inventory).
     if inv_usdc > 0:
         close_quote = by_side.get("sell")
     else:
         close_quote = by_side.get("buy")
+
+    # Compute both P10 (no cap) and P10.5 (with cap) for the
+    # comparison table even on early-exit paths.
+    p10_close = _expected_close_usdc(
+        inv_abs, cap, trigger, default_size, scaling, max_usdc=None
+    )
+    p105_close = _expected_close_usdc(
+        inv_abs, cap, trigger, default_size, scaling, max_usdc=max_usdc
+    )
+    cap_hit = (max_usdc is not None) and (p105_close < p10_close)
+
     if close_quote is None:
         failures.append("FAIL: close leg missing entirely")
     else:
-        expected_close_usdc = _expected_close_usdc(
-            inv_abs, cap, trigger, default_size, scaling
-        )
         expected_size_base = _expected_size_base(
-            expected_close_usdc, close_quote.price, market.size_decimals
+            p105_close, close_quote.price, market.size_decimals
         )
         if close_quote.size_base != expected_size_base:
             failures.append(
                 f"FAIL: close size_base {close_quote.size_base} != "
                 f"expected {expected_size_base} "
-                f"(close_usdc=${expected_close_usdc:.2f})"
+                f"(P10.5 close_usdc=${p105_close:.2f}, P10=${p10_close:.2f})"
             )
         # Sanity tag: close note present.
         if "asymmetric_close" not in close_quote.notes:
@@ -249,15 +286,25 @@ def _run_scenario(
                 f"(notes={close_quote.notes})"
             )
 
-    return (len(failures) == 0, failures)
+    row: Dict[str, Decimal] = {
+        "inv": inv_usdc,
+        "p10": p10_close,
+        "p105": p105_close,
+        "cap_hit": Decimal(1) if cap_hit else Decimal(0),
+    }
+    return (len(failures) == 0, failures, row)
 
 
 def _run(yaml_path: Optional[Path]) -> int:
     market = _build_market()
+    # Cap=$500 mirrors SAMSUNG yaml; combined with trigger_pct=0.7
+    # and default_size=$100 the four scenarios below land at
+    # trigger=$350 / midway=$425 / near-cap=$498 / very-near-cap=$450
+    # so the P10.5 absolute cap clearly fires in 3 of 4 cases.
     cfg: Dict[str, Any] = {
-        "target_max_delta_usdc": Decimal("400"),
+        "target_max_delta_usdc": Decimal("500"),
         "skew_max_offset_bp": Decimal("5"),
-        "hard_position_cap_usdc": Decimal("400"),
+        "hard_position_cap_usdc": Decimal("500"),
         "min_market_spread_bp": Decimal("3"),
         "max_market_spread_bp": Decimal("100"),
         "share_warn_threshold": Decimal("0.95"),
@@ -267,38 +314,61 @@ def _run(yaml_path: Optional[Path]) -> int:
 
     cap = cfg["hard_position_cap_usdc"]
     trigger = cap * cfg["asymmetric_quote_trigger_pct"]
+    max_usdc = cfg.get("asymmetric_close_size_max_usdc")
 
-    # Default-size pinned to $100 so the spec's example numbers match
-    # ($100 → $250 → $395 across the three scenarios at cap=$400).
+    # Default-size pinned to $100 so the comparison numbers are clean.
     default_size = Decimal("100")
     session = _build_session(default_size)
 
     print("=" * 60)
-    print("P9/P10 asymmetric BBO quoting paper check (SAMSUNG-shaped)")
+    print("P9/P10/P10.5 asymmetric BBO quoting paper check (SAMSUNG-shaped)")
     print("=" * 60)
     print(f"  cap=${cap} trigger=${trigger} default_size=${default_size}")
-    print(f"  scaling={cfg.get('asymmetric_close_size_scaling', 'linear')}")
+    print(
+        f"  scaling={cfg.get('asymmetric_close_size_scaling', 'linear')} "
+        f"max_usdc={max_usdc} (None = P10 fallback)"
+    )
 
     scenarios = [
-        ("at-trigger", trigger),         # $280
-        ("midway", (cap + trigger) / 2),  # $340
-        ("near-cap", cap - Decimal("2")),  # $398
+        ("at-trigger",     trigger),                   # $350
+        ("midway",         (cap + trigger) / 2),       # $425
+        ("near-cap",       cap - Decimal("2")),        # $498
+        ("very-near-cap",  Decimal("450")),            # $450
     ]
     all_pass = True
     all_failures: List[str] = []
+    rows: List[Tuple[str, Dict[str, Decimal]]] = []
     for label, inv_usdc in scenarios:
-        ok, failures = _run_scenario(label, inv_usdc, market, session, cfg)
+        ok, failures, row = _run_scenario(label, inv_usdc, market, session, cfg)
+        rows.append((label, row))
         if not ok:
             all_pass = False
             all_failures.extend(f"[{label}] {f}" for f in failures)
 
+    # Comparison table — at a glance shows where the cap fires.
+    print()
+    print("=" * 60)
+    print("P10 vs P10.5 comparison (close-leg notional, $)")
+    print("=" * 60)
+    print(f"{'scenario':<14s} {'inv':>10s} {'P10 close':>12s} "
+          f"{'P10.5 close':>14s} {'cap_hit':>9s}")
+    print("-" * 60)
+    for label, r in rows:
+        cap_hit = "YES" if r["cap_hit"] == Decimal(1) else "no"
+        print(
+            f"{label:<14s} {float(r['inv']):>10.2f} "
+            f"{float(r['p10']):>12.2f} {float(r['p105']):>14.2f} "
+            f"{cap_hit:>9s}"
+        )
+
     print()
     print("=" * 60)
     if all_pass:
-        print("RESULT: PASS — all 3 scenarios verified")
-        print("  [OK] at-trigger:  close ≈ default")
-        print("  [OK] midway:      close ≈ midway between default and cap")
-        print("  [OK] near-cap:    close ≈ cap")
+        print("RESULT: PASS — all 4 scenarios verified")
+        print("  [OK] at-trigger:    close ≈ default (cap not triggered)")
+        print("  [OK] midway:        P10 scales up, P10.5 cap fires")
+        print("  [OK] near-cap:      P10 ≈ effective_cap, P10.5 cap fires")
+        print("  [OK] very-near-cap: P10 ≈ 2/3 cap_room, P10.5 cap fires")
         return 0
     print("RESULT: FAIL")
     for f in all_failures:

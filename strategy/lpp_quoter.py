@@ -168,6 +168,15 @@ QUOTER_DEFAULTS: Dict[str, Any] = {
     # midway, ≈ cap when inv touches cap), so a single fill can
     # land us back below the trigger.
     "asymmetric_close_size_scaling": "linear",
+    # P10.5 (Day-7): optional absolute USDC cap on close-leg notional
+    # that sits on top of the linear scaling. Day-7 P10 logged close
+    # fills up to $598 (SKHYNIX), $496 (SAMSUNG), $402 (HYUNDAI),
+    # and the resulting inventory swings (e.g. SAMSUNG -$134 → +$444
+    # → -$159 in one cycle) cost more in adverse-selection drag than
+    # the faster convergence saved. ``None`` preserves P10 behaviour
+    # exactly; a Decimal/str/int value caps the close at that
+    # notional even when the linear formula would scale higher.
+    "asymmetric_close_size_max_usdc": None,
     # Phase 2.1 P2.1.3: daily max drawdown stop loss. start() captures
     # collateral_start; periodic check fires emergency_stop when
     # drawdown >= min(daily_max_drawdown_usdc, daily_max_drawdown_pct
