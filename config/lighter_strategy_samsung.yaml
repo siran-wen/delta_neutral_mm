@@ -69,8 +69,25 @@ strategy:
   # counter, no disable state — the inventory drifts back as
   # natural takers hit the close leg, and user-driven manual close
   # handles rare large residuals.
+  #
+  # Day-7 Part 2 SAMSUNG-only retune (trigger 0.7 → 0.5): forensics
+  # on the 4.78h all-account session showed SAMSUNG was the dominant
+  # source of drag ($8.23/h account-wide; SAMSUNG 92% asymmetric
+  # active, max |inv| = $557 against the $500 hard_cap). Crucially,
+  # the inv ramped from 0 → -$400 in the first 14 minutes, but the
+  # P9/P10 trigger sat at 0.7 × $500 = $350 — by the time asymmetric
+  # mode engaged, inv was already deep into adverse-selection
+  # territory on the SAMSUNG book (5/4 observer: 26.6% of session
+  # had spread<1bp and median 25bp depth was only $4,578). Dropping
+  # to 0.5 (= $250 at the current $500 cap) lets the close leg get
+  # aggressive earlier in the ramp before |inv| punches the cap, so
+  # the anti leg widens to asymmetric_anti_distance_bp and the close
+  # gets priority queue treatment while the position is still
+  # recoverable. SKHYNIX/HYUNDAI stay at 0.7 — they didn't show the
+  # same ramp pathology in the Day-7 trace; HYUNDAI may follow
+  # SAMSUNG after a 1–2 day SAMSUNG-only validation window.
   asymmetric_quote_enabled: true
-  asymmetric_quote_trigger_pct: "0.7"
+  asymmetric_quote_trigger_pct: "0.5"
   asymmetric_close_mode: "improve_bbo"
   asymmetric_anti_distance_bp: "30"
   # P10 (5-5): scale close size from default at trigger up to cap when

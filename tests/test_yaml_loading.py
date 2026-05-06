@@ -153,10 +153,11 @@ def test_total_absolute_cap_exposure_pinned_at_2k_collateral():
 
 def test_asymmetric_quote_state_pinned_per_yaml():
     """Pin the P9 asymmetric_quote_* knobs per-yaml. The three markets
-    share the same trigger / mode / anti-distance because the inv
-    profile (cap × 0.7 = trigger threshold) and the BBO improvement
-    pattern aren't market-specific — only enabled state may diverge
-    if a market needs to opt out for ad-hoc testing.
+    share mode / anti-distance because the BBO improvement pattern
+    isn't market-specific. The trigger_pct used to be uniform at
+    0.7 but Day-7 Part 2 forensics drove SAMSUNG down to 0.5
+    (early-ramp intervention) — the per-market values are pinned
+    individually now.
 
     P9 (5-4) replaced the P6/P7/P8 active_hedge IOC + post_only
     emergency paths with a plan_quotes-level override that prices
@@ -169,13 +170,21 @@ def test_asymmetric_quote_state_pinned_per_yaml():
 
     for cfg in (skhynix, samsung, hyundai):
         assert cfg["asymmetric_quote_enabled"] is True
-        assert cfg["asymmetric_quote_trigger_pct"] == Decimal("0.7")
         assert cfg["asymmetric_close_mode"] == "improve_bbo"
         assert cfg["asymmetric_anti_distance_bp"] == Decimal("30")
         # P10 (5-5): inv-aware close size scaling. All three markets
         # ship with "linear" — the P10 default. "fixed" is the P9
         # fall-back if a market needs to opt out for ad-hoc testing.
         assert cfg["asymmetric_close_size_scaling"] == "linear"
+
+    # Day-7 Part 2: SAMSUNG dropped to 0.5 to engage asymmetric mode
+    # earlier in the ramp (observed inv 0 → -$400 in the first 14
+    # min, where 0.7 × $500 = $350 trigger fired too late).
+    # SKHYNIX/HYUNDAI stay at 0.7 pending a 1–2 day SAMSUNG-only
+    # validation window before we propagate the change.
+    assert skhynix["asymmetric_quote_trigger_pct"] == Decimal("0.7")
+    assert samsung["asymmetric_quote_trigger_pct"] == Decimal("0.5")
+    assert hyundai["asymmetric_quote_trigger_pct"] == Decimal("0.7")
 
     # P9 strip: the old active_hedge_* keys must be gone — pin to
     # catch a partial revert from a config patch.
